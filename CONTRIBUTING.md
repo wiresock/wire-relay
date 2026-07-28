@@ -21,7 +21,7 @@ of 1.85. Linux is required for full daemon and Unix-domain-socket integration
 testing.
 
 ```bash
-git clone https://github.com/Wiresock-Foundation/wire-relay.git
+git clone https://github.com/wiresock/wire-relay.git
 cd wire-relay
 rustup toolchain install stable --profile minimal \
   --component rustfmt --component clippy

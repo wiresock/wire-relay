@@ -19,4 +19,4 @@ No production release has been declared by this changelog yet. Consult a
 tagged release's notes and artifacts rather than treating the `Unreleased`
 section as a compatibility or verification guarantee.
 
-[Unreleased]: https://github.com/Wiresock-Foundation/wire-relay/commits/main
+[Unreleased]: https://github.com/wiresock/wire-relay/commits/main

@@ -386,6 +386,6 @@ using opaque payloads.
 ## License
 
 WireRelay is available under the
-[GNU Affero General Public License v3 or later](LICENSE-AGPL-3.0). A separate
+[GNU Affero General Public License v3 or later](LICENSE). A separate
 commercial license may also be available; see
 [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
