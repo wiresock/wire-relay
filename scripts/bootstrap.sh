@@ -231,7 +231,11 @@ require_root() {
 }
 
 acquire_operation_lock() {
-    local lock_path="${1:-$OPERATION_LOCK_PATH}"
+    acquire_operation_lock_at "$OPERATION_LOCK_PATH"
+}
+
+acquire_operation_lock_at() {
+    local lock_path="$1"
 
     command -v flock >/dev/null 2>&1 ||
         die "flock is required to serialize bootstrap operations."

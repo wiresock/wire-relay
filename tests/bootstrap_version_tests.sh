@@ -125,7 +125,7 @@ if compare_semantic_versions "1.2.3" "01.2.3" >/dev/null; then
 fi
 
 lock_test_path="$(mktemp)"
-acquire_operation_lock "$lock_test_path"
+acquire_operation_lock_at "$lock_test_path"
 if flock --nonblock "$lock_test_path" true; then
     fail "a concurrent bootstrap operation should not acquire the lock"
 fi
