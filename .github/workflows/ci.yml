@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets and features
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test all features
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Build release binary
+        run: cargo build --release --all-features --locked
+
+  msrv:
+    name: Rust 1.85 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check minimum supported toolchain
+        run: cargo check --all-targets --all-features --locked
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Show ShellCheck version
+        run: shellcheck --version
+
+      - name: Lint bootstrap script
+        run: |
+          bash -n bootstrap.sh scripts/bootstrap.sh
+          shellcheck bootstrap.sh scripts/bootstrap.sh
