@@ -128,22 +128,24 @@ impl EchoBackend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preserves_opaque_datagrams_boundaries_and_independent_mappings() -> Result<()> {
     let backend = EchoBackend::start().await?;
-    let listener = match reserve_listener_addresses(1) {
-        Ok(addresses) => addresses
-            .into_iter()
-            .next()
-            .expect("one listener reservation must include one address"),
+    let (addresses, listener_reservations) = match reserve_listener_addresses(1) {
+        Ok(reservations) => reservations,
         Err(error) => {
             backend.shutdown().await?;
             return Err(error);
         }
     };
+    let listener = addresses
+        .into_iter()
+        .next()
+        .expect("one listener reservation must include one address");
     let backend_address = backend.address();
     let config = make_config(
         ServiceConfig::default(),
         vec![make_listener("opaque", listener, backend_address)],
     );
-    let (runtime, mut backends) = start_environment(config, vec![backend]).await?;
+    let (runtime, mut backends) =
+        start_environment(config, vec![backend], listener_reservations).await?;
 
     let exercise = async {
         let first_client = connected_client(listener).await?;
@@ -252,13 +254,14 @@ async fn two_listeners_route_to_distinct_backends() -> Result<()> {
             return Err(error);
         }
     };
-    let mut addresses = match reserve_listener_addresses(2) {
-        Ok(addresses) => addresses.into_iter(),
+    let (addresses, listener_reservations) = match reserve_listener_addresses(2) {
+        Ok(reservations) => reservations,
         Err(error) => {
             shutdown_backends(vec![first_backend, second_backend]).await?;
             return Err(error);
         }
     };
+    let mut addresses = addresses.into_iter();
     let first_listener = addresses
         .next()
         .expect("two listener reservations must include the first address");
@@ -274,8 +277,12 @@ async fn two_listeners_route_to_distinct_backends() -> Result<()> {
             make_listener("second", second_listener, second_backend_address),
         ],
     );
-    let (runtime, mut backends) =
-        start_environment(config, vec![first_backend, second_backend]).await?;
+    let (runtime, mut backends) = start_environment(
+        config,
+        vec![first_backend, second_backend],
+        listener_reservations,
+    )
+    .await?;
 
     let exercise = async {
         let first_client = connected_client(first_listener).await?;
@@ -329,16 +336,17 @@ async fn two_listeners_route_to_distinct_backends() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_datagrams_are_dropped_without_truncated_forwarding() -> Result<()> {
     let backend = EchoBackend::start().await?;
-    let listener = match reserve_listener_addresses(1) {
-        Ok(addresses) => addresses
-            .into_iter()
-            .next()
-            .expect("one listener reservation must include one address"),
+    let (addresses, listener_reservations) = match reserve_listener_addresses(1) {
+        Ok(reservations) => reservations,
         Err(error) => {
             backend.shutdown().await?;
             return Err(error);
         }
     };
+    let listener = addresses
+        .into_iter()
+        .next()
+        .expect("one listener reservation must include one address");
     let service = ServiceConfig {
         max_datagram_size: 64,
         ..ServiceConfig::default()
@@ -347,7 +355,8 @@ async fn oversized_datagrams_are_dropped_without_truncated_forwarding() -> Resul
         service,
         vec![make_listener("size-limit", listener, backend.address())],
     );
-    let (runtime, mut backends) = start_environment(config, vec![backend]).await?;
+    let (runtime, mut backends) =
+        start_environment(config, vec![backend], listener_reservations).await?;
 
     let exercise = async {
         let client = connected_client(listener).await?;
@@ -403,16 +412,17 @@ async fn run_limit_scenario(
     description: &str,
 ) -> Result<()> {
     let backend = EchoBackend::start().await?;
-    let listener = match reserve_listener_addresses(1) {
-        Ok(addresses) => addresses
-            .into_iter()
-            .next()
-            .expect("one listener reservation must include one address"),
+    let (addresses, listener_reservations) = match reserve_listener_addresses(1) {
+        Ok(reservations) => reservations,
         Err(error) => {
             backend.shutdown().await?;
             return Err(error);
         }
     };
+    let listener = addresses
+        .into_iter()
+        .next()
+        .expect("one listener reservation must include one address");
     let service = ServiceConfig {
         max_sessions,
         max_sessions_per_ip,
@@ -424,7 +434,8 @@ async fn run_limit_scenario(
         service,
         vec![make_listener("limited", listener, backend.address())],
     );
-    let (runtime, mut backends) = start_environment(config, vec![backend]).await?;
+    let (runtime, mut backends) =
+        start_environment(config, vec![backend], listener_reservations).await?;
 
     let exercise = async {
         let first_client = connected_client(listener).await?;
@@ -498,7 +509,7 @@ fn make_listener(name: &str, bind: SocketAddr, backend: SocketAddr) -> ListenerC
     }
 }
 
-fn reserve_listener_addresses(count: usize) -> Result<Vec<SocketAddr>> {
+fn reserve_listener_addresses(count: usize) -> Result<(Vec<SocketAddr>, Vec<std::net::UdpSocket>)> {
     let mut sockets = Vec::with_capacity(count);
     let mut addresses = Vec::with_capacity(count);
     for _ in 0..count {
@@ -511,14 +522,15 @@ fn reserve_listener_addresses(count: usize) -> Result<Vec<SocketAddr>> {
         addresses.push(address);
         sockets.push(socket);
     }
-    drop(sockets);
-    Ok(addresses)
+    Ok((addresses, sockets))
 }
 
 async fn start_environment(
     config: NormalizedConfig,
     backends: Vec<EchoBackend>,
+    listener_reservations: Vec<std::net::UdpSocket>,
 ) -> Result<(Runtime, Vec<EchoBackend>)> {
+    drop(listener_reservations);
     match Runtime::start_with_options(
         config,
         PathBuf::from("relay-integration-test.toml"),

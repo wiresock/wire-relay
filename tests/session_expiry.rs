@@ -77,8 +77,8 @@ impl EchoBackend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_session_expires_and_releases_its_mapping() -> Result<()> {
     let backend = EchoBackend::start().await?;
-    let listener = match reserve_listener_address() {
-        Ok(listener) => listener,
+    let (listener, listener_reservation) = match reserve_listener_address() {
+        Ok(reservation) => reservation,
         Err(error) => {
             backend.shutdown().await?;
             return Err(error);
@@ -102,6 +102,7 @@ async fn idle_session_expires_and_releases_its_mapping() -> Result<()> {
     .into_normalized()
     .expect("expiry test configuration assembled from OS addresses must be valid");
 
+    drop(listener_reservation);
     let runtime = match Runtime::start_with_options(
         config,
         PathBuf::from("session-expiry-test.toml"),
@@ -198,13 +199,12 @@ async fn idle_session_expires_and_releases_its_mapping() -> Result<()> {
     combine_results(exercise, runtime_shutdown, backend_shutdown)
 }
 
-fn reserve_listener_address() -> Result<SocketAddr> {
+fn reserve_listener_address() -> Result<(SocketAddr, std::net::UdpSocket)> {
     let reservation = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .context("failed to reserve expiry-test listener")?;
     let address = reservation.local_addr()?;
     ensure!(address.port() != 0, "the OS returned a zero listener port");
-    drop(reservation);
-    Ok(address)
+    Ok((address, reservation))
 }
 
 async fn wait_for_session_count(runtime: &Runtime, expected: usize) -> Result<()> {
