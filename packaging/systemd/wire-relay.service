@@ -1,0 +1,58 @@
+[Unit]
+Description=WireRelay opaque UDP relay
+Documentation=https://github.com/Wiresock-Foundation/wire-relay
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=wire-relay
+Group=wire-relay
+UMask=0027
+
+ExecStartPre=/usr/local/bin/wire-relay check-config --config /etc/wire-relay/config.toml
+ExecStart=/usr/local/bin/wire-relay run --config /etc/wire-relay/config.toml
+ExecReload=/usr/local/bin/wire-relay reload
+
+RuntimeDirectory=wire-relay
+RuntimeDirectoryMode=0750
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=310s
+LimitNOFILE=131072
+
+# Hardening deliberately keeps AF_INET/AF_INET6 for UDP and DNS, AF_UNIX for
+# the control socket, read access to the configuration, writes to the runtime
+# directory, and stdout/stderr access to journald.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+# Permit explicitly configured privileged UDP listener or metrics ports while
+# retaining an otherwise empty capability set.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+# AF_NETLINK is retained because common libc resolver implementations use it
+# to inspect local interface state while sorting IPv4/IPv6 results.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

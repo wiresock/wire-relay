@@ -1,0 +1,65 @@
+# WireRelay example configuration.
+#
+# Copy to /etc/wire-relay/config.toml, replace the example endpoints, and run:
+#   wire-relay check-config --config /etc/wire-relay/config.toml
+#
+# Configuration is strict: unknown keys, zero-valued limits, duplicate names,
+# conflicting bind addresses, hostnames in `bind`, and invalid endpoints fail
+# validation.
+
+[service]
+# Local control-plane Unix socket. Its parent must be owned and protected by
+# the service administrator. The packaged systemd unit creates this directory.
+control_socket = "/run/wire-relay/control.sock"
+
+# One of: error, warn, info, debug, trace.
+log_level = "info"
+
+# Client or backend activity resets this deadline. Active sessions have no hard
+# lifetime limit.
+idle_timeout = "180s"
+
+# Whole UDP payloads larger than this value are dropped, never truncated and
+# forwarded. Valid range: 1..=65507.
+max_datagram_size = 4096
+
+# Admission limits. Each active session owns a connected upstream UDP socket.
+# The compiled maximum active-session limit is 100000.
+max_sessions = 10000
+max_sessions_per_ip = 64
+
+# Global new-session token-bucket rate, with at most one second of burst
+# (compiled maximum: 100000 per second).
+new_sessions_per_second = 100
+
+# Hostnames are resolved at startup and refreshed on this interval. DNS is not
+# queried per packet. Existing sessions keep their selected address.
+dns_refresh_interval = "60s"
+
+# Graceful-shutdown wait after listeners and control acceptance stop.
+shutdown_timeout = "10s"
+
+[metrics]
+# Metrics use Prometheus text exposition at /metrics. Keep the endpoint on
+# loopback unless it is protected by network policy or an authenticated proxy.
+enabled = false
+bind = "127.0.0.1:9090"
+
+# Listener binds must use numeric IP addresses and nonzero UDP ports. Each
+# listener has one fixed backend; clients can never select a destination.
+[[listeners]]
+name = "germany"
+bind = "0.0.0.0:40001"
+backend = "de.example.com:51820"
+
+[[listeners]]
+name = "netherlands"
+bind = "0.0.0.0:40002"
+backend = "nl.example.com:51820"
+
+# IPv6 literals require brackets when combined with a port:
+#
+# [[listeners]]
+# name = "ipv6-example"
+# bind = "[::]:40003"
+# backend = "[2001:db8::10]:51820"
