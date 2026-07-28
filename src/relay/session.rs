@@ -232,6 +232,16 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    #[cfg(test)]
+    pub(super) fn for_test(session: Session) -> Arc<Self> {
+        let (client_datagrams, _receiver) = mpsc::channel(1);
+        Arc::new(Self {
+            session: Arc::new(session),
+            client_datagrams,
+            cancel: CancellationToken::new(),
+        })
+    }
+
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session

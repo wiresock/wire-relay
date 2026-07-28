@@ -141,20 +141,15 @@ impl SessionTable {
     /// Removes only the exact session incarnation, protecting a newer mapping
     /// from a stale task's cleanup.
     pub fn remove(&self, key: &SessionKey, id: SessionId) -> Option<Arc<SessionHandle>> {
-        let matches = self
+        // `remove_if` holds the shard write lock across the identity check and
+        // deletion, so a replacement cannot slip between separate operations.
+        let (_, removed) = self
             .by_key
-            .get(key)
-            .is_some_and(|entry| entry.session().id == id);
-        if !matches {
-            return None;
-        }
+            .remove_if(key, |_, session| session.session().id == id)?;
 
-        let removed = self.by_key.remove(key).map(|(_, session)| session);
-        if removed.is_some() {
-            self.by_id.remove(&id);
-            self.count.fetch_sub(1, Ordering::Relaxed);
-        }
-        removed
+        self.by_id.remove(&id);
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        Some(removed)
     }
 
     #[must_use]
@@ -207,6 +202,7 @@ impl SessionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::Session;
 
     #[test]
     fn session_key_includes_listener_and_source_port() {
@@ -226,5 +222,67 @@ mod tests {
     fn session_ids_round_trip() {
         let id = SessionId::new();
         assert_eq!(id.to_string().parse::<SessionId>().unwrap(), id);
+    }
+
+    #[test]
+    fn removal_requires_the_current_session_incarnation() {
+        let table = SessionTable::new();
+        let session = test_session_handle();
+        let key = session.session().key();
+        let id = session.session().id;
+        let wrong_id = SessionId::new();
+        assert_ne!(id, wrong_id);
+        assert!(table.insert(Arc::clone(&session)).is_ok());
+
+        assert!(table.remove(&key, wrong_id).is_none());
+        assert_eq!(table.len(), 1);
+        assert!(Arc::ptr_eq(
+            &table.get_by_key(&key).expect("mapping must remain by key"),
+            &session
+        ));
+        assert!(Arc::ptr_eq(
+            &table.get_by_id(&id).expect("mapping must remain by ID"),
+            &session
+        ));
+
+        let removed = table
+            .remove(&key, id)
+            .expect("exact session must be removed");
+        assert!(Arc::ptr_eq(&removed, &session));
+        assert!(table.get_by_key(&key).is_none());
+        assert!(table.get_by_id(&id).is_none());
+        assert!(table.is_empty());
+
+        let replacement = test_session_handle();
+        let replacement_id = replacement.session().id;
+        assert_eq!(replacement.session().key(), key);
+        assert_ne!(replacement_id, id);
+        assert!(table.insert(Arc::clone(&replacement)).is_ok());
+
+        assert!(table.remove(&key, id).is_none());
+        assert_eq!(table.len(), 1);
+        assert!(table.get_by_id(&id).is_none());
+        assert!(Arc::ptr_eq(
+            &table
+                .get_by_key(&key)
+                .expect("replacement must remain by key"),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            &table
+                .get_by_id(&replacement_id)
+                .expect("replacement must remain by ID"),
+            &replacement
+        ));
+    }
+
+    fn test_session_handle() -> Arc<SessionHandle> {
+        SessionHandle::for_test(Session::new(
+            ListenerId::new(7),
+            "test".to_owned(),
+            "192.0.2.10:40000".parse().unwrap(),
+            "127.0.0.1:40001".parse().unwrap(),
+            "192.0.2.20:51820".parse().unwrap(),
+        ))
     }
 }
