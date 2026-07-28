@@ -1,7 +1,7 @@
 # Commercial licensing
 
 WireRelay is available as free software under the GNU Affero General Public
-License, version 3 or any later version. See `LICENSE-AGPL-3.0`.
+License, version 3 or any later version. See `LICENSE`.
 
 A separate commercial license may be available from the relevant copyright
 holders for organizations that need terms different from the AGPL. Commercial

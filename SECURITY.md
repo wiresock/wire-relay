@@ -18,7 +18,7 @@ pull request, log excerpt, or chat.
 
 Use GitHub's private vulnerability reporting flow:
 
-<https://github.com/Wiresock-Foundation/wire-relay/security/advisories/new>
+<https://github.com/wiresock/wire-relay/security/advisories/new>
 
 Include, where possible:
 

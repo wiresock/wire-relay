@@ -1,6 +1,6 @@
 [Unit]
 Description=WireRelay opaque UDP relay
-Documentation=https://github.com/Wiresock-Foundation/wire-relay
+Documentation=https://github.com/wiresock/wire-relay
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=60
