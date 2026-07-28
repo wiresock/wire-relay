@@ -43,8 +43,11 @@ cargo test --lib --bins --benches --all-features --locked
 cargo test --doc --all-features --locked
 cargo test --test "*" --all-features --locked
 cargo build --release --all-features --locked
-bash -n bootstrap.sh scripts/bootstrap.sh
-shellcheck bootstrap.sh scripts/bootstrap.sh
+python3 scripts/versioning/version.py validate
+python3 -m unittest discover -s scripts/versioning -p "test_*.py"
+bash -n bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+shellcheck bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+bash tests/bootstrap_version_tests.sh
 ```
 
 If a check cannot be run locally, state which one and why in the pull request.
@@ -110,8 +113,26 @@ Linux distribution. Explain why each added hardening directive remains
 compatible with UDP sockets, resolver access, journald, configuration reads,
 and `/run/wire-relay` socket creation.
 
-User-visible changes belong in `CHANGELOG.md`. CLI JSON and control-protocol
-changes must be treated as compatibility changes and documented explicitly.
+Breaking, security-sensitive, and operationally significant changes belong in
+`CHANGELOG.md`; routine patch history is generated from pull request metadata
+in GitHub Releases. CLI JSON and control-protocol changes must be treated as
+compatibility changes and documented explicitly.
+
+## Versioning
+
+`Cargo.toml` is the application-version source of truth, and the matching
+`wire-relay` package entry in `Cargo.lock` must stay synchronized. CI validates
+that invariant. After each pull request merges, automation normally increments
+the patch version, creates an annotated `vMAJOR.MINOR.PATCH` tag, and publishes
+the release.
+
+For an intentional minor or major release, update both files to a strictly
+higher stable semantic version in the pull request and update the curated
+changelog milestone. Automation detects the manual increase and does not add a
+second bump. Do not change the independent control-protocol version unless the
+local protocol itself changes. The complete policy and recovery behavior are
+documented in
+[`docs/VERSIONING.md`](docs/VERSIONING.md).
 
 ## Pull requests
 
