@@ -40,11 +40,41 @@ jobs:
       - name: Lint all targets and features
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Test all features
-        run: cargo test --all-targets --all-features --locked
+      - name: Test unit, binary, and benchmark targets
+        run: cargo test --lib --bins --benches --all-features --locked
+
+      - name: Test documentation
+        run: cargo test --doc --all-features --locked
 
       - name: Build release binary
         run: cargo build --release --all-features --locked
+
+  integration:
+    name: Integration tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integration-${{ matrix.os }}
+
+      - name: Run integration suites
+        run: cargo test --test "*" --all-features --locked
 
   msrv:
     name: Rust 1.85 compatibility

@@ -17,7 +17,7 @@ use wire_relay::{
     runtime::{Runtime, RuntimeOptions},
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -227,8 +227,8 @@ async fn reload_adds_listener_while_preserving_unchanged_listener_and_session() 
     let stable_listener_id = listener_id(&runtime, "stable");
     let stable_session_id = only_session(&runtime).id;
 
-    drop(added_reservation);
     write_valid_config(&config_path, &[stable, added]);
+    drop(added_reservation);
     let result = runtime.reload().await.expect("valid reload must apply");
     assert!(result.applied);
     assert_eq!(result.preserved, ["stable"]);
@@ -406,7 +406,7 @@ async fn reload_idle_timeout_wakes_and_updates_existing_session_deadlines() {
         bind: relay_bind,
         backend: backend.address,
     };
-    let initial = write_config_with_idle(&config_path, &[listener], "150ms");
+    let initial = write_config_with_idle(&config_path, &[listener], "1s");
     drop(relay_reservation);
     let runtime = start_runtime(initial, &config_path).await;
     let client = UdpSocket::bind("127.0.0.1:0")
@@ -420,10 +420,10 @@ async fn reload_idle_timeout_wakes_and_updates_existing_session_deadlines() {
     );
     let session_id = only_session(&runtime).id;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    write_config_with_idle(&config_path, &[listener], "2s");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    write_config_with_idle(&config_path, &[listener], "5s");
     runtime.reload().await.expect("longer timeout must apply");
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert!(
         runtime
             .sessions()

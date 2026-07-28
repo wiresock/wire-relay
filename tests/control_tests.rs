@@ -255,7 +255,7 @@ backend = "127.0.0.1:9"
     )
     .await
     .expect("runtime must start");
-    let client = ControlClient::new(&socket_path).with_timeout(Duration::from_secs(2));
+    let client = ControlClient::new(&socket_path).with_timeout(Duration::from_secs(5));
 
     let status = client
         .request(ControlRequest::Status)

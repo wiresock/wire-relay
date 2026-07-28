@@ -37,11 +37,14 @@ Do not update unrelated dependencies in the same pull request.
 Run the same checks as CI before requesting review:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo build --release
-shellcheck scripts/bootstrap.sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --lib --bins --benches --all-features --locked
+cargo test --doc --all-features --locked
+cargo test --test "*" --all-features --locked
+cargo build --release --all-features --locked
+bash -n bootstrap.sh scripts/bootstrap.sh
+shellcheck bootstrap.sh scripts/bootstrap.sh
 ```
 
 If a check cannot be run locally, state which one and why in the pull request.

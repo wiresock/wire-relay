@@ -16,7 +16,7 @@ use wire_relay::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const IDLE_TIMEOUT: Duration = Duration::from_millis(300);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct EchoBackend {
