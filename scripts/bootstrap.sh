@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Install, update, configure, and remove WireRelay on supported systemd Linux
+# Install, upgrade, configure, and remove WireRelay on supported systemd Linux
 # distributions.
 
 set -Eeuo pipefail
@@ -19,6 +19,7 @@ readonly MAX_SESSION_LIMIT=100000
 readonly MAX_SESSION_RATE=100000
 readonly MAX_SESSION_DATAGRAM_MEMORY_BYTES=4294967296
 readonly SESSION_DATAGRAM_SLOTS=10
+readonly SEMANTIC_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 readonly DEFAULT_REPOSITORY_URL="https://github.com/wiresock/wire-relay.git"
 readonly REPOSITORY_URL="${WIRE_RELAY_REPOSITORY_URL:-$DEFAULT_REPOSITORY_URL}"
 readonly BINARY_PATH="/usr/local/bin/wire-relay"
@@ -28,6 +29,7 @@ readonly UNIT_PATH="/etc/systemd/system/wire-relay.service"
 readonly ROLLBACK_UNIT_PATH="$STATE_DIR/wire-relay.service.rollback"
 readonly CONFIG_DIR="/etc/wire-relay"
 readonly CONFIG_PATH="$CONFIG_DIR/config.toml"
+readonly OPERATION_LOCK_PATH="/run/wire-relay-bootstrap.lock"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
@@ -60,6 +62,7 @@ INSTALL_CONFIG_DIR_EXISTED_BEFORE=0
 INSTALL_CONFIG_DIR_ORIGINAL_UID=""
 INSTALL_CONFIG_DIR_ORIGINAL_GID=""
 INSTALL_CONFIG_DIR_ORIGINAL_MODE=""
+OPERATION_LOCK_FD=""
 declare -a WIZARD_LISTENER_NAMES=()
 declare -a WIZARD_LISTENER_BINDS=()
 declare -a WIZARD_LISTENER_BACKENDS=()
@@ -83,6 +86,79 @@ warn() {
 die() {
     printf '[wire-relay] ERROR: %s\n' "$*" >&2
     exit 1
+}
+
+parse_semantic_version() {
+    local version="$1"
+
+    [[ "$version" =~ $SEMANTIC_VERSION_PATTERN ]] || return 1
+    printf '%s\n' "$version"
+}
+
+parse_wire_relay_version() {
+    local output="$1"
+    local version
+
+    [[ "$output" =~ ^wire-relay[[:space:]]+([^[:space:]]+)$ ]] || return 1
+    version="${BASH_REMATCH[1]}"
+    parse_semantic_version "$version"
+}
+
+compare_version_component() {
+    local left="$1"
+    local right="$2"
+    local LC_ALL=C
+
+    if (( ${#left} < ${#right} )); then
+        printf '%s\n' "-1"
+    elif (( ${#left} > ${#right} )); then
+        printf '%s\n' "1"
+    elif [[ "$left" == "$right" ]]; then
+        printf '%s\n' "0"
+    elif [[ "$left" < "$right" ]]; then
+        printf '%s\n' "-1"
+    else
+        printf '%s\n' "1"
+    fi
+}
+
+compare_semantic_versions() {
+    local left="$1"
+    local right="$2"
+    local left_major
+    local left_minor
+    local left_patch
+    local right_major
+    local right_minor
+    local right_patch
+    local comparison
+    local index
+    local -a left_components
+    local -a right_components
+
+    parse_semantic_version "$left" >/dev/null || return 2
+    left_major="${BASH_REMATCH[1]}"
+    left_minor="${BASH_REMATCH[2]}"
+    left_patch="${BASH_REMATCH[3]}"
+    parse_semantic_version "$right" >/dev/null || return 2
+    right_major="${BASH_REMATCH[1]}"
+    right_minor="${BASH_REMATCH[2]}"
+    right_patch="${BASH_REMATCH[3]}"
+
+    left_components=("$left_major" "$left_minor" "$left_patch")
+    right_components=("$right_major" "$right_minor" "$right_patch")
+    for index in 0 1 2; do
+        comparison="$(
+            compare_version_component \
+                "${left_components[$index]}" \
+                "${right_components[$index]}"
+        )"
+        if [[ "$comparison" != "0" ]]; then
+            printf '%s\n' "$comparison"
+            return
+        fi
+    done
+    printf '%s\n' "0"
 }
 
 handle_error() {
@@ -133,10 +209,12 @@ usage() {
     cat <<'EOF'
 Usage:
   sudo ./bootstrap.sh install
-  sudo ./bootstrap.sh update
+  sudo ./bootstrap.sh upgrade
   sudo ./bootstrap.sh configure
   sudo ./bootstrap.sh uninstall
   sudo ./bootstrap.sh status
+
+The legacy "update" command remains an alias for "upgrade".
 
 Running without a command opens an interactive menu.
 
@@ -149,6 +227,24 @@ EOF
 require_root() {
     if (( EUID != 0 )); then
         die "This operation changes system files. Run it with sudo or as root."
+    fi
+}
+
+acquire_operation_lock() {
+    acquire_operation_lock_at "$OPERATION_LOCK_PATH"
+}
+
+acquire_operation_lock_at() {
+    local lock_path="$1"
+
+    command -v flock >/dev/null 2>&1 ||
+        die "flock is required to serialize bootstrap operations."
+    if ! exec {OPERATION_LOCK_FD}>"$lock_path"; then
+        die "Could not open the bootstrap operation lock: $lock_path"
+    fi
+    if ! flock --nonblock "$OPERATION_LOCK_FD"; then
+        exec {OPERATION_LOCK_FD}>&-
+        die "Another WireRelay bootstrap operation is already running."
     fi
 }
 
@@ -500,13 +596,27 @@ resolve_source_checkout() {
 }
 
 update_source_checkout() {
+    local branch
     local changes
+    local upstream
 
     changes="$(run_as_builder git -C "$SOURCE_DIR" status --porcelain=v1 --untracked-files=normal)"
     [[ -z "$changes" ]] ||
         die "The source checkout has uncommitted or untracked files; update it manually before retrying."
 
-    log "Updating the Git checkout with a fast-forward-only pull."
+    branch="$(
+        run_as_builder git -C "$SOURCE_DIR" symbolic-ref --quiet --short HEAD
+    )" || die "The source checkout is detached; switch it to a branch that tracks remote main before upgrading."
+    upstream="$(
+        run_as_builder git -C "$SOURCE_DIR" rev-parse \
+            --abbrev-ref \
+            --symbolic-full-name \
+            '@{upstream}'
+    )" || die "Source branch '$branch' has no upstream; configure it to track remote main before upgrading."
+    [[ "$upstream" == */main ]] ||
+        die "Source branch '$branch' tracks '$upstream', not remote main; switch to the main release stream before upgrading."
+
+    log "Updating '$branch' from '$upstream' with a fast-forward-only pull."
     run_as_builder git -C "$SOURCE_DIR" pull --ff-only
 }
 
@@ -1534,7 +1644,6 @@ configuration_wizard() {
 
 restart_and_verify_service() {
     local expected_binary_version="${1:-}"
-    local daemon_version
     local _
     local stable_checks=0
 
@@ -1544,13 +1653,8 @@ restart_and_verify_service() {
 
     for _ in {1..12}; do
         sleep 1
-        daemon_version=""
         if systemctl is-active --quiet "$SERVICE_NAME.service" &&
-            daemon_version="$(
-                "$BINARY_PATH" --config "$CONFIG_PATH" version 2>/dev/null
-            )" &&
-            { [[ -z "$expected_binary_version" ]] ||
-                [[ "$daemon_version" == "${expected_binary_version} (control protocol "*")" ]]; }; then
+            running_daemon_matches "$expected_binary_version"; then
             stable_checks=$((stable_checks + 1))
             if (( stable_checks >= 2 )); then
                 return 0
@@ -1560,6 +1664,24 @@ restart_and_verify_service() {
         fi
     done
     return 1
+}
+
+daemon_version_matches_binary() {
+    local daemon_version="$1"
+    local binary_version="$2"
+
+    [[ "$daemon_version" == "${binary_version} (control protocol "*")" ]]
+}
+
+running_daemon_matches() {
+    local expected_binary_version="${1:-}"
+    local daemon_version
+
+    daemon_version="$(
+        "$BINARY_PATH" --config "$CONFIG_PATH" version 2>/dev/null
+    )" || return 1
+    [[ -z "$expected_binary_version" ]] ||
+        daemon_version_matches_binary "$daemon_version" "$expected_binary_version"
 }
 
 show_service_diagnostics() {
@@ -1572,6 +1694,8 @@ show_examples() {
     cat <<'EOF'
 
 Useful commands:
+  wire-relay --version
+  sudo wire-relay version
   sudo wire-relay show
   sudo wire-relay listeners
   sudo wire-relay sessions
@@ -1653,11 +1777,14 @@ install_command() {
     show_examples
 }
 
-update_command() {
+upgrade_command() {
     local candidate
-    local old_version
-    local new_version
-    local restored_version
+    local installed_binary_version
+    local installed_version
+    local candidate_binary_version
+    local candidate_version
+    local restored_binary_version
+    local version_comparison
 
     require_root
     detect_platform
@@ -1668,18 +1795,46 @@ update_command() {
     [[ -f "$CONFIG_PATH" && ! -L "$CONFIG_PATH" ]] ||
         die "Existing configuration is missing or invalid: $CONFIG_PATH"
 
-    old_version="$("$BINARY_PATH" --version)"
+    installed_binary_version="$("$BINARY_PATH" --version)"
+    installed_version="$(parse_wire_relay_version "$installed_binary_version")" ||
+        die "The installed binary returned an invalid version: $installed_binary_version"
+    log "Installed version: $installed_version"
     install_system_packages
     ensure_rust
     resolve_source_checkout
     update_source_checkout
     build_and_test
     candidate="$BUILD_TARGET_DIR/release/wire-relay"
-    new_version="$(run_as_builder "$candidate" --version)"
-    [[ -n "$new_version" ]] || die "The new binary returned an empty version."
+    candidate_binary_version="$(run_as_builder "$candidate" --version)"
+    candidate_version="$(parse_wire_relay_version "$candidate_binary_version")" ||
+        die "The candidate binary returned an invalid version: $candidate_binary_version"
+    log "Candidate version: $candidate_version"
+    version_comparison="$(
+        compare_semantic_versions "$candidate_version" "$installed_version"
+    )" || die "Could not compare installed and candidate versions."
+
+    case "$version_comparison" in
+        -1)
+            die "Refusing to downgrade WireRelay from $installed_version to $candidate_version."
+            ;;
+        0 | 1)
+            ;;
+        *)
+            die "Internal version comparison returned an invalid result: $version_comparison"
+            ;;
+    esac
 
     log "Validating the existing configuration with the new binary."
     "$candidate" check-config --config "$CONFIG_PATH"
+
+    if [[ "$version_comparison" == "0" ]]; then
+        if systemctl is-active --quiet "$SERVICE_NAME.service" &&
+            running_daemon_matches "$installed_binary_version"; then
+            log "WireRelay $installed_version is already installed and running; no binary replacement or restart is needed."
+            return
+        fi
+        log "WireRelay $installed_version is installed, but the running service does not match; repairing the installation."
+    fi
 
     ensure_service_identity
     save_binary_rollback
@@ -1688,35 +1843,35 @@ update_command() {
     if atomic_install_binary "$candidate" &&
         atomic_install_unit "$SOURCE_DIR/packaging/systemd/wire-relay.service" &&
         systemctl daemon-reload &&
-        restart_and_verify_service "$new_version"; then
-        log "Update succeeded."
-        printf '  Previous: %s\n' "$old_version"
-        printf '  Installed: %s\n' "$new_version"
+        restart_and_verify_service "$candidate_binary_version"; then
+        log "Upgrade succeeded."
+        printf '  Previous: %s\n' "$installed_version"
+        printf '  Installed: %s\n' "$candidate_version"
         log "Rollback binary retained at $ROLLBACK_BINARY_PATH."
         return
     fi
 
     show_service_diagnostics
-    warn "The updated service failed; restoring the previous binary and unit."
+    warn "The upgraded service failed; restoring the previous binary and unit."
     atomic_install_binary "$ROLLBACK_BINARY_PATH" ||
         die "Could not restore the rollback binary."
     restore_unit_rollback ||
         die "Could not restore the rollback systemd unit."
     systemctl daemon-reload ||
         die "Could not reload systemd after restoring the previous unit."
-    restored_version="$("$BINARY_PATH" --version)"
-    if [[ "$restored_version" != "$old_version" ]]; then
-        die "Rollback binary verification failed (expected '$old_version', got '$restored_version')."
+    restored_binary_version="$("$BINARY_PATH" --version)"
+    if [[ "$restored_binary_version" != "$installed_binary_version" ]]; then
+        die "Rollback binary verification failed (expected '$installed_binary_version', got '$restored_binary_version')."
     fi
 
-    if restart_and_verify_service "$old_version"; then
-        printf '  Failed update: %s\n' "$new_version" >&2
-        printf '  Rolled back to: %s\n' "$old_version" >&2
-        die "Update failed; automatic rollback succeeded."
+    if restart_and_verify_service "$installed_binary_version"; then
+        printf '  Failed upgrade: %s\n' "$candidate_version" >&2
+        printf '  Rolled back to: %s\n' "$installed_version" >&2
+        die "Upgrade failed; automatic rollback succeeded."
     fi
 
     show_service_diagnostics
-    die "Update failed, and the restored version also failed to start. Inspect the diagnostics above."
+    die "Upgrade failed, and the restored version also failed to start. Inspect the diagnostics above."
 }
 
 configure_command() {
@@ -1895,14 +2050,14 @@ interactive_menu() {
 
     printf '%s\n\n' "$PROGRAM_NAME"
     PS3="Choose an action: "
-    select choice in Install Update Configure Uninstall Status Quit; do
+    select choice in Install Upgrade Configure Uninstall Status Quit; do
         case "$choice" in
             Install)
                 SELECTED_COMMAND="install"
                 return
                 ;;
-            Update)
-                SELECTED_COMMAND="update"
+            Upgrade)
+                SELECTED_COMMAND="upgrade"
                 return
                 ;;
             Configure)
@@ -1945,11 +2100,18 @@ main() {
     fi
 
     case "$command_name" in
+        install | upgrade | update | configure | uninstall)
+            require_root
+            acquire_operation_lock
+            ;;
+    esac
+
+    case "$command_name" in
         install)
             install_command
             ;;
-        update)
-            update_command
+        upgrade | update)
+            upgrade_command
             ;;
         configure)
             configure_command

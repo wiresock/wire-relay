@@ -5,7 +5,7 @@ use std::{io, net::IpAddr, str::FromStr, time::Duration};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use wire_relay::{
-    CONTROL_PROTOCOL_VERSION,
+    CONTROL_PROTOCOL_VERSION, VERSION,
     control::{
         ControlClient, ControlError, ControlErrorCode, ControlRequest, ControlResponse,
         RequestEnvelope, ResponseEnvelope,
@@ -16,6 +16,24 @@ use wire_relay::{
     },
     relay::SessionId,
 };
+
+#[test]
+fn local_cli_version_matches_the_package_version() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wire-relay"))
+        .arg("--version")
+        .output()
+        .expect("version CLI must execute");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("wire-relay {VERSION}")
+    );
+}
 
 #[test]
 fn request_variants_round_trip_with_stable_json_tags() {
@@ -212,7 +230,6 @@ async fn unix_control_socket_queries_live_runtime_state_and_versions() {
     use tempfile::tempdir;
     use tokio::net::UnixStream;
     use wire_relay::{
-        VERSION,
         config::Config,
         runtime::{Runtime, RuntimeOptions},
     };

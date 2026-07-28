@@ -1,0 +1,216 @@
+name: Version and Release
+
+on:
+  # This mutating job must receive the trusted base repository token even when
+  # the merged PR came from a fork or Dependabot. It checks out only `main` and
+  # the already-merged commit; no untrusted PR branch code is executed.
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - closed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wire-relay-version-and-release
+  queue: max
+
+jobs:
+  version:
+    name: Version merged pull request
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      release_ref: ${{ steps.version.outputs.release_ref }}
+      release_sha: ${{ steps.version.outputs.release_sha }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git author
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect a version changed by the pull request
+        id: compare
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha }}
+          MERGE_REF: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/versioning/version.py compare-refs \
+            --base-ref "$BASE_REF" \
+            --head-ref "$MERGE_REF"
+
+      - name: Bump or recover the merged pull request version
+        id: version
+        shell: bash
+        env:
+          MANUAL_BUMP: ${{ steps.compare.outputs.changed }}
+          MERGE_REF: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          bot_email="41898282+github-actions[bot]@users.noreply.github.com"
+          expected_subject="chore(version): bump for PR #${PR_NUMBER}"
+          release_sha=""
+          version=""
+          tag=""
+
+          if [[ "$MANUAL_BUMP" == "true" ]]; then
+            git switch --detach "$MERGE_REF"
+            python3 scripts/versioning/version.py validate
+            version="$(
+              python3 scripts/versioning/version.py get \
+                --ref "$MERGE_REF" \
+                --field version
+            )"
+            tag="$(
+              python3 scripts/versioning/version.py get \
+                --ref "$MERGE_REF" \
+                --field tag
+            )"
+            release_sha="$(git rev-parse HEAD)"
+            echo "Pull request #${PR_NUMBER} manually advanced the version to ${version}."
+          else
+            pushed=false
+            for attempt in 1 2 3 4 5 6 7 8; do
+              git fetch --prune --tags origin
+
+              existing_commit=""
+              while read -r candidate_commit; do
+                [[ -n "$candidate_commit" ]] || continue
+                git merge-base --is-ancestor "$MERGE_REF" "$candidate_commit" ||
+                  continue
+                [[ "$(git show -s --format='%s' "$candidate_commit")" == "$expected_subject" ]] ||
+                  continue
+                [[ "$(git show -s --format='%ce' "$candidate_commit")" == "$bot_email" ]] ||
+                  continue
+                changed_files="$(
+                  git diff-tree --no-commit-id --name-only -r "$candidate_commit" |
+                    LC_ALL=C sort
+                )"
+                [[ "$changed_files" == $'Cargo.lock\nCargo.toml' ]] || continue
+                GITHUB_OUTPUT= python3 scripts/versioning/version.py compare-refs \
+                  --base-ref "${candidate_commit}^" \
+                  --head-ref "$candidate_commit" >/dev/null
+                existing_commit="$candidate_commit"
+                break
+              done < <(
+                git log origin/main \
+                  --format='%H' \
+                  --fixed-strings \
+                  --grep="$expected_subject"
+              )
+              if [[ -n "$existing_commit" ]]; then
+                git switch --detach --force "$existing_commit"
+                python3 scripts/versioning/version.py validate
+                version="$(
+                  python3 scripts/versioning/version.py get \
+                    --ref "$existing_commit" \
+                    --field version
+                )"
+                tag="$(
+                  python3 scripts/versioning/version.py get \
+                    --ref "$existing_commit" \
+                    --field tag
+                )"
+                release_sha="$(git rev-parse HEAD)"
+                pushed=true
+                echo "Recovered the existing version commit for pull request #${PR_NUMBER}."
+                break
+              fi
+
+              git switch --detach --force origin/main
+              python3 scripts/versioning/version.py validate
+              version="$(GITHUB_OUTPUT= python3 scripts/versioning/version.py bump)"
+              tag="$(python3 scripts/versioning/version.py get --field tag)"
+              git add -- Cargo.toml Cargo.lock
+              git diff --cached --quiet && {
+                echo "The version helper did not modify the version files." >&2
+                exit 1
+              }
+              git commit -m "$expected_subject"
+              release_sha="$(git rev-parse HEAD)"
+
+              if git push origin HEAD:refs/heads/main; then
+                pushed=true
+                break
+              fi
+
+              echo "::warning::main advanced while creating ${tag}; retrying from the latest commit."
+              sleep "$((attempt * 2))"
+            done
+
+            if [[ "$pushed" != "true" ]]; then
+              echo "Could not push a unique version commit after 8 attempts." >&2
+              exit 1
+            fi
+          fi
+
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "Version helper returned an invalid release tag: $tag" >&2
+            exit 1
+          }
+          [[ -n "$release_sha" ]] || {
+            echo "Version workflow did not resolve a release commit." >&2
+            exit 1
+          }
+
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            [[ "$(git cat-file -t "refs/tags/$tag")" == "tag" ]] || {
+              echo "Existing $tag is not an annotated tag." >&2
+              exit 1
+            }
+            existing_target="$(git rev-parse "refs/tags/$tag^{}")"
+            [[ "$existing_target" == "$release_sha" ]] || {
+              echo "Existing $tag points to $existing_target, expected $release_sha." >&2
+              exit 1
+            }
+            echo "Annotated tag $tag already points to the release commit."
+          else
+            git tag -a "$tag" "$release_sha" -m "WireRelay $version"
+            if ! git push origin "refs/tags/$tag"; then
+              remote_target="$(
+                git ls-remote --tags origin "refs/tags/${tag}^{}" |
+                  awk 'NR == 1 { print $1 }'
+              )"
+              [[ "$remote_target" == "$release_sha" ]] || {
+                echo "Could not publish annotated tag $tag." >&2
+                exit 1
+              }
+              echo "Annotated tag $tag was published concurrently."
+            fi
+          fi
+
+          {
+            echo "release_ref=$tag"
+            echo "release_sha=$release_sha"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Build and publish ${{ needs.version.outputs.release_ref }}
+    needs:
+      - version
+    if: needs.version.outputs.release_ref != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      release_ref: ${{ needs.version.outputs.release_ref }}
+      release_sha: ${{ needs.version.outputs.release_sha }}

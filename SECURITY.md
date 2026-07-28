@@ -2,14 +2,13 @@
 
 ## Supported versions
 
-WireRelay has not yet declared a production release in `CHANGELOG.md`.
-Security fixes are made on the current development line until release notes
-identify maintained tagged versions.
+WireRelay is pre-1.0 software. Security fixes are provided in the latest tagged
+release; older tags and untagged development snapshots should not be assumed to
+receive updates. Operators should normally run the newest available patch
+version and review its release notes before deployment.
 
-After releases begin, the release notes will state which version lines remain
-supported. Operators should normally run the latest patch release in a
-maintained line; older development snapshots should not be assumed to receive
-security updates.
+Release notes will explicitly identify any additional maintained version line
+if that policy changes.
 
 ## Reporting a vulnerability
 

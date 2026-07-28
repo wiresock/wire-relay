@@ -1,22 +1,27 @@
 # Changelog
 
-All notable user-visible changes to WireRelay will be documented in this file.
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and releases are intended to follow
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+WireRelay uses this file for curated release milestones and compatibility
+changes. Patch-by-patch history is generated from merged pull requests on the
+[GitHub Releases](https://github.com/wiresock/wire-relay/releases) page.
+Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### In progress
+No curated milestone is currently pending.
 
-- The initial `0.1.0` release: bounded opaque UDP forwarding, per-client
+## [0.1.1] - 2026-07-28
+
+### Added
+
+- Initial WireRelay release: bounded opaque UDP forwarding, per-client
   connected upstream sockets, strict TOML configuration, cached DNS,
   transactional reload, a versioned local control plane, operator CLI,
   Prometheus metrics, systemd packaging, bootstrap management, tests, and
   Linux release automation.
-
-No production release has been declared by this changelog yet. Consult a
-tagged release's notes and artifacts rather than treating the `Unreleased`
-section as a compatibility or verification guarantee.
+- Automatic patch-version commits and release tags after every merged pull
+  request, with explicit manual minor/major version support.
+- A version-aware `bootstrap.sh upgrade` command that avoids same-version
+  reinstalls and rejects accidental downgrades.
 
 [Unreleased]: https://github.com/wiresock/wire-relay/commits/main
+[0.1.1]: https://github.com/wiresock/wire-relay/releases/tag/v0.1.1

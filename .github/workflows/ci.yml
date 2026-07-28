@@ -97,6 +97,34 @@ jobs:
       - name: Check minimum supported toolchain
         run: cargo check --all-targets --all-features --locked
 
+  versioning:
+    name: Version policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version metadata
+        run: python3 scripts/versioning/version.py validate
+
+      - name: Reject a non-increasing manual version
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 scripts/versioning/version.py compare-refs \
+            --base-ref "$BASE_REF" \
+            --head-ref HEAD
+
+      - name: Test version helper
+        run: python3 -m unittest discover -s scripts/versioning -p "test_*.py"
+
+      - name: Test bootstrap version decisions
+        run: bash tests/bootstrap_version_tests.sh
+
   shellcheck:
     name: ShellCheck
     runs-on: ubuntu-latest
@@ -110,5 +138,5 @@ jobs:
 
       - name: Lint bootstrap script
         run: |
-          bash -n bootstrap.sh scripts/bootstrap.sh
-          shellcheck bootstrap.sh scripts/bootstrap.sh
+          bash -n bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+          shellcheck bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh

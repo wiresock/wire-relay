@@ -82,10 +82,12 @@ Other workflows are:
 
 ```bash
 sudo ./bootstrap.sh configure
-sudo ./bootstrap.sh update
+sudo ./bootstrap.sh upgrade
 sudo ./bootstrap.sh status
 sudo ./bootstrap.sh uninstall
 ```
+
+`update` remains accepted as a compatibility alias for `upgrade`.
 
 Running the script without a command opens its interactive menu:
 
@@ -98,16 +100,25 @@ root, validates configuration before starting the service, and places the
 binary at `/usr/local/bin/wire-relay`. Review a script before running it with
 elevated privileges.
 
-The exact update command is:
+The exact upgrade command is:
 
 ```bash
 cd /path/to/wire-relay
-sudo ./bootstrap.sh update
+sudo ./bootstrap.sh upgrade
 ```
 
-An update does not replace the active configuration. It validates that
+The source checkout must be clean, and its current branch must track a remote
+`main` branch. The command rejects detached/tag and feature-branch checkouts
+with guidance instead of selecting an unintended upgrade stream.
+
+An upgrade does not replace the active configuration. It validates that
 configuration with the candidate binary and retains a rollback binary until
-the restarted service has been verified.
+the restarted service has been verified. If the source still builds the
+installed version, the operation exits without replacing the binary or
+restarting the service when the running daemon reports that same version. If
+the daemon is stopped, stale, or unreachable, the same-version operation
+repairs and restarts the installation. A candidate older than the installed
+version is rejected.
 
 ### Build from source
 
@@ -126,9 +137,13 @@ The repository's systemd unit expects the executable at
 Use the bootstrap script unless you deliberately want to manage those pieces
 yourself.
 
-Tagged releases are expected to provide Linux x86_64 and ARM64 archives,
-release notes, a source archive, and SHA-256 checksums. Verify the checksum
-before installing a downloaded artifact.
+Tagged releases provide Linux x86_64 and ARM64 archives, release notes, a
+source archive, and SHA-256 checksums. Verify the checksum before installing a
+downloaded artifact.
+
+Every merged pull request advances the application version and creates a
+release tag. See [`docs/VERSIONING.md`](docs/VERSIONING.md) for the automatic
+patch policy and manual minor/major releases.
 
 ## Configuration
 
@@ -251,6 +266,11 @@ wire-relay reload
 wire-relay version
 wire-relay --version
 ```
+
+`wire-relay --version` reports the installed executable without requiring a
+running service. `wire-relay version` queries the running daemon and includes
+its control-protocol version, which is useful for detecting a stale daemon
+after an installation change.
 
 Session listings use an opaque control-protocol cursor. The daemon takes one
 filtered, sorted snapshot for the command and serves every page from that
