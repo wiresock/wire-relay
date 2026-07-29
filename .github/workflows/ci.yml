@@ -97,6 +97,36 @@ jobs:
       - name: Check minimum supported toolchain
         run: cargo check --all-targets --all-features --locked
 
+  aarch64-release:
+    name: Linux AArch64 release build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install AArch64 cross toolchain and libc sysroot
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+
+      - name: Install stable Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-release
+
+      - name: Build AArch64 release binary
+        run: cargo build --release --all-features --locked --target aarch64-unknown-linux-gnu
+
   versioning:
     name: Version policy
     runs-on: ubuntu-latest

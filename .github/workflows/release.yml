@@ -150,7 +150,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             apt_packages: ""
           - target: aarch64-unknown-linux-gnu
-            apt_packages: gcc-aarch64-linux-gnu
+            # The GCC meta-package only recommends the cross libc development
+            # sysroot, while the install step intentionally disables
+            # recommends. List it explicitly for Scrt1.o, crti.o, and headers.
+            apt_packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
     steps:
       - name: Check out source
