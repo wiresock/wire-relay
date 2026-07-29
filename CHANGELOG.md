@@ -12,6 +12,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Replaced the repository-only management wrapper with the self-contained
   `wire-relay-install.sh`, which supports reviewed downloads and direct
   `curl | sudo bash` installation.
+- The installer leaves the full Rust test suite to CI by default. Set
+  `WIRE_RELAY_RUN_TESTS=1` to opt in when validating a custom source checkout.
 
 ## [0.1.1] - 2026-07-28
 

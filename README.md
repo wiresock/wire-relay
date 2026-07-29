@@ -88,11 +88,18 @@ curl -fsSL https://raw.githubusercontent.com/wiresock/wire-relay/main/wire-relay
   | sudo bash
 ```
 
-The self-contained installer builds, tests, installs, and configures
-WireRelay. When it is downloaded or piped outside a WireRelay source checkout,
-it clones the repository into the build user's home directory. Its
-component-specific filename lets it coexist with installers for other
-Wiresock services.
+The self-contained installer builds the release binary, installs it, and
+configures WireRelay. The full Rust test suite runs in CI and is not repeated
+on the target host by default. When the installer is downloaded or piped
+outside a WireRelay source checkout, it clones the repository into the build
+user's home directory. Its component-specific filename lets it coexist with
+installers for other Wiresock services.
+
+To run the full suite before installing from a custom source checkout:
+
+```console
+sudo WIRE_RELAY_RUN_TESTS=1 bash wire-relay-install.sh install
+```
 
 Other workflows are:
 
