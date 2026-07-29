@@ -14,6 +14,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `curl | sudo bash` installation.
 - The installer leaves the full Rust test suite to CI by default. Set
   `WIRE_RELAY_RUN_TESTS=1` to opt in when validating a custom source checkout.
+- Published the WireSock contact for commercial licensing inquiries.
 
 ## [0.1.1] - 2026-07-28
 

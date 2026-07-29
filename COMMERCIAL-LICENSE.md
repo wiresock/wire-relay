@@ -3,12 +3,12 @@
 WireRelay is available as free software under the GNU Affero General Public
 License, version 3 or any later version. See `LICENSE`.
 
-A separate commercial license may be available from the relevant copyright
-holders for organizations that need terms different from the AGPL. Commercial
-terms, scope, fees, support, warranties, and eligibility are established only
-in a separate written agreement.
+A separate commercial license may be available from WireSock for organizations
+that need terms different from the AGPL. Commercial terms, scope, fees,
+support, warranties, and eligibility are established only in a separate
+written agreement.
 
-**Commercial licensing contact:** `[TO BE PROVIDED BY THE PROJECT MAINTAINERS]`
+Commercial licensing inquiries: **<licensing@wiresock.net>**
 
 This file is informational. It is not a commercial license grant, an offer,
 or a statement of commercial terms, and possession of the source or a binary
