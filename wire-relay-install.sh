@@ -45,6 +45,8 @@ readonly UNIT_PATH="/etc/systemd/system/wire-relay.service"
 readonly ROLLBACK_UNIT_PATH="$STATE_DIR/wire-relay.service.rollback"
 readonly CONFIG_DIR="/etc/wire-relay"
 readonly CONFIG_PATH="$CONFIG_DIR/config.toml"
+# Retain the legacy path so old bootstrap versions and this installer cannot
+# modify the same installation concurrently during an upgrade.
 readonly OPERATION_LOCK_PATH="/run/wire-relay-bootstrap.lock"
 
 readonly REPOSITORY_ROOT="$INSTALLER_DIR"
@@ -263,7 +265,7 @@ require_root() {
         log "Re-executing the installer through sudo."
         exec sudo \
             --preserve-env=WIRE_RELAY_SOURCE_DIR,WIRE_RELAY_REPOSITORY_URL \
-            bash "${BASH_SOURCE[0]}" "$@"
+            bash -- "${BASH_SOURCE[0]}" "$@"
     fi
 
     die "Piped installs must put sudo before bash: curl ... | sudo bash"
@@ -2137,7 +2139,7 @@ select_command() {
             interactive_menu
         else
             SELECTED_COMMAND="install"
-            log "No command supplied on standard input; starting installation."
+            log "No command supplied in a non-interactive invocation; starting installation."
         fi
     else
         SELECTED_COMMAND="$1"
