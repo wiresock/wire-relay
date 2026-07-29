@@ -20,7 +20,7 @@ No curated milestone is currently pending.
   Linux release automation.
 - Automatic patch-version commits and release tags after every merged pull
   request, with explicit manual minor/major version support.
-- A version-aware `bootstrap.sh upgrade` command that avoids same-version
+- A version-aware source-checkout management command that avoids same-version
   reinstalls and rejects accidental downgrades.
 
 [Unreleased]: https://github.com/wiresock/wire-relay/commits/main

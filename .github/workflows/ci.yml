@@ -136,7 +136,7 @@ jobs:
       - name: Show ShellCheck version
         run: shellcheck --version
 
-      - name: Lint bootstrap script
+      - name: Lint management scripts
         run: |
-          bash -n bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
-          shellcheck bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+          bash -n wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+          shellcheck wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh

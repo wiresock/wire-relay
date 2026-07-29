@@ -45,8 +45,8 @@ cargo test --test "*" --all-features --locked
 cargo build --release --all-features --locked
 python3 scripts/versioning/version.py validate
 python3 -m unittest discover -s scripts/versioning -p "test_*.py"
-bash -n bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
-shellcheck bootstrap.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+bash -n wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+shellcheck wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
 bash tests/bootstrap_version_tests.sh
 ```
 

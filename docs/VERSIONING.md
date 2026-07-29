@@ -74,7 +74,7 @@ the installed binary. The checkout must be clean and on a branch that tracks
 remote `main`; detached/tag and feature-branch checkouts are rejected:
 
 ```bash
-sudo ./bootstrap.sh upgrade
+sudo ./wire-relay.sh upgrade
 ```
 
 For an equal version, the bootstrap still validates the configuration but does
