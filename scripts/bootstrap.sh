@@ -208,11 +208,11 @@ trap 'exit 143' TERM
 usage() {
     cat <<'EOF'
 Usage:
-  sudo ./bootstrap.sh install
-  sudo ./bootstrap.sh upgrade
-  sudo ./bootstrap.sh configure
-  sudo ./bootstrap.sh uninstall
-  sudo ./bootstrap.sh status
+  sudo ./wire-relay.sh install
+  sudo ./wire-relay.sh upgrade
+  sudo ./wire-relay.sh configure
+  sudo ./wire-relay.sh uninstall
+  sudo ./wire-relay.sh status
 
 The legacy "update" command remains an alias for "upgrade".
 

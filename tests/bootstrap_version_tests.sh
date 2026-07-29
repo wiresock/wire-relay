@@ -22,6 +22,15 @@ assert_equal() {
         fail "$description (expected '$expected', got '$actual')"
 }
 
+assert_contains() {
+    local expected="$1"
+    local actual="$2"
+    local description="$3"
+
+    [[ "$actual" == *"$expected"* ]] ||
+        fail "$description (missing '$expected')"
+}
+
 assert_valid_semantic_version() {
     local version="$1"
     local actual
@@ -123,6 +132,14 @@ fi
 if compare_semantic_versions "1.2.3" "01.2.3" >/dev/null; then
     fail "comparison should reject an invalid right version"
 fi
+
+management_help="$("$REPOSITORY_ROOT/wire-relay.sh" --help)"
+assert_contains \
+    "sudo ./wire-relay.sh install" \
+    "$management_help" \
+    "the public management script should delegate to the implementation"
+[[ ! -e "$REPOSITORY_ROOT/bootstrap.sh" ]] ||
+    fail "the generic public bootstrap.sh entry point should not exist"
 
 lock_test_path="$(mktemp)"
 acquire_operation_lock_at "$lock_test_path"

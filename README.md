@@ -69,22 +69,26 @@ matches the intended network load.
 
 ## Installation
 
-### Bootstrap installer
+### WireRelay management script
 
 From a source checkout, the service-management script can build, test, install,
 and configure WireRelay:
 
 ```bash
-sudo ./bootstrap.sh install
+sudo ./wire-relay.sh install
 ```
+
+The component-specific filename lets the script coexist with management tools
+for other Wiresock services. The former generic `bootstrap.sh` entry point is
+not retained.
 
 Other workflows are:
 
 ```bash
-sudo ./bootstrap.sh configure
-sudo ./bootstrap.sh upgrade
-sudo ./bootstrap.sh status
-sudo ./bootstrap.sh uninstall
+sudo ./wire-relay.sh configure
+sudo ./wire-relay.sh upgrade
+sudo ./wire-relay.sh status
+sudo ./wire-relay.sh uninstall
 ```
 
 `update` remains accepted as a compatibility alias for `upgrade`.
@@ -92,7 +96,7 @@ sudo ./bootstrap.sh uninstall
 Running the script without a command opens its interactive menu:
 
 ```bash
-sudo ./bootstrap.sh
+sudo ./wire-relay.sh
 ```
 
 The installer keeps an existing Rust installation, minimizes work performed as
@@ -104,7 +108,7 @@ The exact upgrade command is:
 
 ```bash
 cd /path/to/wire-relay
-sudo ./bootstrap.sh upgrade
+sudo ./wire-relay.sh upgrade
 ```
 
 The source checkout must be clean, and its current branch must track a remote
@@ -134,7 +138,7 @@ cargo build --release --locked
 The repository's systemd unit expects the executable at
 `/usr/local/bin/wire-relay`, configuration at
 `/etc/wire-relay/config.toml`, and a dedicated `wire-relay` user and group.
-Use the bootstrap script unless you deliberately want to manage those pieces
+Use `wire-relay.sh` unless you deliberately want to manage those pieces
 yourself.
 
 Tagged releases provide Linux x86_64 and ARM64 archives, release notes, a
