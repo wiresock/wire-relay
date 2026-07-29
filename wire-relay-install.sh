@@ -58,6 +58,7 @@ BUILDER_HOME=""
 PLATFORM_ARCH=""
 DISTRO_FAMILY=""
 PACKAGE_MANAGER=""
+RUN_TESTS=0
 LAST_CONFIG_BACKUP=""
 CONFIG_CHANGED=0
 CONFIG_EXISTED_BEFORE=0
@@ -248,7 +249,25 @@ installer with no command performs an install.
 Optional environment variables:
   WIRE_RELAY_SOURCE_DIR       Existing checkout or clone destination
   WIRE_RELAY_REPOSITORY_URL   Repository cloned when no checkout is available
+  WIRE_RELAY_RUN_TESTS        Run the full Rust suite when 1 or true
+                              (default: 0)
 EOF
+}
+
+configure_test_policy() {
+    local requested="${WIRE_RELAY_RUN_TESTS:-0}"
+
+    case "${requested,,}" in
+        0 | false)
+            RUN_TESTS=0
+            ;;
+        1 | true)
+            RUN_TESTS=1
+            ;;
+        *)
+            die "WIRE_RELAY_RUN_TESTS must be 0, 1, false, or true."
+            ;;
+    esac
 }
 
 require_root() {
@@ -264,7 +283,7 @@ require_root() {
         -r "${BASH_SOURCE[0]}" ]]; then
         log "Re-executing the installer through sudo."
         exec sudo \
-            --preserve-env=WIRE_RELAY_SOURCE_DIR,WIRE_RELAY_REPOSITORY_URL \
+            --preserve-env=WIRE_RELAY_SOURCE_DIR,WIRE_RELAY_REPOSITORY_URL,WIRE_RELAY_RUN_TESTS \
             bash -- "${BASH_SOURCE[0]}" "$@"
     fi
 
@@ -664,17 +683,24 @@ update_source_checkout() {
     run_as_builder git -C "$SOURCE_DIR" pull --ff-only
 }
 
-build_and_test() {
+run_candidate_tests() {
+    if (( RUN_TESTS == 1 )); then
+        log "Running the complete Rust test suite before installation."
+        run_as_builder env CARGO_TARGET_DIR="$BUILD_TARGET_DIR" \
+            cargo test --all-features --locked --manifest-path "$SOURCE_DIR/Cargo.toml"
+    else
+        log "Skipping the development test suite; set WIRE_RELAY_RUN_TESTS=1 to opt in."
+    fi
+}
+
+build_candidate() {
     local candidate
 
     BUILD_TARGET_DIR="$SOURCE_DIR/target"
     log "Building the release binary with all features."
     run_as_builder env CARGO_TARGET_DIR="$BUILD_TARGET_DIR" \
         cargo build --release --all-features --locked --manifest-path "$SOURCE_DIR/Cargo.toml"
-
-    log "Running the complete test suite before installation."
-    run_as_builder env CARGO_TARGET_DIR="$BUILD_TARGET_DIR" \
-        cargo test --all-features --locked --manifest-path "$SOURCE_DIR/Cargo.toml"
+    run_candidate_tests
 
     candidate="$BUILD_TARGET_DIR/release/wire-relay"
     [[ -f "$candidate" && ! -L "$candidate" && -x "$candidate" ]] ||
@@ -1789,7 +1815,7 @@ install_command() {
     install_system_packages
     ensure_rust
     resolve_source_checkout
-    build_and_test
+    build_candidate
     candidate="$BUILD_TARGET_DIR/release/wire-relay"
     candidate_version="$(run_as_builder "$candidate" --version)"
     [[ -n "$candidate_version" ]] ||
@@ -1852,7 +1878,7 @@ upgrade_command() {
     ensure_rust
     resolve_source_checkout
     update_source_checkout
-    build_and_test
+    build_candidate
     candidate="$BUILD_TARGET_DIR/release/wire-relay"
     candidate_binary_version="$(run_as_builder "$candidate" --version)"
     candidate_version="$(parse_wire_relay_version "$candidate_binary_version")" ||
@@ -2158,7 +2184,12 @@ main() {
     command_name="$SELECTED_COMMAND"
 
     case "$command_name" in
-        install | upgrade | update | configure | uninstall)
+        install | upgrade | update)
+            configure_test_policy
+            require_root "$command_name"
+            acquire_operation_lock
+            ;;
+        configure | uninstall)
             require_root "$command_name"
             acquire_operation_lock
             ;;

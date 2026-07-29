@@ -133,6 +133,66 @@ if compare_semantic_versions "1.2.3" "01.2.3" >/dev/null; then
     fail "comparison should reject an invalid right version"
 fi
 
+unset WIRE_RELAY_RUN_TESTS
+configure_test_policy
+assert_equal \
+    "0" \
+    "$RUN_TESTS" \
+    "target-host tests should be disabled by default"
+
+for setting in "1" "true" "TRUE"; do
+    WIRE_RELAY_RUN_TESTS="$setting"
+    configure_test_policy
+    assert_equal \
+        "1" \
+        "$RUN_TESTS" \
+        "WIRE_RELAY_RUN_TESTS=$setting should enable target-host tests"
+done
+
+for setting in "0" "false" "FALSE"; do
+    WIRE_RELAY_RUN_TESTS="$setting"
+    configure_test_policy
+    assert_equal \
+        "0" \
+        "$RUN_TESTS" \
+        "WIRE_RELAY_RUN_TESTS=$setting should disable target-host tests"
+done
+
+if (
+    WIRE_RELAY_RUN_TESTS="sometimes"
+    configure_test_policy
+) >/dev/null 2>&1; then
+    fail "an invalid WIRE_RELAY_RUN_TESTS value should be rejected"
+fi
+unset WIRE_RELAY_RUN_TESTS
+configure_test_policy
+
+default_test_run="$(
+    run_as_builder() {
+        printf 'run-as-builder\n'
+    }
+    SOURCE_DIR="/tmp/wire-relay-installer-policy-test"
+    BUILD_TARGET_DIR="$SOURCE_DIR/target"
+    RUN_TESTS=0
+    run_candidate_tests
+)"
+[[ "$default_test_run" != *"run-as-builder"* ]] ||
+    fail "the default candidate build policy should not invoke cargo test"
+
+opt_in_test_run="$(
+    run_as_builder() {
+        printf 'run-as-builder\n'
+    }
+    SOURCE_DIR="/tmp/wire-relay-installer-policy-test"
+    BUILD_TARGET_DIR="$SOURCE_DIR/target"
+    RUN_TESTS=1
+    run_candidate_tests
+)"
+assert_contains \
+    "run-as-builder" \
+    "$opt_in_test_run" \
+    "the opt-in candidate build policy should invoke cargo test"
+
 management_help="$(bash "$REPOSITORY_ROOT/wire-relay-install.sh" --help)"
 assert_contains \
     "sudo bash ./wire-relay-install.sh [command]" \
@@ -142,6 +202,10 @@ assert_contains \
     "sudo bash -s -- [command]" \
     "$management_help" \
     "the installer help should document piped command arguments"
+assert_contains \
+    "WIRE_RELAY_RUN_TESTS" \
+    "$management_help" \
+    "the installer help should document the test opt-in"
 
 piped_help="$(
     bash -s -- --help <"$REPOSITORY_ROOT/wire-relay-install.sh"
