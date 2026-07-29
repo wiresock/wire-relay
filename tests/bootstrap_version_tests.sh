@@ -5,8 +5,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 
-# shellcheck source=scripts/bootstrap.sh
-source "$REPOSITORY_ROOT/scripts/bootstrap.sh"
+# shellcheck source=wire-relay-install.sh
+source "$REPOSITORY_ROOT/wire-relay-install.sh"
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -133,23 +133,47 @@ if compare_semantic_versions "1.2.3" "01.2.3" >/dev/null; then
     fail "comparison should reject an invalid right version"
 fi
 
-management_help="$("$REPOSITORY_ROOT/wire-relay.sh" --help)"
+management_help="$(bash "$REPOSITORY_ROOT/wire-relay-install.sh" --help)"
 assert_contains \
-    "sudo ./wire-relay.sh install" \
+    "sudo bash ./wire-relay-install.sh [command]" \
     "$management_help" \
-    "the public management script should delegate to the implementation"
+    "the installer help should document the reviewed download invocation"
+assert_contains \
+    "sudo bash -s -- [command]" \
+    "$management_help" \
+    "the installer help should document piped command arguments"
+
+piped_help="$(
+    bash -s -- --help <"$REPOSITORY_ROOT/wire-relay-install.sh"
+)"
+assert_equal \
+    "$management_help" \
+    "$piped_help" \
+    "direct and piped installer help should match"
+
+SELECTED_COMMAND=""
+select_command </dev/null >/dev/null
+assert_equal \
+    "install" \
+    "$SELECTED_COMMAND" \
+    "a no-command stdin invocation should start installation"
+
 [[ ! -e "$REPOSITORY_ROOT/bootstrap.sh" ]] ||
     fail "the generic public bootstrap.sh entry point should not exist"
+[[ ! -e "$REPOSITORY_ROOT/wire-relay.sh" ]] ||
+    fail "the repository-only wire-relay.sh wrapper should not exist"
+[[ ! -e "$REPOSITORY_ROOT/scripts/bootstrap.sh" ]] ||
+    fail "the installer should not depend on an adjacent bootstrap implementation"
 
 lock_test_path="$(mktemp)"
 acquire_operation_lock_at "$lock_test_path"
 if flock --nonblock "$lock_test_path" true; then
-    fail "a concurrent bootstrap operation should not acquire the lock"
+    fail "a concurrent installer operation should not acquire the lock"
 fi
 exec {OPERATION_LOCK_FD}>&-
 if ! flock --nonblock "$lock_test_path" true; then
-    fail "the bootstrap lock should be released when its descriptor closes"
+    fail "the installer lock should be released when its descriptor closes"
 fi
 rm -f -- "$lock_test_path"
 
-printf 'bootstrap version tests passed\n'
+printf 'installer version tests passed\n'

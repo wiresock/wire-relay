@@ -168,5 +168,5 @@ jobs:
 
       - name: Lint management scripts
         run: |
-          bash -n wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
-          shellcheck wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+          bash -n wire-relay-install.sh tests/bootstrap_version_tests.sh
+          shellcheck wire-relay-install.sh tests/bootstrap_version_tests.sh

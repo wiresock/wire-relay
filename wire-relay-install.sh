@@ -2,12 +2,28 @@
 #
 # Install, upgrade, configure, and remove WireRelay on supported systemd Linux
 # distributions.
+# Review this script before running it as root.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly PROGRAM_NAME="WireRelay bootstrap"
+INSTALLER_IS_SOURCED=false
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "$0" ]]; then
+    INSTALLER_IS_SOURCED=true
+fi
+readonly INSTALLER_IS_SOURCED
+
+INSTALLER_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    INSTALLER_DIR="$(
+        cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null
+        pwd -P
+    )"
+fi
+readonly INSTALLER_DIR
+
+readonly PROGRAM_NAME="WireRelay installer"
 readonly SERVICE_NAME="wire-relay"
 readonly SERVICE_USER="wire-relay"
 readonly SERVICE_GROUP="wire-relay"
@@ -29,10 +45,11 @@ readonly UNIT_PATH="/etc/systemd/system/wire-relay.service"
 readonly ROLLBACK_UNIT_PATH="$STATE_DIR/wire-relay.service.rollback"
 readonly CONFIG_DIR="/etc/wire-relay"
 readonly CONFIG_PATH="$CONFIG_DIR/config.toml"
+# Retain the legacy path so old bootstrap versions and this installer cannot
+# modify the same installation concurrently during an upgrade.
 readonly OPERATION_LOCK_PATH="/run/wire-relay-bootstrap.lock"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+readonly REPOSITORY_ROOT="$INSTALLER_DIR"
 WORK_DIR=""
 SOURCE_DIR=""
 BUILD_TARGET_DIR=""
@@ -200,23 +217,33 @@ register_cleanup_file() {
     CLEANUP_FILES+=("$1")
 }
 
-trap 'handle_error "$?" "$LINENO"' ERR
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+if [[ "$INSTALLER_IS_SOURCED" == false ]]; then
+    trap 'handle_error "$?" "$LINENO"' ERR
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+fi
 
 usage() {
     cat <<'EOF'
+WireRelay installer
+
 Usage:
-  sudo ./wire-relay.sh install
-  sudo ./wire-relay.sh upgrade
-  sudo ./wire-relay.sh configure
-  sudo ./wire-relay.sh uninstall
-  sudo ./wire-relay.sh status
+  sudo bash ./wire-relay-install.sh [command]
+  curl -fsSL https://raw.githubusercontent.com/wiresock/wire-relay/main/wire-relay-install.sh |
+    sudo bash -s -- [command]
 
-The legacy "update" command remains an alias for "upgrade".
+Commands:
+  install      Build, configure, install, enable, and start WireRelay.
+  upgrade      Upgrade WireRelay without replacing its configuration.
+  update       Compatibility alias for upgrade.
+  configure    Reconfigure an existing installation.
+  status       Show the installed version and service status.
+  uninstall    Remove WireRelay and optionally its retained data.
+  help         Show this help.
 
-Running without a command opens an interactive menu.
+With a terminal, omitting the command opens an interactive menu. A piped
+installer with no command performs an install.
 
 Optional environment variables:
   WIRE_RELAY_SOURCE_DIR       Existing checkout or clone destination
@@ -225,9 +252,23 @@ EOF
 }
 
 require_root() {
-    if (( EUID != 0 )); then
-        die "This operation changes system files. Run it with sudo or as root."
+    if (( EUID == 0 )); then
+        return
     fi
+
+    command -v sudo >/dev/null 2>&1 ||
+        die "This operation changes system files. Run it as root, or install sudo."
+
+    if [[ -n "${BASH_SOURCE[0]:-}" &&
+        -f "${BASH_SOURCE[0]}" &&
+        -r "${BASH_SOURCE[0]}" ]]; then
+        log "Re-executing the installer through sudo."
+        exec sudo \
+            --preserve-env=WIRE_RELAY_SOURCE_DIR,WIRE_RELAY_REPOSITORY_URL \
+            bash -- "${BASH_SOURCE[0]}" "$@"
+    fi
+
+    die "Piped installs must put sudo before bash: curl ... | sudo bash"
 }
 
 acquire_operation_lock() {
@@ -238,19 +279,19 @@ acquire_operation_lock_at() {
     local lock_path="$1"
 
     command -v flock >/dev/null 2>&1 ||
-        die "flock is required to serialize bootstrap operations."
+        die "flock is required to serialize installer operations."
     if ! exec {OPERATION_LOCK_FD}>"$lock_path"; then
-        die "Could not open the bootstrap operation lock: $lock_path"
+        die "Could not open the installer operation lock: $lock_path"
     fi
     if ! flock --nonblock "$OPERATION_LOCK_FD"; then
         exec {OPERATION_LOCK_FD}>&-
-        die "Another WireRelay bootstrap operation is already running."
+        die "Another WireRelay installer operation is already running."
     fi
 }
 
 require_systemd() {
     command -v systemctl >/dev/null 2>&1 ||
-        die "systemctl is required; WireRelay's bootstrap supports systemd hosts."
+        die "systemctl is required; the WireRelay installer supports systemd hosts."
     [[ -d /run/systemd/system ]] ||
         die "systemd is not running as the system manager on this host."
 }
@@ -552,7 +593,10 @@ Upgrade the existing Rust installation for '$BUILDER_USER' and retry; it was not
 is_checkout() {
     local directory="$1"
 
-    [[ -f "$directory/Cargo.toml" && -e "$directory/.git" ]]
+    [[ -n "$directory" &&
+        -f "$directory/Cargo.toml" &&
+        -f "$directory/packaging/systemd/wire-relay.service" &&
+        -e "$directory/.git" ]]
 }
 
 canonical_existing_directory() {
@@ -1041,6 +1085,17 @@ is_metrics_bind() {
     is_usable_bind_ip "$host" && is_port "$port"
 }
 
+has_controlling_terminal() {
+    [[ -c /dev/tty && -r /dev/tty && -w /dev/tty ]]
+}
+
+read_from_tty() {
+    has_controlling_terminal ||
+        die "Interactive input requires a controlling terminal."
+    IFS= read -r "$@" </dev/tty ||
+        die "Interactive input ended unexpectedly."
+}
+
 prompt_value() {
     local output_variable="$1"
     local prompt="$2"
@@ -1051,14 +1106,10 @@ prompt_value() {
 
     while true; do
         if [[ -n "$default_value" ]]; then
-            if ! IFS= read -r -p "$prompt [$default_value]: " value; then
-                die "Input ended while reading configuration."
-            fi
+            read_from_tty -p "$prompt [$default_value]: " value
             value="${value:-$default_value}"
         else
-            if ! IFS= read -r -p "$prompt: " value; then
-                die "Input ended while reading configuration."
-            fi
+            read_from_tty -p "$prompt: " value
         fi
 
         if "$validator" "$value"; then
@@ -1075,7 +1126,7 @@ confirm() {
     local answer
     local suffix
 
-    if [[ ! -t 0 ]]; then
+    if ! has_controlling_terminal; then
         log "$prompt (non-interactive default: $default_answer)"
         [[ "$default_answer" == "y" ]]
         return
@@ -1088,9 +1139,7 @@ confirm() {
     fi
 
     while true; do
-        if ! IFS= read -r -p "$prompt $suffix " answer; then
-            return 1
-        fi
+        read_from_tty -p "$prompt $suffix " answer
         answer="${answer:-$default_answer}"
         case "${answer,,}" in
             y | yes)
@@ -1107,8 +1156,8 @@ confirm() {
 }
 
 require_configuration_terminal() {
-    [[ -t 0 && -t 1 ]] ||
-        die "The configuration wizard requires an interactive terminal."
+    has_controlling_terminal ||
+        die "The configuration wizard requires a controlling terminal."
 }
 
 format_endpoint() {
@@ -2084,6 +2133,19 @@ interactive_menu() {
     SELECTED_COMMAND="quit"
 }
 
+select_command() {
+    if (( $# == 0 )); then
+        if [[ -t 0 && -t 1 ]]; then
+            interactive_menu
+        else
+            SELECTED_COMMAND="install"
+            log "No command supplied in a non-interactive invocation; starting installation."
+        fi
+    else
+        SELECTED_COMMAND="$1"
+    fi
+}
+
 main() {
     local command_name
 
@@ -2092,16 +2154,12 @@ main() {
         die "Expected at most one command."
     fi
 
-    if (( $# == 0 )); then
-        interactive_menu
-        command_name="$SELECTED_COMMAND"
-    else
-        command_name="$1"
-    fi
+    select_command "$@"
+    command_name="$SELECTED_COMMAND"
 
     case "$command_name" in
         install | upgrade | update | configure | uninstall)
-            require_root
+            require_root "$command_name"
             acquire_operation_lock
             ;;
     esac
@@ -2134,6 +2192,6 @@ main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "$INSTALLER_IS_SOURCED" == false ]]; then
     main "$@"
 fi

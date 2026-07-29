@@ -68,18 +68,18 @@ The `version` subcommand queries the running daemon and also reports its local
 control-protocol version. This distinction exposes a stale process after a
 binary replacement.
 
-The bootstrap upgrade follows the configured source checkout's remote `main`
+The installer upgrade follows the configured source checkout's remote `main`
 branch, builds and tests the candidate, and compares its semantic version with
 the installed binary. The checkout must be clean and on a branch that tracks
 remote `main`; detached/tag and feature-branch checkouts are rejected:
 
-```bash
-sudo ./wire-relay.sh upgrade
+```console
+sudo bash wire-relay-install.sh upgrade
 ```
 
-For an equal version, the bootstrap still validates the configuration but does
+For an equal version, the installer still validates the configuration but does
 not replace the binary or restart a daemon that reports the same application
-version. If the daemon is stopped or stale, the bootstrap repairs and restarts
+version. If the daemon is stopped or stale, the installer repairs and restarts
 the same-version installation. A lower candidate is rejected to prevent an
 accidental downgrade. The legacy `update` spelling remains an alias for
 compatibility.
