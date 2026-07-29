@@ -427,5 +427,5 @@ using opaque payloads.
 
 WireRelay is available under the
 [GNU Affero General Public License v3 or later](LICENSE). A separate
-commercial license may also be available; see
+commercial license from WireSock may also be available; see
 [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
