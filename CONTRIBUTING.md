@@ -45,8 +45,8 @@ cargo test --test "*" --all-features --locked
 cargo build --release --all-features --locked
 python3 scripts/versioning/version.py validate
 python3 -m unittest discover -s scripts/versioning -p "test_*.py"
-bash -n wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
-shellcheck wire-relay.sh scripts/bootstrap.sh tests/bootstrap_version_tests.sh
+bash -n wire-relay-install.sh tests/bootstrap_version_tests.sh
+shellcheck wire-relay-install.sh tests/bootstrap_version_tests.sh
 bash tests/bootstrap_version_tests.sh
 ```
 
@@ -108,7 +108,7 @@ Configuration fields must include validation, defaults when appropriate,
 normalized control output, tests, and updates to
 `config/config.example.toml` and the README.
 
-Changes to the systemd unit or bootstrap script need testing on a supported
+Changes to the systemd unit or installer script need testing on a supported
 Linux distribution. Explain why each added hardening directive remains
 compatible with UDP sockets, resolver access, journald, configuration reads,
 and `/run/wire-relay` socket creation.

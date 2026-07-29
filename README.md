@@ -69,46 +69,55 @@ matches the intended network load.
 
 ## Installation
 
-### WireRelay management script
+### WireRelay installer
 
-From a source checkout, the service-management script can build, test, install,
-and configure WireRelay:
+Downloading and reviewing a privileged installer is safer than piping it
+directly to a shell:
 
-```bash
-sudo ./wire-relay.sh install
+```console
+curl -fsSLo wire-relay-install.sh \
+  https://raw.githubusercontent.com/wiresock/wire-relay/main/wire-relay-install.sh
+less wire-relay-install.sh
+sudo bash wire-relay-install.sh
 ```
 
-The component-specific filename lets the script coexist with management tools
-for other Wiresock services. The former generic `bootstrap.sh` entry point is
-not retained.
+The compact one-command form is:
+
+```console
+curl -fsSL https://raw.githubusercontent.com/wiresock/wire-relay/main/wire-relay-install.sh \
+  | sudo bash
+```
+
+The self-contained installer builds, tests, installs, and configures
+WireRelay. When it is downloaded or piped outside a WireRelay source checkout,
+it clones the repository into the build user's home directory. Its
+component-specific filename lets it coexist with installers for other
+Wiresock services.
 
 Other workflows are:
 
-```bash
-sudo ./wire-relay.sh configure
-sudo ./wire-relay.sh upgrade
-sudo ./wire-relay.sh status
-sudo ./wire-relay.sh uninstall
+```console
+sudo bash wire-relay-install.sh configure
+sudo bash wire-relay-install.sh upgrade
+sudo bash wire-relay-install.sh status
+sudo bash wire-relay-install.sh uninstall
 ```
 
 `update` remains accepted as a compatibility alias for `upgrade`.
 
-Running the script without a command opens its interactive menu:
-
-```bash
-sudo ./wire-relay.sh
-```
+Running a downloaded file without a command opens its interactive menu.
+The piped form starts installation directly and reads configuration prompts
+from the controlling terminal.
 
 The installer keeps an existing Rust installation, minimizes work performed as
 root, validates configuration before starting the service, and places the
 binary at `/usr/local/bin/wire-relay`. Review a script before running it with
 elevated privileges.
 
-The exact upgrade command is:
+Download and review the current installer before an upgrade, then run:
 
-```bash
-cd /path/to/wire-relay
-sudo ./wire-relay.sh upgrade
+```console
+sudo bash wire-relay-install.sh upgrade
 ```
 
 The source checkout must be clean, and its current branch must track a remote
@@ -138,8 +147,8 @@ cargo build --release --locked
 The repository's systemd unit expects the executable at
 `/usr/local/bin/wire-relay`, configuration at
 `/etc/wire-relay/config.toml`, and a dedicated `wire-relay` user and group.
-Use `wire-relay.sh` unless you deliberately want to manage those pieces
-yourself.
+Use `wire-relay-install.sh` unless you deliberately want to manage those
+pieces yourself.
 
 Tagged releases provide Linux x86_64 and ARM64 archives, release notes, a
 source archive, and SHA-256 checksums. Verify the checksum before installing a

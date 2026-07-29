@@ -7,7 +7,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-No curated milestone is currently pending.
+### Changed
+
+- Replaced the repository-only management wrapper with the self-contained
+  `wire-relay-install.sh`, which supports reviewed downloads and direct
+  `curl | sudo bash` installation.
 
 ## [0.1.1] - 2026-07-28
 
