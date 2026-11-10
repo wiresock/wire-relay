@@ -119,10 +119,10 @@ cancels the token the task waits on. The lease is released under the routing
 entry's shard lock, so a listener that no longer finds the route also finds
 the admission slot free. The lease is stored in the handle before the handle
 is published, so a close that races the launch still releases it. The task
-closes its own session the moment it decides to stop, before draining. A
-stopping listener sets a shared flag before cancelling its token, and every
-session of that listener checks it on the hot path too, so no datagram is sent
-or queued after `stop` while the session tasks are still waking up.
+closes its own session the moment it decides to stop. A stopping listener
+closes every one of its sessions before it cancels its token, while its route
+lock keeps new ones from being launched, so no datagram is sent or queued
+after `stop` while the session tasks are still waking up.
 
 The next datagram from the same client therefore finds no route and is
 admitted as a new session even with a per-IP limit of one (for example a
@@ -139,18 +139,22 @@ is guarded by session ID, so a
 stale task never removes a newer session's route, and the lease is released
 once. A listener that fetched the old handle just before the close drops the
 datagram as `session_closed` instead of sending on the exiting session's
-socket. The cleanup guard is created before the task is spawned, so a task
-dropped before its first poll still removes its entry, ends its gauges,
-releases admission, and counts its unsent first datagram. The task then
-closes its queue and counts every datagram still in it as `session_closed`;
-the unsent first datagram is counted once by the cleanup guard, and
-datagrams already sent are not counted. On idle timer expiry the task re-reads the
+socket. The cleanup guard is created before the task is spawned and owns the
+queue, so it is the one place a session ends, however its task stops
+(returning, dropped in mid-run, or dropped before its first poll): it closes
+the session, waits out a forward the listener had already begun, counts the
+datagram the task had taken but not sent and every datagram still queued as
+`session_closed`, removes the entry, and ends the gauges. Datagrams already
+sent are not counted. On idle timer expiry the task re-reads the
 current timeout before deciding to close, and decides against the listener's
 direct-send path: the listener registers each forward in the handle's state
-word before it checks the flags, and the task sets an expiring flag before it
-re-reads activity. Either the listener sees the flag and drops the datagram as
-`session_closed`, or the task sees the forward (or the activity it recorded)
-and keeps the session.
+word, and the task announces the expiry there, re-reads activity, and closes
+the session only if the word is unchanged. A forward that starts meanwhile
+withdraws the announcement and is sent, so a datagram is refused only by a
+session that really closed. The expiry runs under the route's shard lock and
+removes the route and releases admission in the same step, so the client's
+next datagram opens a new session. A session closed for another reason at
+that moment is counted as closed, not expired.
 
 For a new session, the listener reserves global/per-IP/rate capacity before
 creating a socket. The listener's receive loop serializes creation for that

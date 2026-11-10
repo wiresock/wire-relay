@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -533,9 +533,6 @@ pub struct SessionHandle {
     /// lets idle expiry tell that a datagram is being forwarded right now, so
     /// a session is never expired under a datagram it has just accepted.
     state: AtomicUsize,
-    /// Set by the owning listener before it cancels the parent token, so the
-    /// hot path sees a stopping listener without locking.
-    parent_stopping: Arc<AtomicBool>,
     /// Released as soon as the route is unpublished, so the same client can
     /// be admitted again while this session drains.
     admission: Mutex<Option<AdmissionLease>>,
@@ -557,7 +554,6 @@ impl SessionHandle {
             pending: AtomicUsize::new(0),
             queue_budget: QueueBudget::with_limit(usize::MAX),
             state: AtomicUsize::new(0),
-            parent_stopping: Arc::new(AtomicBool::new(false)),
             admission: Mutex::new(None),
             cancel: CancellationToken::new(),
         })
@@ -680,41 +676,61 @@ impl SessionHandle {
         self.pending.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Registers a forward in progress, unless the session is closed, is
-    /// being expired, or its listener is stopping.
+    /// Registers a forward in progress, unless the session is closed.
     ///
-    /// The registration and the idle check in [`Self::try_expire`] are both
-    /// sequentially consistent, so either this sees the expiry flag, or the
-    /// expiry sees this forward (or the activity it already recorded).
+    /// A forward never loses to an idle expiry that is still being decided:
+    /// it withdraws the expiry attempt instead, so only a session that has
+    /// really been closed refuses a datagram.
     fn begin_forward(&self) -> Option<ForwardGuard<'_>> {
         let previous = self.state.fetch_add(STATE_FORWARDING, Ordering::SeqCst);
         let guard = ForwardGuard(&self.state);
-        if previous & (STATE_CLOSED | STATE_EXPIRING) != 0
-            || self.parent_stopping.load(Ordering::Acquire)
-        {
+        if previous & STATE_CLOSED != 0 {
             return None;
+        }
+        if previous & STATE_EXPIRING != 0 {
+            self.state.fetch_and(!STATE_EXPIRING, Ordering::SeqCst);
         }
         Some(guard)
     }
 
-    /// Decides idle expiry against concurrent listener forwards.
+    /// Decides idle expiry against concurrent listener forwards and, when
+    /// the session is still idle, closes it for the forwarding path.
     ///
-    /// Returns `true` when the session must stop: it is still idle with no
-    /// forward in progress (new forwards are refused from here on), or it was
-    /// closed meanwhile. Returns `false`, leaving the session open, when a
-    /// datagram was accepted since the timer fired or is being forwarded now.
-    fn try_expire(&self, idle_timeout: Duration) -> bool {
+    /// The attempt is announced in the state word, activity is read, and the
+    /// session is closed only if the word is unchanged since. A forward that
+    /// started before the announcement is seen in the previous value, one
+    /// that finished before it has already recorded its activity, and one
+    /// that starts afterwards withdraws the announcement, so the final
+    /// exchange fails. The session task still has to cancel and clean up.
+    pub(super) fn try_expire(&self, idle_timeout: Duration) -> Expiry {
         let previous = self.state.fetch_or(STATE_EXPIRING, Ordering::SeqCst);
         if previous & STATE_CLOSED != 0 {
-            return true;
+            return Expiry::Closed;
         }
-        if previous >= STATE_FORWARDING
-            || Instant::now() < self.session.last_activity() + idle_timeout
+        if previous < STATE_FORWARDING
+            && Instant::now() >= self.session.last_activity() + idle_timeout
         {
-            self.state.fetch_and(!STATE_EXPIRING, Ordering::SeqCst);
-            return false;
+            match self.state.compare_exchange(
+                STATE_EXPIRING,
+                STATE_EXPIRING | STATE_CLOSED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Expiry::Expired,
+                Err(current) if current & STATE_CLOSED != 0 => return Expiry::Closed,
+                Err(_) => {}
+            }
         }
-        true
+        self.state.fetch_and(!STATE_EXPIRING, Ordering::SeqCst);
+        Expiry::Active
+    }
+
+    /// Waits for a listener forward that began before the session was closed.
+    /// A forward never blocks, so this lasts at most a few instructions.
+    fn wait_for_forwards(&self) {
+        while self.state.load(Ordering::SeqCst) >= STATE_FORWARDING {
+            std::thread::yield_now();
+        }
     }
 
     #[cfg(test)]
@@ -734,6 +750,17 @@ impl SessionHandle {
         let lease = lock_unpoisoned(&self.admission).take();
         drop(lease);
     }
+}
+
+/// Outcome of an idle-expiry attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Expiry {
+    /// The session was idle and is now closed for forwarding.
+    Expired,
+    /// A datagram was accepted meanwhile; the session stays open.
+    Active,
+    /// The session had already been closed for another reason.
+    Closed,
 }
 
 /// Why a session task exited.
@@ -757,14 +784,15 @@ pub struct SessionLaunch {
     pub queue_depth: usize,
     pub queue_budget: Arc<QueueBudget>,
     pub parent_cancel: CancellationToken,
-    /// Set by the owning listener before it cancels `parent_cancel`.
-    pub parent_stopping: Arc<AtomicBool>,
     pub tracker: TaskTracker,
     pub log_limiter: Arc<LogRateLimiter>,
 }
 
 /// Inserts and starts one long-lived session task.
-pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, AdmissionLease> {
+///
+/// Returns `None`, releasing the admission lease, when the client already
+/// has a session.
+pub fn launch_session(launch: SessionLaunch) -> Option<Arc<SessionHandle>> {
     let SessionLaunch {
         session,
         first_datagram,
@@ -778,7 +806,6 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
         queue_depth,
         queue_budget,
         parent_cancel,
-        parent_stopping,
         tracker,
         log_limiter,
     } = launch;
@@ -793,7 +820,6 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
         pending: AtomicUsize::new(1),
         queue_budget,
         state: AtomicUsize::new(0),
-        parent_stopping,
         // Stored before the handle is published, so a close that races the
         // insert always finds the lease to release.
         admission: Mutex::new(Some(admission)),
@@ -801,24 +827,26 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
     });
 
     if table.insert(Arc::clone(&handle)).is_err() {
-        let admission = lock_unpoisoned(&handle.admission).take();
-        return Err(admission.expect("an unpublished session keeps its admission lease"));
+        // The lease goes with the unpublished handle.
+        return None;
     }
     let live = handle.queue_budget.session_started();
 
     metrics.session_created();
     listener_counters.session_started();
     // Created before spawning so that a task dropped before its first poll
-    // (shutdown or abort) still closes the handle, removes this table entry,
-    // ends the gauges, releases admission, and counts the unsent first
-    // datagram.
+    // or in mid-run (shutdown or abort) still closes the handle, removes this
+    // table entry, ends the gauges, releases admission, and counts the
+    // datagrams it never sent.
     let cleanup = SessionCleanup {
         handle: Arc::clone(&handle),
         table,
+        receiver,
         metrics: Arc::clone(&metrics),
         listener_counters: Arc::clone(&listener_counters),
         reason: SessionCloseReason::Closed,
-        first_datagram_unsent: true,
+        // The first datagram.
+        unsent_in_flight: true,
     };
 
     let task = SessionTask {
@@ -832,9 +860,9 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
     };
     let task_handle = Arc::clone(&handle);
     tracker.spawn(async move {
-        run_session(task_handle, receiver, cancel, task, cleanup).await;
+        run_session(task_handle, cancel, task, cleanup).await;
     });
-    Ok(handle)
+    Some(handle)
 }
 
 /// Resources owned by a running session task.
@@ -851,7 +879,6 @@ struct SessionTask {
 
 async fn run_session(
     handle: Arc<SessionHandle>,
-    mut receiver: Receiver<QueuedDatagram>,
     cancel: CancellationToken,
     mut task: SessionTask,
     mut cleanup: SessionCleanup,
@@ -872,46 +899,22 @@ async fn run_session(
     };
     task.first_datagram = Vec::new();
     if first_sent {
-        cleanup.first_datagram_unsent = false;
+        cleanup.unsent_in_flight = false;
         handle.finish_pending();
-        forward_until_stopped(
-            &handle,
-            &mut receiver,
-            &cancel,
-            &mut task,
-            &mut cleanup,
-            &upstream,
-        )
-        .await;
-    }
-    // An unsent first datagram is counted once, by the cleanup guard, so a
-    // task dropped before its first poll counts it too.
-
-    // Stop the listener's direct-send path as soon as the task decides to
-    // exit, before the table entry is removed, then count every datagram
-    // still queued. After `close`, the listener's enqueues fail as closed
-    // and are counted there; `recv` also waits out a slot the listener
-    // reserved just before, so nothing is released uncounted.
-    cleanup.table.close(&handle);
-    receiver.close();
-    while let Some(datagram) = receiver.recv().await {
-        drop(datagram);
-        record_drop(
-            &task.metrics,
-            &task.listener_counters,
-            DropReason::SessionClosed,
-        );
+        forward_until_stopped(&handle, &cancel, &mut task, &mut cleanup, &upstream).await;
     }
     debug!(
         session_id = %handle.session.id,
         reason = ?cleanup.reason,
         "session stopped"
     );
+    // Dropping the cleanup guard closes the session for the listener the
+    // moment the task decides to exit and counts every datagram it did not
+    // send: one taken but unsent, and all still queued.
 }
 
 async fn forward_until_stopped(
     handle: &Arc<SessionHandle>,
-    receiver: &mut Receiver<QueuedDatagram>,
     cancel: &CancellationToken,
     task: &mut SessionTask,
     cleanup: &mut SessionCleanup,
@@ -945,23 +948,18 @@ async fn forward_until_stopped(
                     handle.session.last_activity() + idle_timeout,
                 ));
             }
-            datagram = receiver.recv() => {
+            datagram = cleanup.receiver.recv() => {
                 let Some(mut datagram) = datagram else {
                     break;
                 };
                 let mut drained = 0;
                 loop {
+                    // Taken from the queue; counted by the cleanup guard if
+                    // the task stops before the send completes.
+                    cleanup.unsent_in_flight = true;
                     tokio::select! {
                         biased;
-                        () = cancel.cancelled() => {
-                            // Taken from the queue but never sent.
-                            record_drop(
-                                &task.metrics,
-                                &task.listener_counters,
-                                DropReason::SessionClosed,
-                            );
-                            break 'session;
-                        }
+                        () = cancel.cancelled() => break 'session,
                         () = send_to_backend(
                             &handle.session,
                             upstream,
@@ -971,13 +969,14 @@ async fn forward_until_stopped(
                             &task.log_limiter,
                         ) => {}
                     }
+                    cleanup.unsent_in_flight = false;
                     drop(datagram);
                     handle.finish_pending();
                     drained += 1;
                     if drained >= QUEUE_DRAIN_BATCH {
                         break;
                     }
-                    match receiver.try_recv() {
+                    match cleanup.receiver.try_recv() {
                         Ok(next) => datagram = next,
                         Err(_) => break,
                     }
@@ -1076,15 +1075,20 @@ async fn forward_until_stopped(
                 let deadline = handle.session.last_activity() + idle_timeout;
                 if Instant::now() >= deadline {
                     // The listener forwards on this session's socket from
-                    // its own task, so the decision is made against it: once
-                    // this succeeds no further datagram is accepted.
-                    if handle.try_expire(idle_timeout) {
-                        cleanup.reason = SessionCloseReason::Idle;
-                        break;
+                    // its own task, so the decision is made against it, and
+                    // the route and admission slot go in the same step: the
+                    // client's next datagram opens a new session.
+                    match cleanup.table.expire(handle, idle_timeout) {
+                        Expiry::Expired => {
+                            cleanup.reason = SessionCloseReason::Idle;
+                            break;
+                        }
+                        Expiry::Closed => break,
+                        // A datagram was just accepted or is being forwarded
+                        // right now; let it record its activity before the
+                        // deadline is computed again.
+                        Expiry::Active => tokio::task::yield_now().await,
                     }
-                    // A datagram is being forwarded right now; let it record
-                    // its activity before the deadline is computed again.
-                    tokio::task::yield_now().await;
                 }
                 idle_sleep.as_mut().reset(tokio::time::Instant::from_std(
                     handle.session.last_activity() + idle_timeout,
@@ -1154,22 +1158,33 @@ fn record_backend_send(
     }
 }
 
+/// Ends a session exactly once, however its task stops.
 struct SessionCleanup {
     handle: Arc<SessionHandle>,
     table: Arc<SessionTable>,
+    receiver: Receiver<QueuedDatagram>,
     metrics: Arc<Metrics>,
     listener_counters: Arc<ListenerCounters>,
     reason: SessionCloseReason,
-    /// The first datagram was never sent; counted as `session_closed` once.
-    first_datagram_unsent: bool,
+    /// The task holds a client datagram it has not finished sending: the
+    /// first datagram, or one taken from the queue.
+    unsent_in_flight: bool,
 }
 
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
-        // Backstop for every exit path, including a task that is dropped
-        // without running to completion or before its first poll.
+        // The only close on the task's side, for every exit path including a
+        // task dropped in mid-run or before its first poll. After it the
+        // listener refuses this session, so once a forward already under way
+        // has finished, the queue holds everything that will ever be in it.
         self.table.close(&self.handle);
-        if self.first_datagram_unsent {
+        self.handle.wait_for_forwards();
+        self.receiver.close();
+        let mut unsent = usize::from(self.unsent_in_flight);
+        while self.receiver.try_recv().is_ok() {
+            unsent += 1;
+        }
+        for _ in 0..unsent {
             record_drop(
                 &self.metrics,
                 &self.listener_counters,
@@ -1242,7 +1257,6 @@ mod tests {
             pending: AtomicUsize::new(pending),
             queue_budget: Arc::clone(&budget),
             state: AtomicUsize::new(0),
-            parent_stopping: Arc::new(AtomicBool::new(false)),
             admission: Mutex::new(None),
             cancel: CancellationToken::new(),
         });
@@ -1460,7 +1474,6 @@ mod tests {
         log_limiter: Arc<LogRateLimiter>,
         tracker: TaskTracker,
         parent: CancellationToken,
-        parent_stopping: Arc<AtomicBool>,
         admission: Arc<crate::limits::AdmissionController>,
     }
 
@@ -1498,7 +1511,6 @@ mod tests {
         // admitted once the old session's lease is released.
         let admission_controller = crate::limits::AdmissionController::new(1, 1, 100);
         let admission = admission_controller.try_acquire(client_addr.ip()).unwrap();
-        let parent_stopping = Arc::new(AtomicBool::new(false));
         let (idle, idle_receiver) = watch::channel(idle_timeout);
         let metrics = Arc::new(Metrics::default());
         let counters = Arc::new(ListenerCounters::default());
@@ -1518,7 +1530,6 @@ mod tests {
             queue_depth: 16,
             queue_budget: budget,
             parent_cancel: parent.clone(),
-            parent_stopping: Arc::clone(&parent_stopping),
             tracker: tracker.clone(),
             log_limiter: Arc::clone(&log_limiter),
         })
@@ -1533,7 +1544,6 @@ mod tests {
             log_limiter,
             tracker,
             parent,
-            parent_stopping,
             admission: admission_controller,
         }
     }
@@ -1884,7 +1894,7 @@ mod tests {
         // A datagram is being forwarded right now: the session stays open
         // and keeps accepting datagrams.
         let forwarding = harness.handle.begin_forward().expect("session is open");
-        assert!(!harness.handle.try_expire(timeout));
+        assert_eq!(harness.handle.try_expire(timeout), Expiry::Active);
         drop(forwarding);
         assert_eq!(
             observe(
@@ -1898,13 +1908,33 @@ mod tests {
         );
 
         // That datagram counted as activity, so the session is not idle.
-        assert!(!harness.handle.try_expire(timeout));
+        assert_eq!(harness.handle.try_expire(timeout), Expiry::Active);
+        assert_eq!(harness.handle.state.load(Ordering::SeqCst), 0);
+
+        // A forward that starts while an expiry is being decided withdraws
+        // it and is sent; it is not refused on a session that stays open.
+        tokio::time::sleep(timeout * 2).await;
+        harness
+            .handle
+            .state
+            .fetch_or(STATE_EXPIRING, Ordering::SeqCst);
+        assert_eq!(
+            observe(
+                &harness.handle,
+                &harness.metrics,
+                &harness.counters,
+                &harness.log_limiter,
+                b"during",
+            ),
+            ForwardOutcome::Sent
+        );
         assert_eq!(harness.handle.state.load(Ordering::SeqCst), 0);
 
         // Idle with nothing in progress: the session expires, and from then
         // on a datagram is refused instead of being sent on the dying socket.
         tokio::time::sleep(timeout * 2).await;
-        assert!(harness.handle.try_expire(timeout));
+        assert_eq!(harness.handle.try_expire(timeout), Expiry::Expired);
+        assert!(harness.handle.is_closed());
         assert_eq!(
             observe(
                 &harness.handle,
@@ -1915,7 +1945,73 @@ mod tests {
             ),
             ForwardOutcome::Dropped(DropReason::SessionClosed)
         );
-        assert_eq!(harness.metrics.snapshot().packets_to_backend_total, 1);
+        assert_eq!(harness.metrics.snapshot().packets_to_backend_total, 2);
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_frees_the_route_and_admission_in_one_step() {
+        let running = launch_running(Duration::from_secs(30)).await;
+        let key = running.handle.session().key();
+        let client_ip = running.handle.session().client_addr.ip();
+
+        // Not idle yet: nothing changes.
+        assert_eq!(
+            running
+                .table
+                .expire(&running.handle, Duration::from_secs(30)),
+            Expiry::Active
+        );
+        assert!(running.table.get_by_key(&key).is_some());
+        assert!(running.admission.try_acquire(client_ip).is_err());
+
+        // Idle: the session is closed for forwarding, unrouted, and its
+        // admission slot is free before its task has run again.
+        assert_eq!(
+            running.table.expire(&running.handle, Duration::ZERO),
+            Expiry::Expired
+        );
+        assert!(running.handle.is_closed());
+        assert!(running.table.get_by_key(&key).is_none());
+        drop(
+            running
+                .admission
+                .try_acquire(client_ip)
+                .expect("an expired session must free its admission"),
+        );
+        // It expired; a later close does not count it as closed again.
+        assert!(!running.table.close(&running.handle));
+        assert_eq!(
+            running.table.expire(&running.handle, Duration::ZERO),
+            Expiry::Closed
+        );
+        running.stop().await;
+    }
+
+    #[test]
+    fn a_session_task_dropped_in_mid_run_counts_its_queued_datagrams() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (metrics, counters, admission) = runtime.block_on(async {
+            let running = launch_running(Duration::from_secs(30)).await;
+            // Queued behind a datagram the task is still sending.
+            running.handle.pending.fetch_add(1, Ordering::AcqRel);
+            for _ in 0..3 {
+                assert_eq!(running.forward(b"queued"), ForwardOutcome::Queued);
+            }
+            (
+                Arc::clone(&running.metrics),
+                Arc::clone(&running.counters),
+                Arc::clone(&running.admission),
+            )
+        });
+        // Dropping the runtime drops the task without running it again.
+        drop(runtime);
+        assert_eq!(metrics.snapshot().drops().session_closed, 3);
+        assert_eq!(counters.snapshot().drops().session_closed, 3);
+        assert_eq!(metrics.snapshot().active_sessions, 0);
+        assert_eq!(admission.active(), 0);
     }
 
     #[tokio::test]
@@ -1924,8 +2020,8 @@ mod tests {
         assert!(harness.handle.close(), "the first close closes the session");
         assert!(!harness.handle.close(), "a repeated close is not counted");
         assert!(harness.handle.is_closed());
-        // An already closed session stops whatever its idle state.
-        assert!(harness.handle.try_expire(Duration::from_secs(3600)));
+        // An already closed session stops, but not as an idle expiry.
+        assert_eq!(harness.handle.try_expire(Duration::ZERO), Expiry::Closed);
     }
 
     #[tokio::test]
@@ -1983,9 +2079,10 @@ mod tests {
     #[tokio::test]
     async fn a_stopping_listener_closes_its_sessions_for_the_hot_path_at_once() {
         let running = launch_running(Duration::from_secs(30)).await;
-        // What `ListenerHandle::stop` does: flag first, then cancel. The
-        // session task has not run since, so only the flag can stop the send.
-        running.parent_stopping.store(true, Ordering::Release);
+        // What `ListenerHandle::stop` does: close its sessions, then cancel.
+        // The session task has not run since, so only the closed state can
+        // stop the send.
+        assert_eq!(running.table.close_listener(ListenerId::new(1)), 1);
         running.parent.cancel();
         assert_eq!(
             running.forward(b"late"),
