@@ -8,6 +8,7 @@ use wire_relay::config::{
     DEFAULT_CONTROL_SOCKET, DEFAULT_SESSION_QUEUE_DEPTH, MAX_CONFIGURED_SESSIONS, MAX_LISTENERS,
     MAX_NEW_SESSIONS_PER_SECOND, MAX_SESSION_QUEUE_DEPTH, MAX_UDP_DATAGRAM_SIZE, ServiceConfig,
 };
+use wire_relay::relay::session::QueueBudget;
 
 const MINIMAL: &str = r#"
 [[listeners]]
@@ -500,7 +501,7 @@ fn session_queue_depth_parses_and_shares_a_runtime_memory_budget() {
     let defaults = ServiceConfig::default();
     let fixed = defaults.max_sessions * (defaults.max_datagram_size * 2 + 1);
     assert_eq!(
-        defaults.queued_datagram_budget(),
+        QueueBudget::new(&defaults).limit(),
         4 * 1024 * 1024 * 1024 - fixed
     );
 }
@@ -557,17 +558,48 @@ fn reload_budget_reserves_buffers_for_live_sessions_above_the_limit() {
     };
     let per_session = service.max_datagram_size * 2 + 1;
     let total = 4 * 1024 * 1024 * 1024;
+    let budget = QueueBudget::new(&service);
+    assert_eq!(budget.limit(), total - 10 * per_session);
+    let mut live: Vec<_> = (0..3).map(|_| budget.session_started()).collect();
+    assert_eq!(budget.limit(), total - 10 * per_session);
+    live.extend((3..500).map(|_| budget.session_started()));
+    assert_eq!(budget.limit(), total - 500 * per_session);
+    drop(live);
+    assert_eq!(budget.limit(), total - 10 * per_session);
+}
+
+#[test]
+fn the_runtime_budget_keeps_the_largest_validated_limits_exact() {
+    // The runtime packs both values into one atomic word; validated maxima
+    // must survive that unchanged.
+    let service = ServiceConfig {
+        max_sessions: 30_000,
+        max_sessions_per_ip: 1,
+        max_datagram_size: MAX_UDP_DATAGRAM_SIZE,
+        ..ServiceConfig::default()
+    };
+    let budget = QueueBudget::new(&service);
+    assert_eq!(budget.configured(), (30_000, MAX_UDP_DATAGRAM_SIZE));
+    assert_eq!(budget.max_datagram_size(), MAX_UDP_DATAGRAM_SIZE);
+    let per_session = MAX_UDP_DATAGRAM_SIZE * 2 + 1;
     assert_eq!(
-        service.queued_datagram_budget_with_live_sessions(3),
-        total - 10 * per_session
+        budget.limit(),
+        4 * 1024 * 1024 * 1024 - 30_000 * per_session
+    );
+
+    let sessions = ServiceConfig {
+        max_sessions: MAX_CONFIGURED_SESSIONS,
+        max_sessions_per_ip: 1,
+        ..ServiceConfig::default()
+    };
+    budget.configure(&sessions);
+    assert_eq!(
+        budget.configured(),
+        (MAX_CONFIGURED_SESSIONS, sessions.max_datagram_size)
     );
     assert_eq!(
-        service.queued_datagram_budget_with_live_sessions(500),
-        total - 500 * per_session
-    );
-    assert_eq!(
-        service.queued_datagram_budget(),
-        service.queued_datagram_budget_with_live_sessions(0)
+        budget.limit(),
+        4 * 1024 * 1024 * 1024 - MAX_CONFIGURED_SESSIONS * (sessions.max_datagram_size * 2 + 1)
     );
 }
 

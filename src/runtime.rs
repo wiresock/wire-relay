@@ -87,7 +87,6 @@ struct RuntimeCore {
     admission: Arc<AdmissionController>,
     metrics: Arc<Metrics>,
     idle_timeout: watch::Sender<Duration>,
-    max_datagram_size: Arc<AtomicUsize>,
     session_queue_depth: Arc<AtomicUsize>,
     queue_budget: Arc<QueueBudget>,
     dns_refresh_interval_ms: Arc<AtomicU64>,
@@ -241,7 +240,6 @@ impl Runtime {
             admission,
             metrics,
             idle_timeout,
-            max_datagram_size: Arc::new(AtomicUsize::new(config.service.max_datagram_size)),
             session_queue_depth: Arc::new(AtomicUsize::new(config.service.session_queue_depth)),
             queue_budget: QueueBudget::new(&config.service),
             dns_refresh_interval_ms: Arc::new(AtomicU64::new(duration_millis_nonzero(
@@ -333,7 +331,6 @@ impl RuntimeCore {
             admission: Arc::clone(&self.admission),
             metrics: Arc::clone(&self.metrics),
             idle_timeout: self.idle_timeout.clone(),
-            max_datagram_size: Arc::clone(&self.max_datagram_size),
             session_queue_depth: Arc::clone(&self.session_queue_depth),
             queue_budget: Arc::clone(&self.queue_budget),
             dns_refresh_interval_ms: Arc::clone(&self.dns_refresh_interval_ms),
@@ -587,8 +584,6 @@ impl RuntimeCore {
         logging::reload_level(new_config.service.log_level)?;
         self.idle_timeout
             .send_replace(new_config.service.idle_timeout);
-        self.max_datagram_size
-            .store(new_config.service.max_datagram_size, Ordering::Relaxed);
         self.session_queue_depth
             .store(new_config.service.session_queue_depth, Ordering::Relaxed);
         // Apply the new admission limits before the queue budget so no
@@ -601,6 +596,9 @@ impl RuntimeCore {
         // The budget derives its limit from the live session count on every
         // reservation, so sessions admitted under the previous limits keep
         // their receive buffers reserved, and the limit recovers as they end.
+        // It is also the only runtime copy of `max_datagram_size`: one store
+        // publishes the size listeners and sessions size their buffers from
+        // together with the budget shape that charges for it.
         self.queue_budget.configure(&new_config.service);
         warn_if_live_sessions_starve_queue_budget(&self.queue_budget);
         self.dns_refresh_interval_ms.store(

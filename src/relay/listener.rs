@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -40,7 +40,6 @@ pub struct ListenerContext {
     pub admission: Arc<AdmissionController>,
     pub metrics: Arc<Metrics>,
     pub idle_timeout: watch::Sender<Duration>,
-    pub max_datagram_size: Arc<AtomicUsize>,
     pub session_queue_depth: Arc<AtomicUsize>,
     pub queue_budget: Arc<QueueBudget>,
     pub dns_refresh_interval_ms: Arc<AtomicU64>,
@@ -105,6 +104,7 @@ impl PreparedListener {
             socket,
             resolver,
             cancel,
+            stopping: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(ListenerCounters::default()),
             sessions: Arc::clone(&context.sessions),
             route_epoch: AtomicU64::new(1),
@@ -127,6 +127,8 @@ pub struct ListenerHandle {
     socket: Arc<UdpSocket>,
     resolver: Arc<BackendResolver>,
     cancel: CancellationToken,
+    /// Set before `cancel`, so sessions see a stopping listener lock-free.
+    stopping: Arc<AtomicBool>,
     counters: Arc<ListenerCounters>,
     sessions: Arc<SessionTable>,
     route_epoch: AtomicU64,
@@ -192,6 +194,7 @@ impl ListenerHandle {
     pub fn stop(&self) -> usize {
         let _route_commit = lock_unpoisoned(&self.route_commit);
         self.route_epoch.fetch_add(1, Ordering::AcqRel);
+        self.stopping.store(true, Ordering::Release);
         self.cancel.cancel();
         self.resolver.stop();
         self.sessions.close_listener(self.id)
@@ -221,7 +224,7 @@ pub struct ListenerSnapshot {
 }
 
 async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
-    let mut buffer = vec![0_u8; context.max_datagram_size.load(Ordering::Relaxed) + 1];
+    let mut buffer = vec![0_u8; context.queue_budget.max_datagram_size() + 1];
     info!(
         listener = %handle.config().name,
         bind = %handle.bind(),
@@ -229,7 +232,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
     );
 
     loop {
-        let max_size = context.max_datagram_size.load(Ordering::Relaxed);
+        let max_size = context.queue_budget.max_datagram_size();
         if buffer.len() != max_size.saturating_add(1) {
             buffer.resize(max_size.saturating_add(1), 0);
         }
@@ -382,10 +385,10 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             metrics: Arc::clone(&context.metrics),
             listener_counters: Arc::clone(&handle.counters),
             idle_timeout: context.idle_timeout.subscribe(),
-            max_datagram_size: Arc::clone(&context.max_datagram_size),
             queue_depth: context.session_queue_depth.load(Ordering::Relaxed),
             queue_budget: Arc::clone(&context.queue_budget),
             parent_cancel: handle.cancel.clone(),
+            parent_stopping: Arc::clone(&handle.stopping),
             tracker: context.tracker.clone(),
             log_limiter: Arc::clone(&context.log_limiter),
         };

@@ -165,12 +165,31 @@ impl Drop for AdmissionLease {
     }
 }
 
-/// Every rate-limited log site in the daemon.
-///
-/// Each site indexes its own atomic timestamp directly, so `should_log`
-/// neither locks nor searches.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum LogSite {
+/// Declares [`LogSite`] from one list, deriving the slot count (and the
+/// test-only list of every site) so adding a site is a single edit.
+macro_rules! log_sites {
+    ($($site:ident),+ $(,)?) => {
+        /// Every rate-limited log site in the daemon.
+        ///
+        /// Each site indexes its own atomic timestamp directly, so
+        /// `should_log` neither locks nor searches.
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        pub enum LogSite {
+            $($site,)+
+        }
+
+        impl LogSite {
+            /// Number of sites; the limiter keeps one slot per site.
+            pub const COUNT: usize = [$(Self::$site,)+].len();
+
+            /// Every site, in declaration (discriminant) order.
+            #[cfg(test)]
+            const ALL: [Self; Self::COUNT] = [$(Self::$site,)+];
+        }
+    };
+}
+
+log_sites! {
     BackendSendError,
     BackendUnresolved,
     ClientSendError,
@@ -189,50 +208,6 @@ pub enum LogSite {
 }
 
 impl LogSite {
-    /// Number of sites; the limiter keeps one slot per site.
-    pub const COUNT: usize = Self::ALL.len();
-
-    /// Every site, in discriminant order.
-    pub const ALL: [Self; 15] = [
-        Self::BackendSendError,
-        Self::BackendUnresolved,
-        Self::ClientSendError,
-        Self::DnsRefreshError,
-        Self::GlobalSessionLimit,
-        Self::ListenerRecvError,
-        Self::PartialBackendSend,
-        Self::PartialClientSend,
-        Self::PerIpSessionLimit,
-        Self::QueueBudgetExhausted,
-        Self::SessionQueueFull,
-        Self::SessionRateLimit,
-        Self::UpstreamConnectError,
-        Self::UpstreamLocalAddressError,
-        Self::UpstreamRecvError,
-    ];
-
-    /// Stable name of the site, for tests and diagnostics.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::BackendSendError => "backend-send-error",
-            Self::BackendUnresolved => "backend-unresolved",
-            Self::ClientSendError => "client-send-error",
-            Self::DnsRefreshError => "dns-refresh-error",
-            Self::GlobalSessionLimit => "global-session-limit",
-            Self::ListenerRecvError => "listener-recv-error",
-            Self::PartialBackendSend => "partial-backend-send",
-            Self::PartialClientSend => "partial-client-send",
-            Self::PerIpSessionLimit => "per-ip-session-limit",
-            Self::QueueBudgetExhausted => "queue-budget-exhausted",
-            Self::SessionQueueFull => "session-queue-full",
-            Self::SessionRateLimit => "session-rate-limit",
-            Self::UpstreamConnectError => "upstream-connect-error",
-            Self::UpstreamLocalAddressError => "upstream-local-address-error",
-            Self::UpstreamRecvError => "upstream-recv-error",
-        }
-    }
-
     const fn index(self) -> usize {
         self as usize
     }
@@ -360,17 +335,12 @@ mod tests {
             "string log sites remain"
         );
         for (index, site) in LogSite::ALL.into_iter().enumerate() {
-            assert_eq!(site.index(), index, "{site:?} is out of order in ALL");
+            assert_eq!(site.index(), index, "{site:?} does not index its own slot");
             assert!(
                 sources.contains(&format!("LogSite::{site:?}")),
-                "unused log site {site:?} ({})",
-                site.name()
+                "unused log site {site:?}"
             );
         }
-        let mut names: Vec<_> = LogSite::ALL.iter().map(|site| site.name()).collect();
-        names.sort_unstable();
-        names.dedup();
-        assert_eq!(names.len(), LogSite::COUNT);
     }
 
     #[test]

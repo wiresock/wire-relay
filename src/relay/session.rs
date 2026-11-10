@@ -154,10 +154,11 @@ impl QueueBudget {
         })
     }
 
-    /// A budget of `limit` bytes while no session is live.
+    /// A budget of `limit` bytes while no session is live, for 4096-byte
+    /// datagrams.
     #[cfg(test)]
     pub(crate) fn with_limit(limit: usize) -> Arc<Self> {
-        Self::for_test(limit, 0, 0)
+        Self::for_test(limit, 0, 4096)
     }
 
     /// A budget of `memory_bytes` with the given configured shape.
@@ -189,6 +190,16 @@ impl QueueBudget {
             Self::shape(service.max_sessions, service.max_datagram_size),
             Ordering::Release,
         );
+    }
+
+    /// Current `service.max_datagram_size`.
+    ///
+    /// This is the only runtime copy: listeners and sessions size their
+    /// receive buffers from it, so a reload publishes the datagram size and
+    /// the budget shape that charges for it in one store.
+    #[must_use]
+    pub fn max_datagram_size(&self) -> usize {
+        self.configured().1
     }
 
     /// The configured `(max_sessions, max_datagram_size)` the limit uses.
@@ -475,6 +486,12 @@ pub struct SessionHandle {
     /// Set with the cancellation token; checked on the listener hot path
     /// because `CancellationToken::is_cancelled` takes a lock.
     closed: AtomicBool,
+    /// Set by the owning listener before it cancels the parent token, so the
+    /// hot path sees a stopping listener without locking.
+    parent_stopping: Arc<AtomicBool>,
+    /// Released as soon as the route is unpublished, so the same client can
+    /// be admitted again while this session drains.
+    admission: std::sync::Mutex<Option<AdmissionLease>>,
     cancel: CancellationToken,
 }
 
@@ -493,6 +510,8 @@ impl SessionHandle {
             pending: AtomicUsize::new(0),
             queue_budget: QueueBudget::with_limit(usize::MAX),
             closed: AtomicBool::new(false),
+            parent_stopping: Arc::new(AtomicBool::new(false)),
+            admission: std::sync::Mutex::new(None),
             cancel: CancellationToken::new(),
         })
     }
@@ -519,10 +538,13 @@ impl SessionHandle {
         listener_counters: &ListenerCounters,
         log_limiter: &LogRateLimiter,
     ) {
-        // Only an accepted datagram counts as client activity: a client that
-        // keeps sending into a closed or back-pressured session must still
-        // idle out and release its admission slot and receive buffers.
-        if self.closed.load(Ordering::Acquire) {
+        // A datagram dropped by the relay itself (closed session, full queue,
+        // exhausted budget) is not client activity: a client that only sends
+        // into a closed or back-pressured session must still idle out and
+        // release its admission slot and receive buffers. A send the backend
+        // side refused still is, so a backend outage does not expire sessions
+        // whose clients keep sending.
+        if self.is_closed() {
             record_drop(metrics, listener_counters, DropReason::SessionClosed);
             return;
         }
@@ -531,9 +553,7 @@ impl SessionHandle {
             match self.upstream.try_send(datagram) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 result => {
-                    if matches!(result, Ok(sent) if sent == datagram.len()) {
-                        self.session.touch_client();
-                    }
+                    self.session.touch_client();
                     record_backend_send(
                         &self.session,
                         datagram.len(),
@@ -613,9 +633,24 @@ impl SessionHandle {
         self.pending.fetch_sub(1, Ordering::AcqRel);
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) || self.parent_stopping.load(Ordering::Acquire)
+    }
+
+    /// Stops the session; idempotent.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.cancel.cancel();
+    }
+
+    /// Releases the admission lease once; later calls do nothing.
+    pub(super) fn release_admission(&self) {
+        let lease = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(lease);
     }
 }
 
@@ -637,10 +672,11 @@ pub struct SessionLaunch {
     pub metrics: Arc<Metrics>,
     pub listener_counters: Arc<ListenerCounters>,
     pub idle_timeout: watch::Receiver<Duration>,
-    pub max_datagram_size: Arc<AtomicUsize>,
     pub queue_depth: usize,
     pub queue_budget: Arc<QueueBudget>,
     pub parent_cancel: CancellationToken,
+    /// Set by the owning listener before it cancels `parent_cancel`.
+    pub parent_stopping: Arc<AtomicBool>,
     pub tracker: TaskTracker,
     pub log_limiter: Arc<LogRateLimiter>,
 }
@@ -657,10 +693,10 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
         metrics,
         listener_counters,
         idle_timeout,
-        max_datagram_size,
         queue_depth,
         queue_budget,
         parent_cancel,
+        parent_stopping,
         tracker,
         log_limiter,
     } = launch;
@@ -675,27 +711,34 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
         pending: AtomicUsize::new(1),
         queue_budget,
         closed: AtomicBool::new(false),
+        parent_stopping,
+        admission: std::sync::Mutex::new(None),
         cancel: cancel.clone(),
     });
 
     if table.insert(Arc::clone(&handle)).is_err() {
         return Err(admission);
     }
+    *handle
+        .admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(admission);
     let live = handle.queue_budget.session_started();
 
     metrics.session_created();
     listener_counters.session_started();
     // Created before spawning so that a task dropped before its first poll
     // (shutdown or abort) still closes the handle, removes this table entry,
-    // ends the gauges, and releases admission.
+    // ends the gauges, releases admission, and counts the unsent first
+    // datagram.
     let cleanup = SessionCleanup {
         handle: Arc::clone(&handle),
         table,
         session: Arc::clone(&handle.session),
-        admission: Some(admission),
         metrics: Arc::clone(&metrics),
         listener_counters: Arc::clone(&listener_counters),
         reason: SessionCloseReason::Closed,
+        first_datagram_unsent: true,
     };
 
     let task = SessionTask {
@@ -705,7 +748,6 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
         metrics,
         listener_counters,
         idle_timeout,
-        max_datagram_size,
         log_limiter,
     };
     let task_handle = Arc::clone(&handle);
@@ -724,7 +766,6 @@ struct SessionTask {
     metrics: Arc<Metrics>,
     listener_counters: Arc<ListenerCounters>,
     idle_timeout: watch::Receiver<Duration>,
-    max_datagram_size: Arc<AtomicUsize>,
     log_limiter: Arc<LogRateLimiter>,
 }
 
@@ -751,6 +792,7 @@ async fn run_session(
     };
     task.first_datagram = Vec::new();
     if first_sent {
+        cleanup.first_datagram_unsent = false;
         handle.finish_pending();
         forward_until_stopped(
             &handle,
@@ -761,13 +803,9 @@ async fn run_session(
             &upstream,
         )
         .await;
-    } else {
-        record_drop(
-            &task.metrics,
-            &task.listener_counters,
-            DropReason::SessionClosed,
-        );
     }
+    // An unsent first datagram is counted once, by the cleanup guard, so a
+    // task dropped before its first poll counts it too.
 
     // Stop the listener's direct-send path as soon as the task decides to
     // exit, before the table entry is removed, then count every datagram
@@ -799,7 +837,7 @@ async fn forward_until_stopped(
     cleanup: &mut SessionCleanup,
     upstream: &UdpSocket,
 ) {
-    let mut backend_buffer = vec![0_u8; task.max_datagram_size.load(Ordering::Relaxed) + 1];
+    let mut backend_buffer = vec![0_u8; handle.queue_budget.max_datagram_size() + 1];
 
     // The idle deadline is armed once and only recomputed when it fires or
     // the configured timeout changes, so packet forwarding does not touch the
@@ -811,7 +849,7 @@ async fn forward_until_stopped(
     tokio::pin!(idle_sleep);
 
     'session: loop {
-        let max_size = task.max_datagram_size.load(Ordering::Relaxed);
+        let max_size = handle.queue_budget.max_datagram_size();
         if backend_buffer.len() != max_size.saturating_add(1) {
             backend_buffer.resize(max_size.saturating_add(1), 0);
         }
@@ -1011,10 +1049,11 @@ struct SessionCleanup {
     handle: Arc<SessionHandle>,
     table: Arc<SessionTable>,
     session: Arc<Session>,
-    admission: Option<AdmissionLease>,
     metrics: Arc<Metrics>,
     listener_counters: Arc<ListenerCounters>,
     reason: SessionCloseReason,
+    /// The first datagram was never sent; counted as `session_closed` once.
+    first_datagram_unsent: bool,
 }
 
 impl Drop for SessionCleanup {
@@ -1022,11 +1061,17 @@ impl Drop for SessionCleanup {
         // Backstop for every exit path, including a task that is dropped
         // without running to completion or before its first poll.
         self.table.close(&self.handle);
+        if self.first_datagram_unsent {
+            record_drop(
+                &self.metrics,
+                &self.listener_counters,
+                DropReason::SessionClosed,
+            );
+        }
         self.table.remove(&self.session.key(), self.session.id);
         self.listener_counters.session_ended();
         self.metrics
             .session_ended(self.reason == SessionCloseReason::Idle);
-        drop(self.admission.take());
     }
 }
 
@@ -1082,6 +1127,8 @@ mod tests {
             pending: AtomicUsize::new(pending),
             queue_budget: Arc::clone(&budget),
             closed: AtomicBool::new(false),
+            parent_stopping: Arc::new(AtomicBool::new(false)),
+            admission: std::sync::Mutex::new(None),
             cancel: CancellationToken::new(),
         });
         Harness {
@@ -1301,6 +1348,8 @@ mod tests {
         log_limiter: Arc<LogRateLimiter>,
         tracker: TaskTracker,
         parent: CancellationToken,
+        parent_stopping: Arc<AtomicBool>,
+        admission: Arc<crate::limits::AdmissionController>,
     }
 
     async fn launch_running(idle_timeout: Duration) -> Running {
@@ -1333,9 +1382,11 @@ mod tests {
             backend.local_addr().unwrap(),
         ));
         let table = SessionTable::new();
-        let admission = crate::limits::AdmissionController::new(4, 4, 100)
-            .try_acquire(client_addr.ip())
-            .unwrap();
+        // One session per IP and globally, so a replacement can only be
+        // admitted once the old session's lease is released.
+        let admission_controller = crate::limits::AdmissionController::new(1, 1, 100);
+        let admission = admission_controller.try_acquire(client_addr.ip()).unwrap();
+        let parent_stopping = Arc::new(AtomicBool::new(false));
         let (idle, idle_receiver) = watch::channel(idle_timeout);
         let metrics = Arc::new(Metrics::default());
         let counters = Arc::new(ListenerCounters::default());
@@ -1352,10 +1403,10 @@ mod tests {
             metrics: Arc::clone(&metrics),
             listener_counters: Arc::clone(&counters),
             idle_timeout: idle_receiver,
-            max_datagram_size: Arc::new(AtomicUsize::new(4096)),
             queue_depth: 16,
             queue_budget: budget,
             parent_cancel: parent.clone(),
+            parent_stopping: Arc::clone(&parent_stopping),
             tracker: tracker.clone(),
             log_limiter: Arc::clone(&log_limiter),
         })
@@ -1370,6 +1421,8 @@ mod tests {
             log_limiter,
             tracker,
             parent,
+            parent_stopping,
+            admission: admission_controller,
         }
     }
 
@@ -1696,6 +1749,68 @@ mod tests {
         // A successful direct send does.
         let direct = harness(16, 0, usize::MAX).await;
         assert_touch(&direct, b"direct", ForwardOutcome::Sent, true).await;
+
+        // So does a send the OS refused: the client is still active while the
+        // backend side fails. A UDP payload above 65535 bytes always fails.
+        let failing = harness(16, 0, usize::MAX).await;
+        assert_touch(
+            &failing,
+            &vec![0; 70_000],
+            ForwardOutcome::Dropped(DropReason::SendError),
+            true,
+        )
+        .await;
+        assert_eq!(failing.metrics.snapshot().datagrams_dropped.send_error, 1);
+    }
+
+    #[tokio::test]
+    async fn closing_releases_admission_while_the_old_session_drains() {
+        let running = launch_running(Duration::from_secs(30)).await;
+        let client_ip = running.handle.session().client_addr.ip();
+        // Global and per-IP limits are both one, held by this session.
+        assert!(running.admission.try_acquire(client_ip).is_err());
+
+        // Keep the old task draining: it cannot run until this test yields.
+        running.handle.pending.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(running.forward(b"queued"), ForwardOutcome::Queued);
+        running.table.close(&running.handle);
+        assert!(
+            running
+                .table
+                .get_by_id(&running.handle.session().id)
+                .is_some()
+        );
+
+        // The replacement for the same client is admitted right away, while
+        // the old session still holds its receive-buffer reservation.
+        let replacement = running
+            .admission
+            .try_acquire(client_ip)
+            .expect("a closed session must free its admission");
+        assert_eq!(running.admission.active(), 1);
+
+        running.wait_until_removed().await;
+        // The old cleanup must not release the lease a second time.
+        assert_eq!(running.admission.active(), 1);
+        drop(replacement);
+        assert_eq!(running.admission.active(), 0);
+        running.assert_session_closed_drops(1);
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_stopping_listener_closes_its_sessions_for_the_hot_path_at_once() {
+        let running = launch_running(Duration::from_secs(30)).await;
+        // What `ListenerHandle::stop` does: flag first, then cancel. The
+        // session task has not run since, so only the flag can stop the send.
+        running.parent_stopping.store(true, Ordering::Release);
+        running.parent.cancel();
+        assert_eq!(
+            running.forward(b"late"),
+            ForwardOutcome::Dropped(DropReason::SessionClosed)
+        );
+        assert_eq!(running.metrics.snapshot().packets_to_backend_total, 1);
+        running.stop().await;
     }
 
     #[tokio::test]
@@ -1757,6 +1872,9 @@ mod tests {
         assert_eq!(running.counters.snapshot().active_sessions, 0);
         assert_eq!(budget.live_sessions(), 0);
         assert!(running.handle.closed.load(Ordering::Acquire));
+        // The unsent first datagram is counted exactly once, in both scopes.
+        running.assert_session_closed_drops(1);
+        assert_eq!(running.admission.active(), 0);
     }
 
     #[test]

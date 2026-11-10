@@ -261,8 +261,9 @@ impl ServiceConfig {
     /// actual size of each queued datagram, so a deep per-session queue does
     /// not require the pessimistic `max_sessions * depth * max_datagram_size`
     /// allocation to fit.
+    #[cfg(test)]
     #[must_use]
-    pub fn queued_datagram_budget(&self) -> usize {
+    pub(crate) fn queued_datagram_budget(&self) -> usize {
         self.queued_datagram_budget_with_live_sessions(0)
     }
 
@@ -271,8 +272,9 @@ impl ServiceConfig {
     /// Sessions admitted under an earlier, larger `max_sessions` keep their
     /// receive buffers after a reload, so fixed memory is reserved for
     /// whichever is larger: the live sessions or the configured limit.
+    #[cfg(test)]
     #[must_use]
-    pub fn queued_datagram_budget_with_live_sessions(&self, live_sessions: usize) -> usize {
+    pub(crate) fn queued_datagram_budget_with_live_sessions(&self, live_sessions: usize) -> usize {
         queued_datagram_budget(
             MAX_SESSION_DATAGRAM_MEMORY_BYTES,
             self.max_sessions,

@@ -140,12 +140,17 @@ impl SessionTable {
 
     /// Unpublishes this exact incarnation from routing and closes it.
     ///
-    /// The routing entry goes first, so the next datagram from the same
-    /// client can start a new session while this one drains its queue; the
-    /// ID entry and gauges stay until the session task's cleanup calls
+    /// The routing entry goes first and the admission lease is released, so
+    /// the next datagram from the same client can start a new session while
+    /// this one drains its queue; the ID entry, gauges, and queue-budget
+    /// reservation stay until the session task's cleanup calls
     /// [`Self::remove`].
     pub fn close(&self, session: &SessionHandle) {
         self.unpublish(&session.session().key(), session.session().id);
+        // With the route gone, the client may be admitted again right away
+        // (even with a per-IP limit of one); the draining session keeps its
+        // receive buffers counted in the queue budget until its task ends.
+        session.release_admission();
         session.close();
     }
 
