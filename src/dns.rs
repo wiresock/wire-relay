@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{info, warn};
 
-use crate::{config::BackendEndpoint, limits::LogRateLimiter, metrics::Metrics};
+use crate::{
+    config::BackendEndpoint,
+    limits::{LogRateLimiter, LogSite},
+    metrics::Metrics,
+};
 
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -265,7 +269,7 @@ impl BackendResolver {
                     // Deliberately retain state.current and last_success.
                 }
                 self.metrics.dns_error();
-                if self.log_limiter.should_log("dns-refresh-error") {
+                if self.log_limiter.should_log(LogSite::DnsRefreshError) {
                     warn!(
                         configured_backend = %endpoint,
                         %error,

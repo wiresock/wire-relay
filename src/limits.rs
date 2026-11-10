@@ -167,61 +167,109 @@ impl Drop for AdmissionLease {
 
 /// Every rate-limited log site in the daemon.
 ///
-/// The limiter keeps one atomic timestamp per entry, so `should_log` never
-/// locks. A site missing from this table shares the last, catch-all slot (and
-/// trips a debug assertion in tests).
-pub const LOG_SITES: &[&str] = &[
-    "backend-send-error",
-    "backend-unresolved",
-    "client-send-error",
-    "dns-refresh-error",
-    "global-session-limit",
-    "listener-recv-error",
-    "partial-backend-send",
-    "partial-client-send",
-    "per-ip-session-limit",
-    "queue-budget-exhausted",
-    "session-queue-full",
-    "session-rate-limit",
-    "upstream-connect-error",
-    "upstream-local-address-error",
-    "upstream-recv-error",
-];
+/// Each site indexes its own atomic timestamp directly, so `should_log`
+/// neither locks nor searches.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LogSite {
+    BackendSendError,
+    BackendUnresolved,
+    ClientSendError,
+    DnsRefreshError,
+    GlobalSessionLimit,
+    ListenerRecvError,
+    PartialBackendSend,
+    PartialClientSend,
+    PerIpSessionLimit,
+    QueueBudgetExhausted,
+    SessionQueueFull,
+    SessionRateLimit,
+    UpstreamConnectError,
+    UpstreamLocalAddressError,
+    UpstreamRecvError,
+}
+
+impl LogSite {
+    /// Number of sites; the limiter keeps one slot per site.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Every site, in discriminant order.
+    pub const ALL: [Self; 15] = [
+        Self::BackendSendError,
+        Self::BackendUnresolved,
+        Self::ClientSendError,
+        Self::DnsRefreshError,
+        Self::GlobalSessionLimit,
+        Self::ListenerRecvError,
+        Self::PartialBackendSend,
+        Self::PartialClientSend,
+        Self::PerIpSessionLimit,
+        Self::QueueBudgetExhausted,
+        Self::SessionQueueFull,
+        Self::SessionRateLimit,
+        Self::UpstreamConnectError,
+        Self::UpstreamLocalAddressError,
+        Self::UpstreamRecvError,
+    ];
+
+    /// Stable name of the site, for tests and diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BackendSendError => "backend-send-error",
+            Self::BackendUnresolved => "backend-unresolved",
+            Self::ClientSendError => "client-send-error",
+            Self::DnsRefreshError => "dns-refresh-error",
+            Self::GlobalSessionLimit => "global-session-limit",
+            Self::ListenerRecvError => "listener-recv-error",
+            Self::PartialBackendSend => "partial-backend-send",
+            Self::PartialClientSend => "partial-client-send",
+            Self::PerIpSessionLimit => "per-ip-session-limit",
+            Self::QueueBudgetExhausted => "queue-budget-exhausted",
+            Self::SessionQueueFull => "session-queue-full",
+            Self::SessionRateLimit => "session-rate-limit",
+            Self::UpstreamConnectError => "upstream-connect-error",
+            Self::UpstreamLocalAddressError => "upstream-local-address-error",
+            Self::UpstreamRecvError => "upstream-recv-error",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
 
 /// A small helper for suppressing repetitive log sites.
 ///
 /// Each site allows one event per interval. The state is a lock-free atomic
-/// timestamp per site, because sites such as `session-queue-full` fire on the
+/// timestamp per site, because sites such as `SessionQueueFull` fire on the
 /// datagram drop path exactly when the relay is overloaded.
 #[derive(Debug)]
 pub struct LogRateLimiter {
     interval_nanos: u64,
     origin: Instant,
     /// Nanoseconds since `origin` plus one of each site's last event; zero
-    /// means the site has not logged yet. One extra slot for unknown sites.
-    last: Box<[AtomicU64]>,
+    /// means the site has not logged yet.
+    last: [AtomicU64; LogSite::COUNT],
 }
 
 impl LogRateLimiter {
-    /// Creates a limiter that allows each named site once per `interval`.
+    /// Creates a limiter that allows each site once per `interval`.
     #[must_use]
     pub fn new(interval: Duration) -> Self {
         Self {
             interval_nanos: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
             origin: Instant::now(),
-            last: (0..=LOG_SITES.len()).map(|_| AtomicU64::new(0)).collect(),
+            last: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
     /// Returns true when the caller should emit this log event.
-    pub fn should_log(&self, site: &'static str) -> bool {
+    pub fn should_log(&self, site: LogSite) -> bool {
         self.should_log_at(site, Instant::now())
     }
 
-    fn should_log_at(&self, site: &'static str, now: Instant) -> bool {
-        let index = LOG_SITES.iter().position(|known| *known == site);
-        debug_assert!(index.is_some(), "unregistered log site {site:?}");
-        let slot = &self.last[index.unwrap_or(LOG_SITES.len())];
+    fn should_log_at(&self, site: LogSite, now: Instant) -> bool {
+        let slot = &self.last[site.index()];
         let now = u64::try_from(now.saturating_duration_since(self.origin).as_nanos())
             .unwrap_or(u64::MAX - 1)
             .saturating_add(1);
@@ -268,14 +316,17 @@ mod tests {
     fn log_sites_allow_one_event_per_interval_independently() {
         let limiter = LogRateLimiter::new(Duration::from_secs(5));
         let start = limiter.origin;
-        assert!(limiter.should_log_at("session-queue-full", start));
-        assert!(!limiter.should_log_at("session-queue-full", start));
-        assert!(!limiter.should_log_at("session-queue-full", start + Duration::from_millis(4_999)));
+        assert!(limiter.should_log_at(LogSite::SessionQueueFull, start));
+        assert!(!limiter.should_log_at(LogSite::SessionQueueFull, start));
+        assert!(!limiter.should_log_at(
+            LogSite::SessionQueueFull,
+            start + Duration::from_millis(4_999)
+        ));
         // Another site has its own slot.
-        assert!(limiter.should_log_at("queue-budget-exhausted", start));
-        assert!(limiter.should_log_at("session-queue-full", start + Duration::from_secs(5)));
-        assert!(!limiter.should_log_at("session-queue-full", start + Duration::from_secs(6)));
-        assert!(limiter.should_log_at("session-queue-full", start + Duration::from_secs(10)));
+        assert!(limiter.should_log_at(LogSite::QueueBudgetExhausted, start));
+        assert!(limiter.should_log_at(LogSite::SessionQueueFull, start + Duration::from_secs(5)));
+        assert!(!limiter.should_log_at(LogSite::SessionQueueFull, start + Duration::from_secs(6)));
+        assert!(limiter.should_log_at(LogSite::SessionQueueFull, start + Duration::from_secs(10)));
     }
 
     #[test]
@@ -286,7 +337,7 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     for _ in 0..1_000 {
-                        if limiter.should_log("backend-send-error") {
+                        if limiter.should_log(LogSite::BackendSendError) {
                             logged.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -297,27 +348,29 @@ mod tests {
     }
 
     #[test]
-    fn every_log_site_in_the_tree_is_registered() {
+    fn every_log_site_is_used_and_indexes_its_own_slot() {
         let sources = [
             include_str!("relay/listener.rs"),
             include_str!("relay/session.rs"),
             include_str!("dns.rs"),
         ]
         .concat();
-        let marker = "should_log(\"";
-        for (offset, _) in sources.match_indices(marker) {
-            let rest = &sources[offset + marker.len()..];
-            let site = &rest[..rest.find('"').unwrap()];
-            assert!(LOG_SITES.contains(&site), "unregistered log site {site:?}");
-        }
-        // Every registered site is used, including the admission-rejection
-        // sites chosen by a `match` before the call.
-        for site in LOG_SITES {
+        assert!(
+            !sources.contains("should_log(\""),
+            "string log sites remain"
+        );
+        for (index, site) in LogSite::ALL.into_iter().enumerate() {
+            assert_eq!(site.index(), index, "{site:?} is out of order in ALL");
             assert!(
-                sources.contains(&format!("\"{site}\"")),
-                "stale log site {site:?}"
+                sources.contains(&format!("LogSite::{site:?}")),
+                "unused log site {site:?} ({})",
+                site.name()
             );
         }
+        let mut names: Vec<_> = LogSite::ALL.iter().map(|site| site.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), LogSite::COUNT);
     }
 
     #[test]

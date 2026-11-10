@@ -570,3 +570,28 @@ fn reload_budget_reserves_buffers_for_live_sessions_above_the_limit() {
         service.queued_datagram_budget_with_live_sessions(0)
     );
 }
+
+#[test]
+fn datagram_budget_errors_name_the_field_to_change() {
+    let field_of = |input: &str| match Config::parse_str(input) {
+        Err(ConfigError::InvalidValue { field, reason }) => {
+            assert!(reason.contains("datagram buffers"), "{reason}");
+            field
+        }
+        other => panic!("expected a budget validation error, got {other:?}"),
+    };
+
+    // The queue depth alone overflows the budget with a single session.
+    let deep_queue = format!(
+        "[service]\nmax_sessions = 1\nmax_sessions_per_ip = 1\nmax_datagram_size = 65507\n\
+         session_queue_depth = 65536\n{MINIMAL}"
+    );
+    assert_eq!(field_of(&deep_queue), "service.session_queue_depth");
+
+    // The receive buffers alone overflow it, whatever the queue depth.
+    let many_sessions = format!(
+        "[service]\nmax_sessions = 100000\nmax_sessions_per_ip = 1\n\
+         max_datagram_size = 65507\nsession_queue_depth = 1\n{MINIMAL}"
+    );
+    assert_eq!(field_of(&many_sessions), "service.max_sessions");
+}

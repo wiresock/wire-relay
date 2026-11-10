@@ -602,7 +602,7 @@ impl RuntimeCore {
         // reservation, so sessions admitted under the previous limits keep
         // their receive buffers reserved, and the limit recovers as they end.
         self.queue_budget.configure(&new_config.service);
-        warn_if_live_sessions_exhaust_queue_budget(&self.queue_budget);
+        warn_if_live_sessions_starve_queue_budget(&self.queue_budget);
         self.dns_refresh_interval_ms.store(
             duration_millis_nonzero(new_config.service.dns_refresh_interval),
             Ordering::Relaxed,
@@ -963,7 +963,7 @@ impl ControlHandler for RuntimeCore {
                             format!("session `{id}` was not found"),
                         )
                     })?;
-                    session.close();
+                    self.sessions.close(&session);
                     Ok(ControlResponse::SessionClosed { id })
                 }
                 ControlRequest::Version => Ok(ControlResponse::Version(VersionSnapshot {
@@ -1114,11 +1114,12 @@ fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Warns when a reload leaves live sessions' receive buffers covering the
-/// whole datagram budget. The reload still applies; queued datagrams drop as
-/// `budget_exhausted` until enough of those sessions end.
-fn warn_if_live_sessions_exhaust_queue_budget(budget: &QueueBudget) -> bool {
-    if !budget.exhausted_by_live_sessions() {
+/// Warns when a reload leaves live sessions' receive buffers so large that
+/// less than one maximum-sized datagram fits in the queue budget. The reload
+/// still applies; queued datagrams drop as `budget_exhausted` until enough of
+/// those sessions end.
+fn warn_if_live_sessions_starve_queue_budget(budget: &QueueBudget) -> bool {
+    if !budget.starved_by_live_sessions() {
         return false;
     }
     let (max_sessions, max_datagram_size) = budget.configured();
@@ -1126,9 +1127,11 @@ fn warn_if_live_sessions_exhaust_queue_budget(budget: &QueueBudget) -> bool {
         live_sessions = budget.live_sessions(),
         max_sessions,
         max_datagram_size,
-        "receive buffers of the live sessions at the new max_datagram_size use the whole \
-         queued-datagram memory budget; queued client datagrams will drop as \
-         budget_exhausted until enough of these sessions end"
+        budget_limit_bytes = budget.limit(),
+        one_datagram_charge_bytes = QueueBudget::charge(max_datagram_size),
+        "receive buffers of the live sessions at the new max_datagram_size leave less than \
+         one maximum-sized datagram of queued-datagram memory; queued client datagrams will \
+         drop as budget_exhausted until enough of these sessions end"
     );
     true
 }
@@ -1262,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_detects_live_sessions_exhausting_the_queue_budget() {
+    fn reload_detects_live_sessions_starving_the_queue_budget() {
         let before = crate::config::ServiceConfig {
             max_sessions: 50_000,
             max_datagram_size: 4096,
@@ -1275,12 +1278,38 @@ mod tests {
         };
         let budget = QueueBudget::new(&before);
         let live: Vec<_> = (0..40_000).map(|_| budget.session_started()).collect();
-        assert!(!warn_if_live_sessions_exhaust_queue_budget(&budget));
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
         budget.configure(&after);
-        assert!(warn_if_live_sessions_exhaust_queue_budget(&budget));
+        assert!(warn_if_live_sessions_starve_queue_budget(&budget));
+        assert_eq!(budget.limit(), 0);
         drop(live);
-        assert!(!warn_if_live_sessions_exhaust_queue_budget(&budget));
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
         assert_eq!(budget.limit(), after.queued_datagram_budget());
+    }
+
+    #[test]
+    fn reload_warns_when_less_than_one_maximum_datagram_fits() {
+        let after = crate::config::ServiceConfig {
+            max_sessions: 1_000,
+            max_datagram_size: 65_507,
+            ..crate::config::ServiceConfig::default()
+        };
+        let charge = QueueBudget::charge(after.max_datagram_size);
+        let budget = QueueBudget::new(&crate::config::ServiceConfig::default());
+        // 32 781 live sessions at 2 * 65507 + 1 bytes leave 164 581 bytes:
+        // room for a full-sized datagram, so no warning.
+        let mut live: Vec<_> = (0..32_781).map(|_| budget.session_started()).collect();
+        budget.configure(&after);
+        assert!(budget.limit() >= charge);
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
+        // One more leaves 33 566 bytes: positive, but too little for one
+        // maximum-sized datagram, so the reload must still warn.
+        live.push(budget.session_started());
+        assert!(budget.limit() > 0);
+        assert!(budget.limit() < charge);
+        assert!(warn_if_live_sessions_starve_queue_budget(&budget));
+        drop(live);
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
     }
 
     fn session_snapshot(label: &str, bytes: u64) -> SessionSnapshot {

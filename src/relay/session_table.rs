@@ -138,16 +138,32 @@ impl SessionTable {
         self.by_id.get(id).map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Unpublishes this exact incarnation from routing and closes it.
+    ///
+    /// The routing entry goes first, so the next datagram from the same
+    /// client can start a new session while this one drains its queue; the
+    /// ID entry and gauges stay until the session task's cleanup calls
+    /// [`Self::remove`].
+    pub fn close(&self, session: &SessionHandle) {
+        self.unpublish(&session.session().key(), session.session().id);
+        session.close();
+    }
+
+    /// Removes the routing entry only if it still maps to `id`, so a stale
+    /// session never deletes a newer mapping for the same key.
+    fn unpublish(&self, key: &SessionKey, id: SessionId) {
+        // `remove_if` holds the shard write lock across the identity check and
+        // deletion, so a replacement cannot slip between separate operations.
+        self.by_key
+            .remove_if(key, |_, session| session.session().id == id);
+    }
+
     /// Removes only the exact session incarnation, protecting a newer mapping
     /// from a stale task's cleanup.
     pub fn remove(&self, key: &SessionKey, id: SessionId) -> Option<Arc<SessionHandle>> {
-        // `remove_if` holds the shard write lock across the identity check and
-        // deletion, so a replacement cannot slip between separate operations.
-        let (_, removed) = self
-            .by_key
-            .remove_if(key, |_, session| session.session().id == id)?;
-
-        self.by_id.remove(&id);
+        self.unpublish(key, id);
+        // IDs are unique per incarnation, so this never touches a newer one.
+        let (_, removed) = self.by_id.remove(&id)?;
         self.count.fetch_sub(1, Ordering::Relaxed);
         Some(removed)
     }
@@ -171,7 +187,7 @@ impl SessionTable {
             .collect()
     }
 
-    /// Cancels every mapping owned by a listener and returns the number found.
+    /// Closes every session owned by a listener and returns the number found.
     pub fn close_listener(&self, listener_id: ListenerId) -> usize {
         let sessions: Vec<_> = self
             .by_id
@@ -180,12 +196,12 @@ impl SessionTable {
             .map(|entry| Arc::clone(entry.value()))
             .collect();
         for session in &sessions {
-            session.close();
+            self.close(session);
         }
         sessions.len()
     }
 
-    /// Cancels every active session.
+    /// Closes every active session.
     pub fn close_all(&self) -> usize {
         let sessions: Vec<_> = self
             .by_id
@@ -193,7 +209,7 @@ impl SessionTable {
             .map(|entry| Arc::clone(entry.value()))
             .collect();
         for session in &sessions {
-            session.close();
+            self.close(session);
         }
         sessions.len()
     }
@@ -274,6 +290,54 @@ mod tests {
                 .expect("replacement must remain by ID"),
             &replacement
         ));
+    }
+
+    #[tokio::test]
+    async fn closing_unpublishes_the_route_but_keeps_the_session_until_removed() {
+        let table = SessionTable::new();
+        let old = test_session_handle();
+        let key = old.session().key();
+        let old_id = old.session().id;
+        assert!(table.insert(Arc::clone(&old)).is_ok());
+
+        table.close(&old);
+        assert!(
+            table.get_by_key(&key).is_none(),
+            "closed route must be gone"
+        );
+        assert!(
+            table.get_by_id(&old_id).is_some(),
+            "draining session stays listed"
+        );
+        assert_eq!(table.len(), 1);
+
+        // The same client can open a new session while the old one drains.
+        let replacement = test_session_handle();
+        assert_eq!(replacement.session().key(), key);
+        assert!(table.insert(Arc::clone(&replacement)).is_ok());
+        assert_eq!(table.len(), 2);
+
+        // The old task's cleanup must not delete the newer route.
+        assert!(table.remove(&key, old_id).is_some());
+        assert_eq!(table.len(), 1);
+        assert!(Arc::ptr_eq(
+            &table
+                .get_by_key(&key)
+                .expect("replacement must stay routed"),
+            &replacement
+        ));
+        assert!(table.get_by_id(&old_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_a_listener_frees_its_routes_for_new_sessions() {
+        let table = SessionTable::new();
+        let old = test_session_handle();
+        let key = old.session().key();
+        assert!(table.insert(Arc::clone(&old)).is_ok());
+        assert_eq!(table.close_listener(ListenerId::new(7)), 1);
+        assert!(table.get_by_key(&key).is_none());
+        assert!(table.insert(test_session_handle()).is_ok());
     }
 
     fn test_session_handle() -> Arc<SessionHandle> {

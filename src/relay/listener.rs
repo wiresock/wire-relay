@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::{
     config::ListenerConfig,
     dns::{BackendResolver, DnsSnapshot, PreparedBackend},
-    limits::{AdmissionController, AdmissionRejection, LogRateLimiter},
+    limits::{AdmissionController, AdmissionRejection, LogRateLimiter, LogSite},
     metrics::{DropReason, Metrics},
 };
 
@@ -243,7 +243,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             Ok(result) => result,
             Err(error) => {
                 context.metrics.socket_error();
-                if context.log_limiter.should_log("listener-recv-error") {
+                if context.log_limiter.should_log(LogSite::ListenerRecvError) {
                     warn!(
                         listener = %handle.config().name,
                         %error,
@@ -281,9 +281,9 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
                 context.metrics.session_rejected(rate_limited);
                 record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
                 if context.log_limiter.should_log(match rejection {
-                    AdmissionRejection::GlobalLimit => "global-session-limit",
-                    AdmissionRejection::PerIpLimit => "per-ip-session-limit",
-                    AdmissionRejection::RateLimited => "session-rate-limit",
+                    AdmissionRejection::GlobalLimit => LogSite::GlobalSessionLimit,
+                    AdmissionRejection::PerIpLimit => LogSite::PerIpSessionLimit,
+                    AdmissionRejection::RateLimited => LogSite::SessionRateLimit,
                 }) {
                     warn!(
                         listener = %handle.config().name,
@@ -314,7 +314,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             context.metrics.session_rejected(false);
             record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
             drop(admission);
-            if context.log_limiter.should_log("backend-unresolved") {
+            if context.log_limiter.should_log(LogSite::BackendUnresolved) {
                 warn!(
                     listener = %handle.config().name,
                     "new session rejected because backend has never resolved"
@@ -330,7 +330,10 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
                 context.metrics.session_rejected(false);
                 record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
                 drop(admission);
-                if context.log_limiter.should_log("upstream-connect-error") {
+                if context
+                    .log_limiter
+                    .should_log(LogSite::UpstreamConnectError)
+                {
                     warn!(
                         listener = %handle.config().name,
                         %backend_addr,
@@ -350,7 +353,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
                 drop(admission);
                 if context
                     .log_limiter
-                    .should_log("upstream-local-address-error")
+                    .should_log(LogSite::UpstreamLocalAddressError)
                 {
                     warn!(
                         listener = %handle.config().name,

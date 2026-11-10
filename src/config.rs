@@ -234,18 +234,21 @@ pub fn fixed_datagram_memory(sessions: usize, max_datagram_size: usize) -> u128 
     (sessions as u128).saturating_mul(per_session)
 }
 
-/// Bytes left for queued datagrams after reserving fixed receive buffers for
-/// `sessions` sessions out of `memory_bytes`.
+/// Bytes left for queued datagrams out of `memory_bytes`.
 ///
-/// This is the single implementation of the queue budget; configuration
-/// helpers and the runtime budget both call it. Production passes
-/// [`MAX_SESSION_DATAGRAM_MEMORY_BYTES`] and `max(live, max_sessions)`.
+/// Fixed receive buffers are reserved for `max(live_sessions, max_sessions)`
+/// sessions: sessions admitted under an earlier, larger limit keep their
+/// buffers after a reload. This is the single implementation of the queue
+/// budget; the configuration helpers and the runtime budget both call it, and
+/// production passes [`MAX_SESSION_DATAGRAM_MEMORY_BYTES`].
 #[must_use]
 pub fn queued_datagram_budget(
     memory_bytes: u128,
-    sessions: usize,
+    max_sessions: usize,
+    live_sessions: usize,
     max_datagram_size: usize,
 ) -> usize {
+    let sessions = max_sessions.max(live_sessions);
     let remaining = memory_bytes.saturating_sub(fixed_datagram_memory(sessions, max_datagram_size));
     usize::try_from(remaining).unwrap_or(usize::MAX)
 }
@@ -272,7 +275,8 @@ impl ServiceConfig {
     pub fn queued_datagram_budget_with_live_sessions(&self, live_sessions: usize) -> usize {
         queued_datagram_budget(
             MAX_SESSION_DATAGRAM_MEMORY_BYTES,
-            self.max_sessions.max(live_sessions),
+            self.max_sessions,
+            live_sessions,
             self.max_datagram_size,
         )
     }
@@ -741,17 +745,29 @@ fn validate_service(service: &ServiceConfig) -> Result<(), ConfigError> {
     // maximum-sized datagrams, each charged with the per-datagram overhead,
     // must fit. Queues beyond that share the remaining budget, which the relay
     // enforces using the same per-datagram charge.
-    let worst_case_datagram_memory = service
-        .fixed_session_datagram_memory()
-        .saturating_add(service.full_queue_datagram_memory());
-    if worst_case_datagram_memory > MAX_SESSION_DATAGRAM_MEMORY_BYTES {
+    let gib = MAX_SESSION_DATAGRAM_MEMORY_BYTES / (1024 * 1024 * 1024);
+    let fixed = service.fixed_session_datagram_memory();
+    if fixed > MAX_SESSION_DATAGRAM_MEMORY_BYTES {
         return Err(invalid_value(
             "service.max_sessions",
             format!(
-                "combined with service.max_datagram_size and service.session_queue_depth, the \
-                 worst-case per-session datagram buffers plus one full session queue exceed the \
-                 defensive {} GiB budget; reduce one of those values",
-                MAX_SESSION_DATAGRAM_MEMORY_BYTES / (1024 * 1024 * 1024)
+                "combined with service.max_datagram_size, the per-session receive datagram \
+                 buffers alone exceed the defensive {gib} GiB budget; reduce \
+                 service.max_sessions or service.max_datagram_size"
+            ),
+        ));
+    }
+    if fixed.saturating_add(service.full_queue_datagram_memory())
+        > MAX_SESSION_DATAGRAM_MEMORY_BYTES
+    {
+        return Err(invalid_value(
+            "service.session_queue_depth",
+            format!(
+                "one full session queue of service.max_datagram_size datagrams does not fit \
+                 beside the per-session receive datagram buffers of service.max_sessions \
+                 sessions within the defensive {gib} GiB budget; reduce \
+                 service.session_queue_depth, service.max_datagram_size, or \
+                 service.max_sessions"
             ),
         ));
     }

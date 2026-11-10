@@ -1685,8 +1685,8 @@ configuration_wizard() {
             "$DEFAULT_SESSION_QUEUE_DEPTH"; then
             break
         fi
-        warn "That datagram size and session limit exceed the defensive 4 GiB buffering budget."
-        warn "Choose a smaller maximum datagram size, or restart the wizard with fewer sessions."
+        warn "That datagram size and session limit, with the default session queue depth of ${DEFAULT_SESSION_QUEUE_DEPTH}, exceed the defensive 4 GiB buffering budget (per-session receive buffers plus one full session queue)."
+        warn "Choose a smaller maximum datagram size, or restart the wizard with fewer sessions. A smaller service.session_queue_depth in the configuration file also reduces the budget needed."
     done
 
     if confirm "Enable Prometheus metrics?" "n"; then

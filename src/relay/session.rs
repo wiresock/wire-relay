@@ -28,7 +28,7 @@ use crate::{
         MAX_SESSION_DATAGRAM_MEMORY_BYTES, QUEUED_DATAGRAM_OVERHEAD_BYTES, ServiceConfig,
         queued_datagram_budget,
     },
-    limits::{AdmissionLease, LogRateLimiter},
+    limits::{AdmissionLease, LogRateLimiter, LogSite},
     metrics::{DropCounters, DropReason, DropSnapshot, Metrics},
 };
 
@@ -215,22 +215,25 @@ impl QueueBudget {
         let (max_sessions, max_datagram_size) = self.configured();
         queued_datagram_budget(
             self.memory_bytes,
-            self.live_sessions().max(max_sessions),
+            max_sessions,
+            self.live_sessions(),
             max_datagram_size,
         )
     }
 
-    /// Whether live sessions' receive buffers currently leave nothing for
-    /// queued datagrams, so every queued datagram drops as
-    /// `budget_exhausted` until enough of those sessions end.
+    /// Whether live sessions' receive buffers leave less than one
+    /// maximum-sized queued datagram's charge, so a full-sized datagram that
+    /// has to queue drops as `budget_exhausted` (smaller ones soon after)
+    /// until enough of those sessions end.
     ///
-    /// Validation guarantees a positive budget for `max_sessions`, so this
-    /// only happens when a reload left more live sessions than the new
-    /// configuration allows for, or raised `max_datagram_size` under a large
-    /// live population.
+    /// Validation guarantees room for a full queue of maximum-sized
+    /// datagrams beside `max_sessions` sessions, so this only happens when a
+    /// reload left more live sessions than the new configuration allows for,
+    /// or raised `max_datagram_size` under a large live population.
     #[must_use]
-    pub fn exhausted_by_live_sessions(&self) -> bool {
-        self.live_sessions() > 0 && self.limit() == 0
+    pub fn starved_by_live_sessions(&self) -> bool {
+        let (_, max_datagram_size) = self.configured();
+        self.live_sessions() > 0 && self.limit() < Self::charge(max_datagram_size)
     }
 
     /// Counts one session's receive buffers until the guard is dropped.
@@ -516,7 +519,9 @@ impl SessionHandle {
         listener_counters: &ListenerCounters,
         log_limiter: &LogRateLimiter,
     ) {
-        self.session.touch_client();
+        // Only an accepted datagram counts as client activity: a client that
+        // keeps sending into a closed or back-pressured session must still
+        // idle out and release its admission slot and receive buffers.
         if self.closed.load(Ordering::Acquire) {
             record_drop(metrics, listener_counters, DropReason::SessionClosed);
             return;
@@ -526,6 +531,9 @@ impl SessionHandle {
             match self.upstream.try_send(datagram) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 result => {
+                    if matches!(result, Ok(sent) if sent == datagram.len()) {
+                        self.session.touch_client();
+                    }
                     record_backend_send(
                         &self.session,
                         datagram.len(),
@@ -540,7 +548,7 @@ impl SessionHandle {
         }
 
         match self.enqueue(datagram) {
-            Ok(()) => {}
+            Ok(()) => self.session.touch_client(),
             Err(reason) => {
                 record_drop(metrics, listener_counters, reason);
                 self.log_enqueue_drop(reason, datagram.len(), log_limiter);
@@ -550,7 +558,7 @@ impl SessionHandle {
 
     fn log_enqueue_drop(&self, reason: DropReason, size: usize, log_limiter: &LogRateLimiter) {
         match reason {
-            DropReason::QueueFull if log_limiter.should_log("session-queue-full") => {
+            DropReason::QueueFull if log_limiter.should_log(LogSite::SessionQueueFull) => {
                 warn!(
                     listener = %self.session.listener_name,
                     session_id = %self.session.id,
@@ -558,7 +566,9 @@ impl SessionHandle {
                     "session queue full (service.session_queue_depth); dropping client datagram"
                 );
             }
-            DropReason::BudgetExhausted if log_limiter.should_log("queue-budget-exhausted") => {
+            DropReason::BudgetExhausted
+                if log_limiter.should_log(LogSite::QueueBudgetExhausted) =>
+            {
                 let (max_sessions, max_datagram_size) = self.queue_budget.configured();
                 warn!(
                     listener = %self.session.listener_name,
@@ -675,13 +685,23 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
 
     metrics.session_created();
     listener_counters.session_started();
+    // Created before spawning so that a task dropped before its first poll
+    // (shutdown or abort) still closes the handle, removes this table entry,
+    // ends the gauges, and releases admission.
+    let cleanup = SessionCleanup {
+        handle: Arc::clone(&handle),
+        table,
+        session: Arc::clone(&handle.session),
+        admission: Some(admission),
+        metrics: Arc::clone(&metrics),
+        listener_counters: Arc::clone(&listener_counters),
+        reason: SessionCloseReason::Closed,
+    };
 
     let task = SessionTask {
         _live: live,
         first_datagram,
         listener_socket,
-        table,
-        admission: Some(admission),
         metrics,
         listener_counters,
         idle_timeout,
@@ -690,7 +710,7 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
     };
     let task_handle = Arc::clone(&handle);
     tracker.spawn(async move {
-        run_session(task_handle, receiver, cancel, task).await;
+        run_session(task_handle, receiver, cancel, task, cleanup).await;
     });
     Ok(handle)
 }
@@ -701,8 +721,6 @@ struct SessionTask {
     _live: LiveSession,
     first_datagram: Vec<u8>,
     listener_socket: Arc<UdpSocket>,
-    table: Arc<SessionTable>,
-    admission: Option<AdmissionLease>,
     metrics: Arc<Metrics>,
     listener_counters: Arc<ListenerCounters>,
     idle_timeout: watch::Receiver<Duration>,
@@ -715,16 +733,8 @@ async fn run_session(
     mut receiver: Receiver<QueuedDatagram>,
     cancel: CancellationToken,
     mut task: SessionTask,
+    mut cleanup: SessionCleanup,
 ) {
-    let mut cleanup = SessionCleanup {
-        handle: Arc::clone(&handle),
-        table: Arc::clone(&task.table),
-        session: Arc::clone(&handle.session),
-        admission: task.admission.take(),
-        metrics: Arc::clone(&task.metrics),
-        listener_counters: Arc::clone(&task.listener_counters),
-        reason: SessionCloseReason::Closed,
-    };
     let upstream = Arc::clone(&handle.upstream);
 
     let first_sent = tokio::select! {
@@ -764,7 +774,7 @@ async fn run_session(
     // still queued. After `close`, the listener's enqueues fail as closed
     // and are counted there; `recv` also waits out a slot the listener
     // reserved just before, so nothing is released uncounted.
-    handle.close();
+    cleanup.table.close(&handle);
     receiver.close();
     while let Some(datagram) = receiver.recv().await {
         drop(datagram);
@@ -878,7 +888,7 @@ async fn forward_until_stopped(
                                     &task.listener_counters,
                                     DropReason::SendError,
                                 );
-                                if task.log_limiter.should_log("partial-client-send") {
+                                if task.log_limiter.should_log(LogSite::PartialClientSend) {
                                     warn!(
                                         session_id = %handle.session.id,
                                         expected = size,
@@ -894,7 +904,7 @@ async fn forward_until_stopped(
                                     &task.listener_counters,
                                     DropReason::SendError,
                                 );
-                                if task.log_limiter.should_log("client-send-error") {
+                                if task.log_limiter.should_log(LogSite::ClientSendError) {
                                     warn!(
                                         session_id = %handle.session.id,
                                         %error,
@@ -909,7 +919,7 @@ async fn forward_until_stopped(
                     }
                     Err(error) => {
                         task.metrics.socket_error();
-                        if task.log_limiter.should_log("upstream-recv-error") {
+                        if task.log_limiter.should_log(LogSite::UpstreamRecvError) {
                             warn!(
                                 session_id = %handle.session.id,
                                 %error,
@@ -974,7 +984,7 @@ fn record_backend_send(
         Ok(sent) => {
             metrics.socket_error();
             record_drop(metrics, listener_counters, DropReason::SendError);
-            if log_limiter.should_log("partial-backend-send") {
+            if log_limiter.should_log(LogSite::PartialBackendSend) {
                 warn!(
                     session_id = %session.id,
                     expected,
@@ -986,7 +996,7 @@ fn record_backend_send(
         Err(error) => {
             metrics.socket_error();
             record_drop(metrics, listener_counters, DropReason::SendError);
-            if log_limiter.should_log("backend-send-error") {
+            if log_limiter.should_log(LogSite::BackendSendError) {
                 warn!(
                     session_id = %session.id,
                     %error,
@@ -1010,8 +1020,8 @@ struct SessionCleanup {
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         // Backstop for every exit path, including a task that is dropped
-        // without running to completion.
-        self.handle.close();
+        // without running to completion or before its first poll.
+        self.table.close(&self.handle);
         self.table.remove(&self.session.key(), self.session.id);
         self.listener_counters.session_ended();
         self.metrics
@@ -1483,7 +1493,7 @@ mod tests {
         let live: Vec<_> = (0..40_000).map(|_| budget.session_started()).collect();
         budget.configure(&lowered);
         assert_eq!(budget.limit(), 0);
-        assert!(budget.exhausted_by_live_sessions());
+        assert!(budget.starved_by_live_sessions());
         assert_eq!(
             budget.limit(),
             lowered.queued_datagram_budget_with_live_sessions(live.len())
@@ -1506,7 +1516,7 @@ mod tests {
         assert_eq!(budget.live_sessions(), 0);
         assert_eq!(budget.limit(), lowered.queued_datagram_budget());
         assert!(budget.limit() > 0);
-        assert!(!budget.exhausted_by_live_sessions());
+        assert!(!budget.starved_by_live_sessions());
     }
 
     #[test]
@@ -1527,16 +1537,24 @@ mod tests {
         let budget = QueueBudget::new(&before);
         let live: Vec<_> = (0..40_000).map(|_| budget.session_started()).collect();
         assert!(budget.limit() > 0);
-        assert!(!budget.exhausted_by_live_sessions());
+        assert!(!budget.starved_by_live_sessions());
 
         // Live sessions resize their receive buffers to the new maximum, so
         // 40 000 * (2 * 65507 + 1) bytes exceed the 4 GiB ceiling.
         budget.configure(&after);
         assert_eq!(budget.limit(), 0);
-        assert!(budget.exhausted_by_live_sessions());
+        assert!(budget.starved_by_live_sessions());
+
+        // With 32 782 sessions left, 33 566 bytes remain: not zero, but less
+        // than one maximum-sized datagram's charge, so still starved.
+        let mut live = live;
+        live.truncate(32_782);
+        assert!(budget.limit() > 0);
+        assert!(budget.limit() < QueueBudget::charge(after.max_datagram_size));
+        assert!(budget.starved_by_live_sessions());
 
         drop(live);
-        assert!(!budget.exhausted_by_live_sessions());
+        assert!(!budget.starved_by_live_sessions());
         assert_eq!(budget.limit(), after.queued_datagram_budget());
     }
 
@@ -1609,6 +1627,136 @@ mod tests {
         assert_eq!(metrics.snapshot().packets_to_backend_total, 0);
         assert_eq!(budget.used(), 0);
         assert_eq!(budget.live_sessions(), 0);
+    }
+
+    /// Asserts whether forwarding `datagram` moved the client activity time.
+    async fn assert_touch(
+        harness: &Harness,
+        datagram: &[u8],
+        expected: ForwardOutcome,
+        touched: bool,
+    ) {
+        let before = harness
+            .handle
+            .session
+            .activity
+            .last_client_ns
+            .load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(harness.forward(datagram), expected);
+        let after = harness
+            .handle
+            .session
+            .activity
+            .last_client_ns
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            after > before,
+            touched,
+            "{expected:?} touched={}",
+            after > before
+        );
+    }
+
+    #[tokio::test]
+    async fn only_accepted_datagrams_refresh_client_activity() {
+        // A queued datagram counts as activity.
+        let queued = harness(1, 1, usize::MAX).await;
+        assert_touch(&queued, b"one", ForwardOutcome::Queued, true).await;
+        // A full session queue does not.
+        assert_touch(
+            &queued,
+            b"two",
+            ForwardOutcome::Dropped(DropReason::QueueFull),
+            false,
+        )
+        .await;
+
+        // An exhausted shared budget does not.
+        let starved = harness(16, 1, QueueBudget::charge(1)).await;
+        assert_touch(
+            &starved,
+            &[0; 2],
+            ForwardOutcome::Dropped(DropReason::BudgetExhausted),
+            false,
+        )
+        .await;
+
+        // A closed session does not.
+        let closed = harness(16, 0, usize::MAX).await;
+        closed.handle.close();
+        assert_touch(
+            &closed,
+            b"late",
+            ForwardOutcome::Dropped(DropReason::SessionClosed),
+            false,
+        )
+        .await;
+
+        // A successful direct send does.
+        let direct = harness(16, 0, usize::MAX).await;
+        assert_touch(&direct, b"direct", ForwardOutcome::Sent, true).await;
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_frees_its_route_for_the_next_datagram() {
+        let running = launch_running(Duration::from_secs(30)).await;
+        let key = running.handle.session().key();
+        // Keep the old task draining: it cannot run until this test yields.
+        running.handle.pending.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(running.forward(b"queued"), ForwardOutcome::Queued);
+        running.table.close(&running.handle);
+
+        // The listener's lookup misses, so it would create a new session for
+        // the same client instead of dropping the datagram as closed.
+        assert!(running.table.get_by_key(&key).is_none());
+        let replacement = SessionHandle::for_test(Session::new(
+            key.listener_id,
+            "test".to_owned(),
+            key.client_addr,
+            "127.0.0.1:40001".parse().unwrap(),
+            "127.0.0.1:40002".parse().unwrap(),
+        ));
+        assert!(running.table.insert(Arc::clone(&replacement)).is_ok());
+
+        running.wait_until_removed().await;
+        running.assert_session_closed_drops(1);
+        assert!(Arc::ptr_eq(
+            &running
+                .table
+                .get_by_key(&key)
+                .expect("replacement stays routed"),
+            &replacement
+        ));
+        assert_eq!(running.table.len(), 1);
+        running.stop().await;
+    }
+
+    #[test]
+    fn a_session_task_dropped_before_its_first_poll_cleans_up() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // `launch_unstarted` never yields after spawning, so the session
+        // task is still unpolled when the runtime is dropped.
+        let budget = QueueBudget::with_limit(usize::MAX);
+        let running = runtime.block_on(launch_unstarted(
+            Duration::from_secs(30),
+            Arc::clone(&budget),
+        ));
+        assert_eq!(running.table.len(), 1);
+        assert_eq!(running.metrics.snapshot().active_sessions, 1);
+        drop(runtime);
+
+        // Nothing was sent, so the task really never ran.
+        assert_eq!(running.metrics.snapshot().packets_to_backend_total, 0);
+        assert!(running.table.is_empty());
+        assert!(!running.in_table());
+        assert_eq!(running.metrics.snapshot().active_sessions, 0);
+        assert_eq!(running.counters.snapshot().active_sessions, 0);
+        assert_eq!(budget.live_sessions(), 0);
+        assert!(running.handle.closed.load(Ordering::Acquire));
     }
 
     #[test]
