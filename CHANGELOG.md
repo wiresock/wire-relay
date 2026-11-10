@@ -20,10 +20,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   queue memory budget charged with each datagram's size plus a fixed 64-byte
   overhead. Under a tight configuration (high `max_sessions` and large
   datagrams) the shared remainder can be small, and a few back-pressured
-  sessions can exhaust it so that others drop as `queue_full`.
+  sessions can exhaust it so that others drop as `queue_full`. After a reload
+  lowers `max_sessions` below the live session count, the budget recovers to
+  its full size as the surplus sessions end.
 - Per-reason drop counters in `/metrics`, `wire-relay stats`, and
   `wire-relay listeners`, plus a rate-limited warning when a session queue is
-  full. `wire_relay_datagrams_dropped_total` is unchanged.
+  full. `wire_relay_datagrams_dropped_total` is unchanged; it is now the sum
+  of the per-reason counters, and datagrams still queued when a session stops
+  are counted as `session_closed`.
 
 ### Changed
 

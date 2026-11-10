@@ -267,7 +267,9 @@ fit beside them, so the largest datagram and session-count ceilings cannot be
 selected simultaneously. The rest of the budget is shared by all session queues
 and is enforced at runtime; a datagram that would exceed it is dropped as
 `queue_full`. After a reload that lowers `max_sessions`, receive buffers stay
-reserved for sessions that are still active above the new limit.
+reserved for sessions that are still active above the new limit, and the
+shared remainder grows back to the new configuration's full size as those
+sessions end.
 
 The shared remainder can be small. With a high `max_sessions` and a large
 `max_datagram_size`, the fixed receive buffers take most of the 4 GiB, and a
@@ -399,7 +401,7 @@ broken down, without labels, by reason:
 | --- | --- |
 | `wire_relay_datagrams_dropped_oversize_total` | larger than `max_datagram_size` |
 | `wire_relay_datagrams_dropped_queue_full_total` | session queue or shared queue memory full |
-| `wire_relay_datagrams_dropped_session_closed_total` | session was closing |
+| `wire_relay_datagrams_dropped_session_closed_total` | session was closing, including datagrams still queued when it stopped |
 | `wire_relay_datagrams_dropped_rejected_total` | no session could be created (admission limits, unresolved backend, socket setup, route change) |
 | `wire_relay_datagrams_dropped_send_error_total` | the OS refused or truncated a send in either direction |
 

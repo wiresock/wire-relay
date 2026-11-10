@@ -74,20 +74,32 @@ rather than growing memory or blocking all clients on the listener.
 
 Queued datagrams also reserve their length plus a fixed 64-byte per-datagram
 overhead from a process-wide queue memory budget: the defensive 4 GiB datagram
-budget minus the fixed receive buffers of `max(max_sessions, live sessions)`,
-recomputed on reload. The reservation is released when the queued datagram is
-dropped, including when a session stops with datagrams still queued. A lowered
-limit applies immediately; new reservations fail until use drains below it.
+budget minus the fixed receive buffers of `max(max_sessions, live sessions)`.
+The limit is not stored: every reservation derives it from the current
+`max_sessions` and `max_datagram_size` (updated on reload, after the admission
+limits) and an atomic live-session count kept by each session task. A reload
+that shrinks `max_sessions` below the live count therefore lowers the limit
+only while the surplus sessions exist, and it returns to the steady-state
+budget as they end, without a recomputation that a concurrent reload or
+session exit could leave stale. The reservation is released when the queued
+datagram is dropped, including when a session stops with datagrams still
+queued. A lowered limit applies immediately; new reservations fail until use
+drains below it. The listener claims a queue slot before charging the budget
+or copying the datagram, so a full queue drops without either.
 The budget is shared, not partitioned: under a tight configuration (high
 `max_sessions` and large datagrams) the remainder can be small, and a few
 back-pressured sessions can exhaust it so that other sessions drop as
 `queue_full`.
 
-The session task cancels its token on every exit path (idle expiry, closed
+The session task closes its handle on every exit path (idle expiry, closed
 idle-timeout channel, explicit close, shutdown) before its table entry is
-removed, so a listener still holding the handle drops later datagrams as
-`session_closed` instead of sending on the exiting session's socket. On idle
-timer expiry the task re-reads the current timeout before deciding to close.
+removed: an atomic flag the listener checks without locking, plus the
+cancellation token the task waits on. A listener still holding the handle then
+drops later datagrams as `session_closed` instead of sending on the exiting
+session's socket. The task then closes its queue and counts every datagram
+still in it, and an unsent first datagram, as `session_closed`; datagrams
+already sent are not counted. On idle timer expiry the task re-reads the
+current timeout before deciding to close.
 
 For a new session, the listener reserves global/per-IP/rate capacity before
 creating a socket. The listener's receive loop serializes creation for that
