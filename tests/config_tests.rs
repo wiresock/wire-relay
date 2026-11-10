@@ -527,3 +527,46 @@ fn one_full_queue_must_fit_beside_fixed_session_buffers() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn one_full_queue_is_charged_with_per_datagram_overhead() {
+    // 65536 * 65507 plus one session's receive buffers fits in 4 GiB, but not
+    // once each queued datagram is charged its fixed overhead.
+    let input = format!(
+        "[service]\nmax_sessions = 1\nmax_sessions_per_ip = 1\n\
+         max_datagram_size = 65507\nsession_queue_depth = 65536\n{MINIMAL}"
+    );
+    let error = Config::parse_str(&input).expect_err("queue overhead must be budgeted");
+    assert!(
+        error.to_string().contains("session_queue_depth"),
+        "unexpected error: {error}"
+    );
+    let input = format!(
+        "[service]\nmax_sessions = 1\nmax_sessions_per_ip = 1\n\
+         max_datagram_size = 65507\nsession_queue_depth = 65000\n{MINIMAL}"
+    );
+    Config::parse_str(&input).expect("a queue that fits with overhead must be accepted");
+}
+
+#[test]
+fn reload_budget_reserves_buffers_for_live_sessions_above_the_limit() {
+    let service = ServiceConfig {
+        max_sessions: 10,
+        max_sessions_per_ip: 10,
+        ..ServiceConfig::default()
+    };
+    let per_session = service.max_datagram_size * 2 + 1;
+    let total = 4 * 1024 * 1024 * 1024;
+    assert_eq!(
+        service.queued_datagram_budget_with_live_sessions(3),
+        total - 10 * per_session
+    );
+    assert_eq!(
+        service.queued_datagram_budget_with_live_sessions(500),
+        total - 500 * per_session
+    );
+    assert_eq!(
+        service.queued_datagram_budget(),
+        service.queued_datagram_budget_with_live_sessions(0)
+    );
+}

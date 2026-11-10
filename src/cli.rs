@@ -452,6 +452,13 @@ fn render_listeners(listeners: &[ListenerSnapshot]) -> String {
         let resolved = listener
             .resolved_backend
             .map_or_else(|| "-".to_owned(), |address| address.to_string());
+        let counters = &listener.counters;
+        let queue_full = if counters.datagrams_dropped.is_reported_for(counters.dropped) {
+            counters.datagrams_dropped.queue_full.to_string()
+        } else {
+            // An older daemon reports drops without a per-reason breakdown.
+            "-".to_owned()
+        };
         let _ = writeln!(
             output,
             "{:<20} {:<24} {:<24} {:<24} {:<12} {:<9} {:<9} {}",
@@ -460,9 +467,9 @@ fn render_listeners(listeners: &[ListenerSnapshot]) -> String {
             listener.configured_backend,
             resolved,
             format!("{:?}", listener.status),
-            listener.counters.active_sessions,
-            listener.counters.dropped,
-            listener.counters.datagrams_dropped.queue_full
+            counters.active_sessions,
+            counters.dropped,
+            queue_full
         );
     }
     output
@@ -510,8 +517,8 @@ fn render_session(session: &SessionSnapshot) -> String {
 }
 
 fn render_stats(stats: &MetricsSnapshot) -> String {
-    format!(
-        "active sessions: {}\nsessions created: {}\nsessions expired: {}\nsessions closed: {}\nsessions rejected: {}\npackets to backend: {}\npackets to client: {}\nbytes to backend: {}\nbytes to client: {}\ndatagrams dropped: {}\n  oversize: {}\n  queue full: {}\n  session closed: {}\n  rejected: {}\n  send error: {}\nrate limited: {}\nDNS errors: {}\nsocket errors: {}\n",
+    let mut output = format!(
+        "active sessions: {}\nsessions created: {}\nsessions expired: {}\nsessions closed: {}\nsessions rejected: {}\npackets to backend: {}\npackets to client: {}\nbytes to backend: {}\nbytes to client: {}\ndatagrams dropped: {}\n",
         stats.active_sessions,
         stats.sessions_created_total,
         stats.sessions_expired_total,
@@ -522,15 +529,26 @@ fn render_stats(stats: &MetricsSnapshot) -> String {
         stats.bytes_to_backend_total,
         stats.bytes_to_client_total,
         stats.datagrams_dropped_total,
-        stats.datagrams_dropped.oversize,
-        stats.datagrams_dropped.queue_full,
-        stats.datagrams_dropped.session_closed,
-        stats.datagrams_dropped.rejected,
-        stats.datagrams_dropped.send_error,
-        stats.rate_limited_total,
-        stats.dns_errors_total,
-        stats.socket_errors_total
-    )
+    );
+    let drops = &stats.datagrams_dropped;
+    // An older daemon reports drops without a per-reason breakdown.
+    if drops.is_reported_for(stats.datagrams_dropped_total) {
+        let _ = write!(
+            output,
+            "  oversize: {}\n  queue full: {}\n  session closed: {}\n  rejected: {}\n  send error: {}\n",
+            drops.oversize,
+            drops.queue_full,
+            drops.session_closed,
+            drops.rejected,
+            drops.send_error
+        );
+    }
+    let _ = write!(
+        output,
+        "rate limited: {}\nDNS errors: {}\nsocket errors: {}\n",
+        stats.rate_limited_total, stats.dns_errors_total, stats.socket_errors_total
+    );
+    output
 }
 
 fn render_reload(result: &ReloadResult) -> String {
@@ -641,9 +659,8 @@ mod tests {
         Cli::try_parse_from(["wire-relay", "config", "--toml"]).expect("config TOML command");
     }
 
-    #[test]
-    fn human_listener_output_contains_runtime_dns_state() {
-        let listener = ListenerSnapshot {
+    fn test_listener(counters: ListenerCounterSnapshot) -> ListenerSnapshot {
+        ListenerSnapshot {
             id: ListenerId::new(1),
             name: "germany".to_owned(),
             bind: "127.0.0.1:40001".parse().unwrap(),
@@ -658,12 +675,58 @@ mod tests {
                 last_attempt_age_ms: 1000,
                 last_error: None,
             },
-            counters: ListenerCounterSnapshot::default(),
-        };
-        let rendered = render_listeners(&[listener]);
+            counters,
+        }
+    }
+
+    fn listener_row(counters: ListenerCounterSnapshot) -> String {
+        render_listeners(&[test_listener(counters)])
+            .lines()
+            .nth(1)
+            .expect("one listener row")
+            .to_owned()
+    }
+
+    #[test]
+    fn human_listener_output_contains_runtime_dns_state() {
+        let rendered = render_listeners(&[test_listener(ListenerCounterSnapshot::default())]);
         assert!(rendered.contains("germany"));
         assert!(rendered.contains("192.0.2.1:51820"));
         assert!(rendered.contains("QUEUE FULL"));
+    }
+
+    #[test]
+    fn human_listener_queue_full_column_distinguishes_unknown_from_zero() {
+        let none = listener_row(ListenerCounterSnapshot::default());
+        assert!(none.ends_with(" 0"), "{none}");
+
+        let counted = listener_row(ListenerCounterSnapshot {
+            dropped: 3,
+            datagrams_dropped: crate::metrics::DropSnapshot {
+                queue_full: 2,
+                oversize: 1,
+                ..crate::metrics::DropSnapshot::default()
+            },
+            ..ListenerCounterSnapshot::default()
+        });
+        assert!(counted.ends_with(" 2"), "{counted}");
+
+        let genuine_zero = listener_row(ListenerCounterSnapshot {
+            dropped: 1,
+            datagrams_dropped: crate::metrics::DropSnapshot {
+                oversize: 1,
+                ..crate::metrics::DropSnapshot::default()
+            },
+            ..ListenerCounterSnapshot::default()
+        });
+        assert!(genuine_zero.ends_with(" 0"), "{genuine_zero}");
+
+        // An older daemon: drops without any per-reason counters.
+        let older = listener_row(ListenerCounterSnapshot {
+            dropped: 5,
+            ..ListenerCounterSnapshot::default()
+        });
+        assert!(older.ends_with(" 5         -"), "{older}");
     }
 
     #[test]
@@ -680,10 +743,27 @@ mod tests {
             ..MetricsSnapshot::default()
         };
         let rendered = render_stats(&stats);
-        assert!(rendered.contains("datagrams dropped: 6\n"));
-        assert!(rendered.contains("  oversize: 1\n"));
+        assert!(rendered.contains("datagrams dropped: 6\n  oversize: 1\n"));
         assert!(rendered.contains("  queue full: 2\n"));
+        assert!(rendered.contains("  session closed: 0\n"));
         assert!(rendered.contains("  rejected: 3\n"));
+        assert!(rendered.contains("  send error: 0\nrate limited: 0\n"));
+
+        let none = render_stats(&MetricsSnapshot::default());
+        assert!(none.contains("datagrams dropped: 0\n  oversize: 0\n"));
+        assert!(none.contains("  queue full: 0\n"));
+    }
+
+    #[test]
+    fn human_stats_output_omits_an_unknown_breakdown_from_older_daemons() {
+        let stats = MetricsSnapshot {
+            datagrams_dropped_total: 4,
+            ..MetricsSnapshot::default()
+        };
+        let rendered = render_stats(&stats);
+        assert!(rendered.contains("datagrams dropped: 4\nrate limited: 0\n"));
+        assert!(!rendered.contains("queue full"));
+        assert!(!rendered.contains("oversize"));
     }
 
     #[tokio::test]

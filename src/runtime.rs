@@ -591,8 +591,15 @@ impl RuntimeCore {
             .store(new_config.service.max_datagram_size, Ordering::Relaxed);
         self.session_queue_depth
             .store(new_config.service.session_queue_depth, Ordering::Relaxed);
-        self.queue_budget
-            .set_limit(new_config.service.queued_datagram_budget());
+        // Sessions admitted under the previous limits keep their receive
+        // buffers, so reserve fixed memory for them even if `max_sessions`
+        // shrinks; queued datagrams get only what remains.
+        let live_sessions = self.admission.active().max(self.sessions.len());
+        self.queue_budget.set_limit(
+            new_config
+                .service
+                .queued_datagram_budget_with_live_sessions(live_sessions),
+        );
         self.dns_refresh_interval_ms.store(
             duration_millis_nonzero(new_config.service.dns_refresh_interval),
             Ordering::Relaxed,
@@ -1112,6 +1119,84 @@ fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_budget_test_config(
+        listener: std::net::SocketAddr,
+        backend: std::net::SocketAddr,
+        max_sessions: usize,
+    ) -> String {
+        format!(
+            "[service]\nmax_datagram_size = 4096\nmax_sessions = {max_sessions}\n\
+             max_sessions_per_ip = {max_sessions}\nnew_sessions_per_second = 1000\n\
+             shutdown_timeout = \"3s\"\n\n[[listeners]]\nname = \"budget\"\n\
+             bind = \"{listener}\"\nbackend = \"{backend}\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn reload_reserves_receive_buffers_for_sessions_beyond_a_lowered_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let backend = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let text = queue_budget_test_config(listener_addr, backend_addr, 4);
+        std::fs::write(&path, &text).unwrap();
+        let config = crate::config::Config::parse_str(&text)
+            .unwrap()
+            .into_normalized()
+            .unwrap();
+        let runtime = Runtime::start_with_options(
+            config,
+            &path,
+            RuntimeOptions {
+                control: false,
+                metrics: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.send_to(b"hello", listener_addr).await.unwrap();
+            clients.push(client);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.sessions().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("three sessions must start");
+
+        let lowered = queue_budget_test_config(listener_addr, backend_addr, 1);
+        std::fs::write(&path, &lowered).unwrap();
+        let result = runtime.reload().await.unwrap();
+        assert!(result.applied, "{}", result.message);
+        assert_eq!(
+            runtime.sessions().len(),
+            3,
+            "reload must keep live sessions"
+        );
+
+        let new_service = crate::config::Config::parse_str(&lowered).unwrap().service;
+        let per_session = 2 * 4096 + 1;
+        let expected =
+            usize::try_from(crate::config::MAX_SESSION_DATAGRAM_MEMORY_BYTES - 3 * per_session)
+                .unwrap();
+        assert_eq!(runtime.core.queue_budget.limit(), expected);
+        assert!(
+            runtime.core.queue_budget.limit() < new_service.queued_datagram_budget(),
+            "live sessions above the new limit must keep their buffer reservation"
+        );
+
+        runtime.shutdown().await.unwrap();
+    }
 
     fn session_snapshot(label: &str, bytes: u64) -> SessionSnapshot {
         SessionSnapshot {

@@ -46,22 +46,7 @@ async fn upload_bursts_are_forwarded_like_download_bursts() -> Result<()> {
         .await
         .context("bind backend")?;
     let backend_addr = backend.local_addr()?;
-    let reservation = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let listener_addr = reservation.local_addr()?;
-    drop(reservation);
-
-    let config = Config {
-        service: ServiceConfig::default(),
-        metrics: None,
-        listeners: vec![ListenerConfig {
-            name: "burst".to_owned(),
-            bind: listener_addr,
-            backend: BackendEndpoint::parse(&backend_addr.to_string()).context("parse backend")?,
-        }],
-    }
-    .into_normalized()
-    .context("valid test configuration")?;
-    let runtime = start(config).await?;
+    let (runtime, listener_addr) = start_on_free_port(backend_addr).await?;
 
     let result = exercise(&runtime, backend, listener_addr).await;
     let shutdown = timeout(IO_TIMEOUT, runtime.shutdown())
@@ -69,6 +54,38 @@ async fn upload_bursts_are_forwarded_like_download_bursts() -> Result<()> {
         .context("timed out shutting down runtime")?
         .context("runtime shutdown failed");
     result.and(shutdown)
+}
+
+/// Listener binds must name a concrete port, so pick one the OS reports as
+/// free and retry if another process claims it before the relay binds.
+async fn start_on_free_port(backend: SocketAddr) -> Result<(Runtime, SocketAddr)> {
+    const ATTEMPTS: usize = 10;
+    let mut last_error = None;
+    for _ in 0..ATTEMPTS {
+        let candidate =
+            std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?.local_addr()?;
+        match start(config_for(candidate, backend)?).await {
+            Ok(runtime) => return Ok((runtime, candidate)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("at least one attempt was made")).context(format!(
+        "failed to start the relay after {ATTEMPTS} port attempts"
+    ))
+}
+
+fn config_for(listener: SocketAddr, backend: SocketAddr) -> Result<NormalizedConfig> {
+    Config {
+        service: ServiceConfig::default(),
+        metrics: None,
+        listeners: vec![ListenerConfig {
+            name: "burst".to_owned(),
+            bind: listener,
+            backend: BackendEndpoint::parse(&backend.to_string()).context("parse backend")?,
+        }],
+    }
+    .into_normalized()
+    .context("valid test configuration")
 }
 
 async fn start(config: NormalizedConfig) -> Result<Runtime> {

@@ -58,10 +58,20 @@ const MIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const MAX_DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const MAX_SESSION_DATAGRAM_MEMORY_BYTES: u128 = 4 * 1024 * 1024 * 1024;
+/// Defensive ceiling for session receive buffers plus queued datagrams.
+pub const MAX_SESSION_DATAGRAM_MEMORY_BYTES: u128 = 4 * 1024 * 1024 * 1024;
 /// Receive buffers of `max_datagram_size` bytes that every session may own
 /// regardless of queue use.
-const SESSION_FIXED_DATAGRAM_BUFFERS: u128 = 2;
+pub const SESSION_FIXED_DATAGRAM_BUFFERS: u128 = 2;
+
+/// Fixed budget charged for every queued datagram on top of its payload.
+///
+/// It covers the 40-byte queue slot on 64-bit targets (the payload `Vec` plus
+/// the budget reservation; a compile-time assertion keeps the slot within
+/// this value) and leaves slack for allocator size-class rounding and the
+/// channel's per-block bookkeeping. Without it, empty or tiny datagrams could
+/// occupy far more real memory than the budget records.
+pub const QUEUED_DATAGRAM_OVERHEAD_BYTES: usize = 64;
 
 /// Fully typed configuration loaded from TOML.
 ///
@@ -224,16 +234,38 @@ impl ServiceConfig {
     /// allocation to fit.
     #[must_use]
     pub fn queued_datagram_budget(&self) -> usize {
-        let remaining =
-            MAX_SESSION_DATAGRAM_MEMORY_BYTES.saturating_sub(self.fixed_session_datagram_memory());
+        self.queued_datagram_budget_with_live_sessions(0)
+    }
+
+    /// Queue budget to apply while `live_sessions` sessions already exist.
+    ///
+    /// Sessions admitted under an earlier, larger `max_sessions` keep their
+    /// receive buffers after a reload, so fixed memory is reserved for
+    /// whichever is larger: the live sessions or the configured limit.
+    #[must_use]
+    pub fn queued_datagram_budget_with_live_sessions(&self, live_sessions: usize) -> usize {
+        let sessions = self.max_sessions.max(live_sessions);
+        let remaining = MAX_SESSION_DATAGRAM_MEMORY_BYTES
+            .saturating_sub(self.fixed_datagram_memory_for(sessions));
         usize::try_from(remaining).unwrap_or(usize::MAX)
     }
 
-    fn fixed_session_datagram_memory(&self) -> u128 {
+    fn fixed_datagram_memory_for(&self, sessions: usize) -> u128 {
         let per_session = (self.max_datagram_size as u128)
             .saturating_mul(SESSION_FIXED_DATAGRAM_BUFFERS)
             .saturating_add(1);
-        (self.max_sessions as u128).saturating_mul(per_session)
+        (sessions as u128).saturating_mul(per_session)
+    }
+
+    fn fixed_session_datagram_memory(&self) -> u128 {
+        self.fixed_datagram_memory_for(self.max_sessions)
+    }
+
+    /// Budget charged by one completely full queue of maximum-sized datagrams.
+    fn full_queue_datagram_memory(&self) -> u128 {
+        (self.max_datagram_size as u128)
+            .saturating_add(QUEUED_DATAGRAM_OVERHEAD_BYTES as u128)
+            .saturating_mul(self.session_queue_depth as u128)
     }
 }
 
@@ -686,13 +718,12 @@ fn validate_service(service: &ServiceConfig) -> Result<(), ConfigError> {
     }
 
     // Every session's fixed receive buffers plus one completely full queue of
-    // maximum-sized datagrams must fit. Queues beyond that share the remaining
-    // budget, which the relay enforces using actual queued datagram sizes.
-    let one_full_queue =
-        (service.max_datagram_size as u128).saturating_mul(service.session_queue_depth as u128);
+    // maximum-sized datagrams, each charged with the per-datagram overhead,
+    // must fit. Queues beyond that share the remaining budget, which the relay
+    // enforces using the same per-datagram charge.
     let worst_case_datagram_memory = service
         .fixed_session_datagram_memory()
-        .saturating_add(one_full_queue);
+        .saturating_add(service.full_queue_datagram_memory());
     if worst_case_datagram_memory > MAX_SESSION_DATAGRAM_MEMORY_BYTES {
         return Err(invalid_value(
             "service.max_sessions",

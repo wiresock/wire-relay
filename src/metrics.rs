@@ -90,6 +90,17 @@ pub struct DropSnapshot {
     pub send_error: u64,
 }
 
+impl DropSnapshot {
+    /// Whether this breakdown can describe `total` drops.
+    ///
+    /// Daemons without per-reason counters report a non-zero total with an
+    /// all-zero breakdown; that is "unknown", not "zero for every reason".
+    #[must_use]
+    pub fn is_reported_for(&self, total: u64) -> bool {
+        total == 0 || *self != Self::default()
+    }
+}
+
 /// A serializable snapshot used by the control API.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MetricsSnapshot {
