@@ -113,8 +113,12 @@ count), so the drop path neither locks nor searches to decide whether to log.
 
 Closing a session (idle expiry, closed idle-timeout channel, explicit close,
 listener removal or backend change, shutdown) first unpublishes its routing
-entry and releases its admission lease, then sets an atomic flag the listener
-checks without locking and cancels the token the task waits on. The task
+entry and releases its admission lease, then sets the closed flag in the
+handle's atomic state word, which the listener checks without locking, and
+cancels the token the task waits on. The lease is released under the routing
+entry's shard lock, so a listener that no longer finds the route also finds
+the admission slot free. The lease is stored in the handle before the handle
+is published, so a close that races the launch still releases it. The task
 closes its own session the moment it decides to stop, before draining. A
 stopping listener sets a shared flag before cancelling its token, and every
 session of that listener checks it on the hot path too, so no datagram is sent
@@ -123,9 +127,15 @@ or queued after `stop` while the session tasks are still waking up.
 The next datagram from the same client therefore finds no route and is
 admitted as a new session even with a per-IP limit of one (for example a
 WireGuard handshake retry after a backend change), while the old task still
-drains. The draining session keeps its receive-buffer reservation, gauges, and
-ID entry until its task ends, so the queue budget stays conservative and can
-briefly count both incarnations. Route removal is guarded by session ID, so a
+drains. The draining session keeps its upstream socket, receive-buffer
+reservation, gauges, and ID entry until its task ends, so the queue budget
+stays conservative and can briefly count both incarnations. Admission limits
+bound routable sessions; to keep the overlap short, every wait in the session
+task (including the client-direction send and the receive-error back-off) is
+raced against the cancellation token, so a closed task exits at its next
+wake-up. Closing is reported once: a session that is already closed but still
+listed is not counted again by a later listener close or reload. Route removal
+is guarded by session ID, so a
 stale task never removes a newer session's route, and the lease is released
 once. A listener that fetched the old handle just before the close drops the
 datagram as `session_closed` instead of sending on the exiting session's
@@ -135,7 +145,12 @@ releases admission, and counts its unsent first datagram. The task then
 closes its queue and counts every datagram still in it as `session_closed`;
 the unsent first datagram is counted once by the cleanup guard, and
 datagrams already sent are not counted. On idle timer expiry the task re-reads the
-current timeout before deciding to close.
+current timeout before deciding to close, and decides against the listener's
+direct-send path: the listener registers each forward in the handle's state
+word before it checks the flags, and the task sets an expiring flag before it
+re-reads activity. Either the listener sees the flag and drops the datagram as
+`session_closed`, or the task sees the forward (or the activity it recorded)
+and keeps the session.
 
 For a new session, the listener reserves global/per-IP/rate capacity before
 creating a socket. The listener's receive loop serializes creation for that

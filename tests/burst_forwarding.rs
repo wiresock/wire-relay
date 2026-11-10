@@ -120,9 +120,9 @@ async fn exercise(runtime: &Runtime, backend: UdpSocket, listener: SocketAddr) -
     let upload = run_bursts(Arc::clone(&client), Arc::clone(&backend), &payload).await?;
     let stats = runtime.status().stats;
     ensure!(
-        stats.datagrams_dropped.queue_full == 0,
+        stats.drops().queue_full == 0,
         "relay dropped {} upload datagrams because a session queue was full",
-        stats.datagrams_dropped.queue_full
+        stats.drops().queue_full
     );
     let download = run_bursts(Arc::clone(&backend), Arc::clone(&client), &payload).await?;
 
@@ -140,7 +140,7 @@ async fn exercise(runtime: &Runtime, backend: UdpSocket, listener: SocketAddr) -
     // Only relay queueing drops fail the test; a transient host send error
     // is not what this test guards against.
     ensure!(
-        stats.datagrams_dropped.queue_full == 0 && stats.datagrams_dropped.budget_exhausted == 0,
+        stats.drops().queue_full == 0 && stats.drops().budget_exhausted == 0,
         "relay dropped queued datagrams during bursts: {:?}",
         stats.datagrams_dropped
     );

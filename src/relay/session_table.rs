@@ -139,19 +139,29 @@ impl SessionTable {
     }
 
     /// Unpublishes this exact incarnation from routing and closes it.
+    /// Returns whether this call closed it, so an already closed session that
+    /// is still listed is not counted twice.
     ///
-    /// The routing entry goes first and the admission lease is released, so
-    /// the next datagram from the same client can start a new session while
-    /// this one drains its queue; the ID entry, gauges, and queue-budget
-    /// reservation stay until the session task's cleanup calls
-    /// [`Self::remove`].
-    pub fn close(&self, session: &SessionHandle) {
-        self.unpublish(&session.session().key(), session.session().id);
-        // With the route gone, the client may be admitted again right away
-        // (even with a per-IP limit of one); the draining session keeps its
-        // receive buffers counted in the queue budget until its task ends.
+    /// The route and the admission lease go together, so the next datagram
+    /// from the same client can start a new session while this one stops;
+    /// the ID entry, gauges, and queue-budget reservation stay until the
+    /// session task's cleanup calls [`Self::remove`].
+    pub fn close(&self, session: &SessionHandle) -> bool {
+        let id = session.session().id;
+        // The lease is released under the route's shard lock: a listener
+        // that no longer finds the route also finds the admission slot free
+        // (even with a per-IP limit of one), never a gap between the two.
+        self.by_key
+            .remove_if(&session.session().key(), |_, current| {
+                let published = current.session().id == id;
+                if published {
+                    session.release_admission();
+                }
+                published
+            });
+        // Covers a session whose route was already gone or never published.
         session.release_admission();
-        session.close();
+        session.close()
     }
 
     /// Removes the routing entry only if it still maps to `id`, so a stale
@@ -192,7 +202,9 @@ impl SessionTable {
             .collect()
     }
 
-    /// Closes every session owned by a listener and returns the number found.
+    /// Closes every session owned by a listener and returns how many this
+    /// call closed; sessions that were already closed and are only still
+    /// listed while their tasks stop are not counted again.
     pub fn close_listener(&self, listener_id: ListenerId) -> usize {
         let sessions: Vec<_> = self
             .by_id
@@ -200,23 +212,23 @@ impl SessionTable {
             .filter(|entry| entry.session().listener_id == listener_id)
             .map(|entry| Arc::clone(entry.value()))
             .collect();
-        for session in &sessions {
-            self.close(session);
-        }
-        sessions.len()
+        sessions
+            .iter()
+            .filter(|session| self.close(session))
+            .count()
     }
 
-    /// Closes every active session.
+    /// Closes every active session and returns how many this call closed.
     pub fn close_all(&self) -> usize {
         let sessions: Vec<_> = self
             .by_id
             .iter()
             .map(|entry| Arc::clone(entry.value()))
             .collect();
-        for session in &sessions {
-            self.close(session);
-        }
-        sessions.len()
+        sessions
+            .iter()
+            .filter(|session| self.close(session))
+            .count()
     }
 }
 
@@ -343,6 +355,24 @@ mod tests {
         assert_eq!(table.close_listener(ListenerId::new(7)), 1);
         assert!(table.get_by_key(&key).is_none());
         assert!(table.insert(test_session_handle()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sessions_already_closed_are_not_counted_again() {
+        let table = SessionTable::new();
+        let old = test_session_handle();
+        assert!(table.insert(Arc::clone(&old)).is_ok());
+        assert!(table.close(&old));
+        assert!(!table.close(&old));
+
+        // The closed session is still listed until its task removes it, next
+        // to the replacement for the same client.
+        let replacement = test_session_handle();
+        assert!(table.insert(Arc::clone(&replacement)).is_ok());
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.close_listener(ListenerId::new(7)), 1);
+        assert_eq!(table.close_listener(ListenerId::new(7)), 0);
+        assert_eq!(table.close_all(), 0);
     }
 
     fn test_session_handle() -> Arc<SessionHandle> {

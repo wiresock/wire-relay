@@ -97,15 +97,6 @@ pub struct DropSnapshot {
 }
 
 impl DropSnapshot {
-    /// Whether this breakdown can describe `total` drops.
-    ///
-    /// Daemons without per-reason counters report a non-zero total with an
-    /// all-zero breakdown; that is "unknown", not "zero for every reason".
-    #[must_use]
-    pub fn is_reported_for(&self, total: u64) -> bool {
-        total == 0 || *self != Self::default()
-    }
-
     /// Sum of all reasons; the reported total for in-process counters.
     #[must_use]
     pub const fn total(&self) -> u64 {
@@ -134,9 +125,18 @@ pub struct MetricsSnapshot {
     pub rate_limited_total: u64,
     pub dns_errors_total: u64,
     pub socket_errors_total: u64,
-    /// Breakdown of `datagrams_dropped_total` by reason.
+    /// Breakdown of `datagrams_dropped_total` by reason; `None` when the
+    /// daemon predates the breakdown, which is "unknown", not zero.
     #[serde(default)]
-    pub datagrams_dropped: DropSnapshot,
+    pub datagrams_dropped: Option<DropSnapshot>,
+}
+
+impl MetricsSnapshot {
+    /// The per-reason breakdown, all zero when the daemon did not report one.
+    #[must_use]
+    pub fn drops(&self) -> DropSnapshot {
+        self.datagrams_dropped.clone().unwrap_or_default()
+    }
 }
 
 /// Internal application metrics.
@@ -222,7 +222,7 @@ impl Metrics {
             rate_limited_total: self.rate_limited_total.load(Ordering::Relaxed),
             dns_errors_total: self.dns_errors_total.load(Ordering::Relaxed),
             socket_errors_total: self.socket_errors_total.load(Ordering::Relaxed),
-            datagrams_dropped,
+            datagrams_dropped: Some(datagrams_dropped),
         }
     }
 
@@ -230,6 +230,7 @@ impl Metrics {
     #[must_use]
     pub fn render_prometheus(&self) -> String {
         let values = self.snapshot();
+        let drops = values.drops();
         let metrics = [
             ("wire_relay_active_sessions", values.active_sessions),
             (
@@ -270,27 +271,27 @@ impl Metrics {
             ),
             (
                 "wire_relay_datagrams_dropped_oversize_total",
-                values.datagrams_dropped.oversize,
+                drops.oversize,
             ),
             (
                 "wire_relay_datagrams_dropped_queue_full_total",
-                values.datagrams_dropped.queue_full,
+                drops.queue_full,
             ),
             (
                 "wire_relay_datagrams_dropped_budget_exhausted_total",
-                values.datagrams_dropped.budget_exhausted,
+                drops.budget_exhausted,
             ),
             (
                 "wire_relay_datagrams_dropped_session_closed_total",
-                values.datagrams_dropped.session_closed,
+                drops.session_closed,
             ),
             (
                 "wire_relay_datagrams_dropped_rejected_total",
-                values.datagrams_dropped.rejected,
+                drops.rejected,
             ),
             (
                 "wire_relay_datagrams_dropped_send_error_total",
-                values.datagrams_dropped.send_error,
+                drops.send_error,
             ),
             ("wire_relay_rate_limited_total", values.rate_limited_total),
             ("wire_relay_dns_errors_total", values.dns_errors_total),
@@ -498,14 +499,14 @@ mod tests {
         assert_eq!(snapshot.datagrams_dropped_total, 5);
         assert_eq!(
             snapshot.datagrams_dropped,
-            DropSnapshot {
+            Some(DropSnapshot {
                 oversize: 1,
                 queue_full: 2,
                 budget_exhausted: 1,
                 session_closed: 0,
                 rejected: 0,
                 send_error: 1,
-            }
+            })
         );
         let output = metrics.render_prometheus();
         assert!(output.contains("wire_relay_datagrams_dropped_total 5\n"));
@@ -535,9 +536,9 @@ mod tests {
             let process = metrics.snapshot();
             let listener = listener.snapshot();
             let expected = u64::try_from(index + 1).unwrap();
-            assert_eq!(process.datagrams_dropped.total(), expected);
+            assert_eq!(process.drops().total(), expected);
             assert_eq!(process.datagrams_dropped_total, expected);
-            assert_eq!(listener.datagrams_dropped.total(), expected);
+            assert_eq!(listener.drops().total(), expected);
             assert_eq!(listener.dropped, expected);
         }
         assert!(
@@ -549,24 +550,23 @@ mod tests {
 
     #[test]
     fn snapshots_without_a_drop_breakdown_still_deserialize() {
-        let mut value = serde_json::to_value(MetricsSnapshot::default()).unwrap();
-        value.as_object_mut().unwrap().remove("datagrams_dropped");
-        let snapshot: MetricsSnapshot = serde_json::from_value(value).unwrap();
-        assert_eq!(snapshot.datagrams_dropped, DropSnapshot::default());
-
         // An older daemon reports only the stored total; decoding keeps it
-        // and the breakdown is marked unknown rather than zero.
-        let mut value = serde_json::to_value(MetricsSnapshot::default()).unwrap();
+        // and the breakdown is absent rather than zero.
+        let mut value = serde_json::to_value(Metrics::default().snapshot()).unwrap();
         let object = value.as_object_mut().unwrap();
         object.remove("datagrams_dropped");
         object.insert("datagrams_dropped_total".to_owned(), 5.into());
         let snapshot: MetricsSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(snapshot.datagrams_dropped_total, 5);
-        assert!(
-            !snapshot
-                .datagrams_dropped
-                .is_reported_for(snapshot.datagrams_dropped_total)
-        );
+        assert_eq!(snapshot.datagrams_dropped, None);
+        assert_eq!(snapshot.drops(), DropSnapshot::default());
+
+        // A current daemon always reports the breakdown, as a plain object
+        // that older clients ignore, even when nothing was dropped.
+        let value = serde_json::to_value(Metrics::default().snapshot()).unwrap();
+        assert!(value["datagrams_dropped"].is_object());
+        let snapshot: MetricsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snapshot.datagrams_dropped, Some(DropSnapshot::default()));
 
         // A daemon from before the budget reason omits that field; it
         // defaults to zero while the other reasons still decode.
@@ -579,13 +579,6 @@ mod tests {
         let drops: DropSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(drops.budget_exhausted, 0);
         assert_eq!(drops.queue_full, 3);
-        assert!(drops.is_reported_for(3));
-        // Only the new reason is non-zero: the breakdown is still known.
-        let drops = DropSnapshot {
-            budget_exhausted: 2,
-            ..DropSnapshot::default()
-        };
-        assert!(drops.is_reported_for(2));
     }
 
     #[tokio::test]

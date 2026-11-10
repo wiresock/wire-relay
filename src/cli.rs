@@ -453,16 +453,16 @@ fn render_listeners(listeners: &[ListenerSnapshot]) -> String {
             .resolved_backend
             .map_or_else(|| "-".to_owned(), |address| address.to_string());
         let counters = &listener.counters;
-        let drops = &counters.datagrams_dropped;
-        let (queue_full, budget) = if drops.is_reported_for(counters.dropped) {
-            (
-                drops.queue_full.to_string(),
-                drops.budget_exhausted.to_string(),
-            )
-        } else {
-            // An older daemon reports drops without a per-reason breakdown.
-            ("-".to_owned(), "-".to_owned())
-        };
+        // An older daemon reports drops without a per-reason breakdown.
+        let (queue_full, budget) = counters.datagrams_dropped.as_ref().map_or_else(
+            || ("-".to_owned(), "-".to_owned()),
+            |drops| {
+                (
+                    drops.queue_full.to_string(),
+                    drops.budget_exhausted.to_string(),
+                )
+            },
+        );
         let _ = writeln!(
             output,
             "{:<20} {:<24} {:<24} {:<24} {:<12} {:<9} {:<9} {:<10} {}",
@@ -535,9 +535,8 @@ fn render_stats(stats: &MetricsSnapshot) -> String {
         stats.bytes_to_client_total,
         stats.datagrams_dropped_total,
     );
-    let drops = &stats.datagrams_dropped;
     // An older daemon reports drops without a per-reason breakdown.
-    if drops.is_reported_for(stats.datagrams_dropped_total) {
+    if let Some(drops) = &stats.datagrams_dropped {
         let _ = write!(
             output,
             "  oversize: {}\n  queue full: {}\n  queue budget exhausted: {}\n  session closed: {}\n  rejected: {}\n  send error: {}\n",
@@ -703,61 +702,69 @@ mod tests {
 
     #[test]
     fn human_listener_queue_full_column_distinguishes_unknown_from_zero() {
-        let none = listener_row(ListenerCounterSnapshot::default());
+        let none = listener_row(ListenerCounterSnapshot {
+            datagrams_dropped: Some(crate::metrics::DropSnapshot::default()),
+            ..ListenerCounterSnapshot::default()
+        });
         assert!(none.ends_with(" 0          0"), "{none}");
 
         let counted = listener_row(ListenerCounterSnapshot {
             dropped: 3,
-            datagrams_dropped: crate::metrics::DropSnapshot {
+            datagrams_dropped: Some(crate::metrics::DropSnapshot {
                 queue_full: 2,
                 oversize: 1,
                 ..crate::metrics::DropSnapshot::default()
-            },
+            }),
             ..ListenerCounterSnapshot::default()
         });
         assert!(counted.ends_with(" 2          0"), "{counted}");
 
         let budget = listener_row(ListenerCounterSnapshot {
             dropped: 4,
-            datagrams_dropped: crate::metrics::DropSnapshot {
+            datagrams_dropped: Some(crate::metrics::DropSnapshot {
                 queue_full: 1,
                 budget_exhausted: 3,
                 ..crate::metrics::DropSnapshot::default()
-            },
+            }),
             ..ListenerCounterSnapshot::default()
         });
         assert!(budget.ends_with(" 4         1          3"), "{budget}");
 
         let genuine_zero = listener_row(ListenerCounterSnapshot {
             dropped: 1,
-            datagrams_dropped: crate::metrics::DropSnapshot {
+            datagrams_dropped: Some(crate::metrics::DropSnapshot {
                 oversize: 1,
                 ..crate::metrics::DropSnapshot::default()
-            },
+            }),
             ..ListenerCounterSnapshot::default()
         });
         assert!(genuine_zero.ends_with(" 0          0"), "{genuine_zero}");
 
-        // An older daemon: drops without any per-reason counters.
+        // An older daemon: no per-reason counters, whatever the total.
         let older = listener_row(ListenerCounterSnapshot {
             dropped: 5,
             ..ListenerCounterSnapshot::default()
         });
         assert!(older.ends_with(" 5         -          -"), "{older}");
+        let older_idle = listener_row(ListenerCounterSnapshot::default());
+        assert!(
+            older_idle.ends_with(" 0         -          -"),
+            "{older_idle}"
+        );
     }
 
     #[test]
     fn human_stats_output_breaks_down_drop_reasons() {
         let stats = MetricsSnapshot {
             datagrams_dropped_total: 10,
-            datagrams_dropped: crate::metrics::DropSnapshot {
+            datagrams_dropped: Some(crate::metrics::DropSnapshot {
                 oversize: 1,
                 queue_full: 2,
                 budget_exhausted: 4,
                 session_closed: 0,
                 rejected: 3,
                 send_error: 0,
-            },
+            }),
             ..MetricsSnapshot::default()
         };
         let rendered = render_stats(&stats);
@@ -767,7 +774,10 @@ mod tests {
         assert!(rendered.contains("  rejected: 3\n"));
         assert!(rendered.contains("  send error: 0\nrate limited: 0\n"));
 
-        let none = render_stats(&MetricsSnapshot::default());
+        let none = render_stats(&MetricsSnapshot {
+            datagrams_dropped: Some(crate::metrics::DropSnapshot::default()),
+            ..MetricsSnapshot::default()
+        });
         assert!(none.contains("datagrams dropped: 0\n  oversize: 0\n"));
         assert!(none.contains("  queue full: 0\n"));
     }

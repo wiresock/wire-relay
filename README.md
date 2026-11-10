@@ -288,10 +288,19 @@ sending.
 Closing a session (backend change, listener removal, `close-session`, idle
 expiry) releases its route and admission slot at once, so the client's next
 datagram opens a new session even with `max_sessions_per_ip = 1` or a full
-global limit. The old session keeps draining its queue and still counts as
-live in the queue budget, the session gauges, and `wire-relay sessions` until
-its task ends, so after a mass close and reopen the budget can briefly
-reserve receive buffers for both the old and the new sessions.
+global limit. `max_sessions` and `max_sessions_per_ip` therefore bound the
+sessions that can carry traffic. A closed session does no further forwarding:
+its task stops at its next wake-up, without waiting for a pending send, and
+discards what is still queued as `session_closed`. Until then it still holds
+its upstream socket and counts as live in the queue budget, the session
+gauges, and `wire-relay sessions`, so right after a mass close and reopen
+(for example a backend change) the old and the new sessions briefly coexist.
+Only an operator action or idle expiry closes a session; a client cannot
+trigger this overlap.
+
+Idle expiry is decided against the listener's forwarding path: a session is
+not expired under a datagram it has just accepted, and once it expires no
+further datagram is sent on its upstream socket.
 
 The shared remainder can be small. With a high `max_sessions` and a large
 `max_datagram_size`, the fixed receive buffers take most of the 4 GiB, and a

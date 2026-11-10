@@ -6,7 +6,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -85,7 +85,7 @@ impl ListenerCounters {
             bytes_to_client: self.bytes_to_client.load(Ordering::Relaxed),
             // Derived from the breakdown so the two can never disagree.
             dropped: datagrams_dropped.total(),
-            datagrams_dropped,
+            datagrams_dropped: Some(datagrams_dropped),
         }
     }
 }
@@ -99,9 +99,18 @@ pub struct ListenerCounterSnapshot {
     pub bytes_to_backend: u64,
     pub bytes_to_client: u64,
     pub dropped: u64,
-    /// Breakdown of `dropped` by reason.
+    /// Breakdown of `dropped` by reason; `None` when the daemon predates the
+    /// breakdown, which is "unknown", not zero.
     #[serde(default)]
-    pub datagrams_dropped: DropSnapshot,
+    pub datagrams_dropped: Option<DropSnapshot>,
+}
+
+impl ListenerCounterSnapshot {
+    /// The per-reason breakdown, all zero when the daemon did not report one.
+    #[must_use]
+    pub fn drops(&self) -> DropSnapshot {
+        self.datagrams_dropped.clone().unwrap_or_default()
+    }
 }
 
 /// Records one discarded datagram in the process and listener counters.
@@ -130,9 +139,26 @@ pub struct QueueBudget {
     memory_bytes: u128,
     /// `max_sessions` in the high 32 bits and `max_datagram_size` in the low
     /// 32 bits, published together by one store.
-    shape: AtomicU64,
-    live_sessions: AtomicUsize,
-    used: AtomicUsize,
+    ///
+    /// Read-mostly: every listener loads it per received datagram, so it is
+    /// kept off the cache lines of the counters below, which are written on
+    /// session churn and on every queued datagram.
+    shape: CacheAligned<AtomicU64>,
+    live_sessions: CacheAligned<AtomicUsize>,
+    used: CacheAligned<AtomicUsize>,
+}
+
+/// Keeps a value on cache lines of its own to avoid false sharing.
+#[derive(Debug)]
+#[repr(align(128))]
+struct CacheAligned<T>(T);
+
+impl<T> std::ops::Deref for CacheAligned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
 }
 
 impl QueueBudget {
@@ -148,9 +174,9 @@ impl QueueBudget {
     fn with_memory(memory_bytes: u128, max_sessions: usize, max_datagram_size: usize) -> Arc<Self> {
         Arc::new(Self {
             memory_bytes,
-            shape: AtomicU64::new(Self::shape(max_sessions, max_datagram_size)),
-            live_sessions: AtomicUsize::new(0),
-            used: AtomicUsize::new(0),
+            shape: CacheAligned(AtomicU64::new(Self::shape(max_sessions, max_datagram_size))),
+            live_sessions: CacheAligned(AtomicUsize::new(0)),
+            used: CacheAligned(AtomicUsize::new(0)),
         })
     }
 
@@ -467,6 +493,22 @@ pub struct SessionSnapshot {
     pub bytes_to_client: u64,
 }
 
+/// The session is closed; set together with the cancellation token.
+const STATE_CLOSED: usize = 1;
+/// The session task is deciding whether to expire the session as idle.
+const STATE_EXPIRING: usize = 1 << 1;
+/// One listener forward in progress.
+const STATE_FORWARDING: usize = 1 << 2;
+
+/// Marks one listener forward in progress until dropped.
+struct ForwardGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ForwardGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(STATE_FORWARDING, Ordering::SeqCst);
+    }
+}
+
 /// Forwarding state stored in the session table.
 ///
 /// The listener sends a client datagram directly on the session's connected
@@ -483,15 +525,20 @@ pub struct SessionHandle {
     /// Client datagrams queued or being sent by the session task.
     pending: AtomicUsize,
     queue_budget: Arc<QueueBudget>,
-    /// Set with the cancellation token; checked on the listener hot path
-    /// because `CancellationToken::is_cancelled` takes a lock.
-    closed: AtomicBool,
+    /// [`STATE_CLOSED`] and [`STATE_EXPIRING`] flags plus a count of listener
+    /// forwards in progress (in units of [`STATE_FORWARDING`]).
+    ///
+    /// The listener hot path reads the flags from here because
+    /// `CancellationToken::is_cancelled` takes a lock. The in-progress count
+    /// lets idle expiry tell that a datagram is being forwarded right now, so
+    /// a session is never expired under a datagram it has just accepted.
+    state: AtomicUsize,
     /// Set by the owning listener before it cancels the parent token, so the
     /// hot path sees a stopping listener without locking.
     parent_stopping: Arc<AtomicBool>,
     /// Released as soon as the route is unpublished, so the same client can
     /// be admitted again while this session drains.
-    admission: std::sync::Mutex<Option<AdmissionLease>>,
+    admission: Mutex<Option<AdmissionLease>>,
     cancel: CancellationToken,
 }
 
@@ -509,9 +556,9 @@ impl SessionHandle {
             client_datagrams,
             pending: AtomicUsize::new(0),
             queue_budget: QueueBudget::with_limit(usize::MAX),
-            closed: AtomicBool::new(false),
+            state: AtomicUsize::new(0),
             parent_stopping: Arc::new(AtomicBool::new(false)),
-            admission: std::sync::Mutex::new(None),
+            admission: Mutex::new(None),
             cancel: CancellationToken::new(),
         })
     }
@@ -544,10 +591,10 @@ impl SessionHandle {
         // release its admission slot and receive buffers. A send the backend
         // side refused still is, so a backend outage does not expire sessions
         // whose clients keep sending.
-        if self.is_closed() {
+        let Some(_forwarding) = self.begin_forward() else {
             record_drop(metrics, listener_counters, DropReason::SessionClosed);
             return;
-        }
+        };
 
         if self.pending.load(Ordering::Acquire) == 0 {
             match self.upstream.try_send(datagram) {
@@ -633,23 +680,58 @@ impl SessionHandle {
         self.pending.fetch_sub(1, Ordering::AcqRel);
     }
 
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.parent_stopping.load(Ordering::Acquire)
+    /// Registers a forward in progress, unless the session is closed, is
+    /// being expired, or its listener is stopping.
+    ///
+    /// The registration and the idle check in [`Self::try_expire`] are both
+    /// sequentially consistent, so either this sees the expiry flag, or the
+    /// expiry sees this forward (or the activity it already recorded).
+    fn begin_forward(&self) -> Option<ForwardGuard<'_>> {
+        let previous = self.state.fetch_add(STATE_FORWARDING, Ordering::SeqCst);
+        let guard = ForwardGuard(&self.state);
+        if previous & (STATE_CLOSED | STATE_EXPIRING) != 0
+            || self.parent_stopping.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some(guard)
     }
 
-    /// Stops the session; idempotent.
-    pub fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+    /// Decides idle expiry against concurrent listener forwards.
+    ///
+    /// Returns `true` when the session must stop: it is still idle with no
+    /// forward in progress (new forwards are refused from here on), or it was
+    /// closed meanwhile. Returns `false`, leaving the session open, when a
+    /// datagram was accepted since the timer fired or is being forwarded now.
+    fn try_expire(&self, idle_timeout: Duration) -> bool {
+        let previous = self.state.fetch_or(STATE_EXPIRING, Ordering::SeqCst);
+        if previous & STATE_CLOSED != 0 {
+            return true;
+        }
+        if previous >= STATE_FORWARDING
+            || Instant::now() < self.session.last_activity() + idle_timeout
+        {
+            self.state.fetch_and(!STATE_EXPIRING, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_CLOSED != 0
+    }
+
+    /// Stops the session; idempotent. Returns whether this call closed it.
+    pub fn close(&self) -> bool {
+        let previous = self.state.fetch_or(STATE_CLOSED, Ordering::SeqCst);
         self.cancel.cancel();
+        previous & STATE_CLOSED == 0
     }
 
     /// Releases the admission lease once; later calls do nothing.
     pub(super) fn release_admission(&self) {
-        let lease = self
-            .admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        let lease = lock_unpoisoned(&self.admission).take();
         drop(lease);
     }
 }
@@ -710,19 +792,18 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
         // datagrams must queue behind it until it has been sent.
         pending: AtomicUsize::new(1),
         queue_budget,
-        closed: AtomicBool::new(false),
+        state: AtomicUsize::new(0),
         parent_stopping,
-        admission: std::sync::Mutex::new(None),
+        // Stored before the handle is published, so a close that races the
+        // insert always finds the lease to release.
+        admission: Mutex::new(Some(admission)),
         cancel: cancel.clone(),
     });
 
     if table.insert(Arc::clone(&handle)).is_err() {
-        return Err(admission);
+        let admission = lock_unpoisoned(&handle.admission).take();
+        return Err(admission.expect("an unpublished session keeps its admission lease"));
     }
-    *handle
-        .admission
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(admission);
     let live = handle.queue_budget.session_started();
 
     metrics.session_created();
@@ -734,7 +815,6 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
     let cleanup = SessionCleanup {
         handle: Arc::clone(&handle),
         table,
-        session: Arc::clone(&handle.session),
         metrics: Arc::clone(&metrics),
         listener_counters: Arc::clone(&listener_counters),
         reason: SessionCloseReason::Closed,
@@ -910,10 +990,27 @@ async fn forward_until_stopped(
                         // client send succeeds.
                         handle.session.touch_backend();
                         let payload = &backend_buffer[..size];
-                        match task.listener_socket.send_to(
-                            payload,
-                            handle.session.client_addr,
-                        ).await {
+                        // A closed session must not outlive a slow client-side
+                        // send: its admission slot is already free, so its
+                        // socket and buffers have to go promptly too.
+                        let sent = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => None,
+                            sent = task.listener_socket.send_to(
+                                payload,
+                                handle.session.client_addr,
+                            ) => Some(sent),
+                        };
+                        let Some(sent) = sent else {
+                            // Received from the backend but never delivered.
+                            record_drop(
+                                &task.metrics,
+                                &task.listener_counters,
+                                DropReason::SessionClosed,
+                            );
+                            break 'session;
+                        };
+                        match sent {
                             Ok(sent) if sent == size => {
                                 handle.session.record_to_client(size);
                                 task.listener_counters.to_client(size);
@@ -964,7 +1061,11 @@ async fn forward_until_stopped(
                                 "upstream receive failed"
                             );
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => break 'session,
+                            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                        }
                     }
                 }
             }
@@ -974,12 +1075,20 @@ async fn forward_until_stopped(
                 idle_timeout = *task.idle_timeout.borrow_and_update();
                 let deadline = handle.session.last_activity() + idle_timeout;
                 if Instant::now() >= deadline {
-                    cleanup.reason = SessionCloseReason::Idle;
-                    break;
+                    // The listener forwards on this session's socket from
+                    // its own task, so the decision is made against it: once
+                    // this succeeds no further datagram is accepted.
+                    if handle.try_expire(idle_timeout) {
+                        cleanup.reason = SessionCloseReason::Idle;
+                        break;
+                    }
+                    // A datagram is being forwarded right now; let it record
+                    // its activity before the deadline is computed again.
+                    tokio::task::yield_now().await;
                 }
-                idle_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::from_std(deadline));
+                idle_sleep.as_mut().reset(tokio::time::Instant::from_std(
+                    handle.session.last_activity() + idle_timeout,
+                ));
             }
         }
     }
@@ -1048,7 +1157,6 @@ fn record_backend_send(
 struct SessionCleanup {
     handle: Arc<SessionHandle>,
     table: Arc<SessionTable>,
-    session: Arc<Session>,
     metrics: Arc<Metrics>,
     listener_counters: Arc<ListenerCounters>,
     reason: SessionCloseReason,
@@ -1068,11 +1176,18 @@ impl Drop for SessionCleanup {
                 DropReason::SessionClosed,
             );
         }
-        self.table.remove(&self.session.key(), self.session.id);
+        let session = self.handle.session();
+        self.table.remove(&session.key(), session.id);
         self.listener_counters.session_ended();
         self.metrics
             .session_ended(self.reason == SessionCloseReason::Idle);
     }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn saturating_u64(value: usize) -> u64 {
@@ -1126,9 +1241,9 @@ mod tests {
             client_datagrams,
             pending: AtomicUsize::new(pending),
             queue_budget: Arc::clone(&budget),
-            closed: AtomicBool::new(false),
+            state: AtomicUsize::new(0),
             parent_stopping: Arc::new(AtomicBool::new(false)),
-            admission: std::sync::Mutex::new(None),
+            admission: Mutex::new(None),
             cancel: CancellationToken::new(),
         });
         Harness {
@@ -1162,7 +1277,7 @@ mod tests {
         let pending_before = handle.pending.load(Ordering::Acquire);
         handle.forward_from_client(datagram, metrics, counters, log_limiter);
         let after = metrics.snapshot();
-        let drops = (&before.datagrams_dropped, &after.datagrams_dropped);
+        let drops = (&before.drops(), &after.drops());
         if after.packets_to_backend_total > before.packets_to_backend_total {
             ForwardOutcome::Sent
         } else if drops.1.queue_full > drops.0.queue_full {
@@ -1242,11 +1357,11 @@ mod tests {
         );
         let stats = harness.metrics.snapshot();
         assert_eq!(stats.datagrams_dropped_total, 1);
-        assert_eq!(stats.datagrams_dropped.queue_full, 1);
-        assert_eq!(stats.datagrams_dropped.oversize, 0);
+        assert_eq!(stats.drops().queue_full, 1);
+        assert_eq!(stats.drops().oversize, 0);
         let listener = harness.counters.snapshot();
         assert_eq!(listener.dropped, 1);
-        assert_eq!(listener.datagrams_dropped.queue_full, 1);
+        assert_eq!(listener.drops().queue_full, 1);
         // The failed enqueue must not leave a phantom pending datagram.
         assert_eq!(harness.handle.pending.load(Ordering::Acquire), 3);
     }
@@ -1262,9 +1377,9 @@ mod tests {
             ForwardOutcome::Dropped(DropReason::BudgetExhausted)
         );
         // Budget exhaustion is reported separately from a full session queue.
-        let drops = harness.metrics.snapshot().datagrams_dropped;
+        let drops = harness.metrics.snapshot().drops();
         assert_eq!((drops.budget_exhausted, drops.queue_full), (1, 0));
-        let drops = harness.counters.snapshot().datagrams_dropped;
+        let drops = harness.counters.snapshot().drops();
         assert_eq!((drops.budget_exhausted, drops.queue_full), (1, 0));
         assert_eq!(harness.forward(&[3; 40]), ForwardOutcome::Queued);
         assert_eq!(harness.budget.used(), charge(60) + charge(40));
@@ -1332,10 +1447,7 @@ mod tests {
             harness.forward(b"late"),
             ForwardOutcome::Dropped(DropReason::SessionClosed)
         );
-        assert_eq!(
-            harness.metrics.snapshot().datagrams_dropped.session_closed,
-            1
-        );
+        assert_eq!(harness.metrics.snapshot().drops().session_closed, 1);
     }
 
     struct Running {
@@ -1512,8 +1624,8 @@ mod tests {
         fn assert_session_closed_drops(&self, expected: u64) {
             let process = self.metrics.snapshot();
             let listener = self.counters.snapshot();
-            assert_eq!(process.datagrams_dropped.session_closed, expected);
-            assert_eq!(listener.datagrams_dropped.session_closed, expected);
+            assert_eq!(process.drops().session_closed, expected);
+            assert_eq!(listener.drops().session_closed, expected);
             assert_eq!(process.datagrams_dropped_total, expected);
             assert_eq!(listener.dropped, expected);
         }
@@ -1673,9 +1785,9 @@ mod tests {
         running.stop().await;
 
         // The unsent first datagram plus the three queued behind it.
-        assert_eq!(metrics.snapshot().datagrams_dropped.session_closed, 4);
+        assert_eq!(metrics.snapshot().drops().session_closed, 4);
         assert_eq!(metrics.snapshot().datagrams_dropped_total, 4);
-        assert_eq!(counters.snapshot().datagrams_dropped.session_closed, 4);
+        assert_eq!(counters.snapshot().drops().session_closed, 4);
         assert_eq!(counters.snapshot().dropped, 4);
         assert_eq!(metrics.snapshot().packets_to_backend_total, 0);
         assert_eq!(budget.used(), 0);
@@ -1760,7 +1872,77 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(failing.metrics.snapshot().datagrams_dropped.send_error, 1);
+        assert_eq!(failing.metrics.snapshot().drops().send_error, 1);
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_yields_to_a_forward_in_progress() {
+        let harness = harness(16, 0, usize::MAX).await;
+        let timeout = Duration::from_millis(20);
+        tokio::time::sleep(timeout * 2).await;
+
+        // A datagram is being forwarded right now: the session stays open
+        // and keeps accepting datagrams.
+        let forwarding = harness.handle.begin_forward().expect("session is open");
+        assert!(!harness.handle.try_expire(timeout));
+        drop(forwarding);
+        assert_eq!(
+            observe(
+                &harness.handle,
+                &harness.metrics,
+                &harness.counters,
+                &harness.log_limiter,
+                b"late",
+            ),
+            ForwardOutcome::Sent
+        );
+
+        // That datagram counted as activity, so the session is not idle.
+        assert!(!harness.handle.try_expire(timeout));
+        assert_eq!(harness.handle.state.load(Ordering::SeqCst), 0);
+
+        // Idle with nothing in progress: the session expires, and from then
+        // on a datagram is refused instead of being sent on the dying socket.
+        tokio::time::sleep(timeout * 2).await;
+        assert!(harness.handle.try_expire(timeout));
+        assert_eq!(
+            observe(
+                &harness.handle,
+                &harness.metrics,
+                &harness.counters,
+                &harness.log_limiter,
+                b"too late",
+            ),
+            ForwardOutcome::Dropped(DropReason::SessionClosed)
+        );
+        assert_eq!(harness.metrics.snapshot().packets_to_backend_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_reports_expiry_and_close_only_once() {
+        let harness = harness(16, 0, usize::MAX).await;
+        assert!(harness.handle.close(), "the first close closes the session");
+        assert!(!harness.handle.close(), "a repeated close is not counted");
+        assert!(harness.handle.is_closed());
+        // An already closed session stops whatever its idle state.
+        assert!(harness.handle.try_expire(Duration::from_secs(3600)));
+    }
+
+    #[tokio::test]
+    async fn a_close_racing_the_launch_still_releases_admission() {
+        let running =
+            launch_unstarted(Duration::from_secs(30), QueueBudget::with_limit(usize::MAX)).await;
+        let client_ip = running.handle.session().client_addr.ip();
+        // The lease is in the handle from the moment it is published, so a
+        // close before the task has run at all frees the slot.
+        assert!(running.admission.try_acquire(client_ip).is_err());
+        assert!(running.table.close(&running.handle));
+        let replacement = running
+            .admission
+            .try_acquire(client_ip)
+            .expect("closing a just-launched session must free its admission");
+        drop(replacement);
+        running.stop().await;
     }
 
     #[tokio::test]
@@ -1871,7 +2053,7 @@ mod tests {
         assert_eq!(running.metrics.snapshot().active_sessions, 0);
         assert_eq!(running.counters.snapshot().active_sessions, 0);
         assert_eq!(budget.live_sessions(), 0);
-        assert!(running.handle.closed.load(Ordering::Acquire));
+        assert!(running.handle.is_closed());
         // The unsent first datagram is counted exactly once, in both scopes.
         running.assert_session_closed_drops(1);
         assert_eq!(running.admission.active(), 0);

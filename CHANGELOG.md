@@ -16,8 +16,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A closed session no longer keeps its route or admission slot while it
   drains, so the next datagram from the same client opens a new session
   instead of being dropped as `session_closed` or `rejected`, even with
-  `max_sessions_per_ip = 1`. The draining session still counts toward the
-  queue budget and session gauges until its task ends. A session task dropped
+  `max_sessions_per_ip = 1`. The closed session still counts toward the
+  queue budget and session gauges until its task ends, which no longer waits
+  for a pending client-direction send. A reload or listener stop no longer
+  counts sessions that were already closed. A session task dropped
   before it first runs still removes its table entry and gauges and counts its
   unsent first datagram as `session_closed`.
 - Datagrams the relay drops itself (`queue_full`, `budget_exhausted`,
@@ -26,6 +28,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   send errors still count as client activity.
 - Sessions of a stopping listener reject datagrams immediately instead of
   sending or queueing them until their tasks wake up.
+- Idle expiry no longer races the direct upload path: a session is not
+  expired under a datagram it has just accepted, and an expired session
+  sends nothing further on its upstream socket.
 
 ### Added
 
