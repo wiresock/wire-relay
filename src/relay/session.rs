@@ -25,8 +25,8 @@ use tracing::{debug, warn};
 
 use crate::{
     config::{
-        MAX_SESSION_DATAGRAM_MEMORY_BYTES, QUEUED_DATAGRAM_OVERHEAD_BYTES,
-        SESSION_FIXED_DATAGRAM_BUFFERS, ServiceConfig,
+        MAX_SESSION_DATAGRAM_MEMORY_BYTES, QUEUED_DATAGRAM_OVERHEAD_BYTES, ServiceConfig,
+        queued_datagram_budget,
     },
     limits::{AdmissionLease, LogRateLimiter},
     metrics::{DropCounters, DropReason, DropSnapshot, Metrics},
@@ -127,9 +127,9 @@ pub fn record_drop(metrics: &Metrics, listener_counters: &ListenerCounters, reas
 /// reservations fail until enough queued datagrams drain.
 #[derive(Debug)]
 pub struct QueueBudget {
-    total: u64,
-    /// `max_sessions` in the high 32 bits and the fixed receive-buffer bytes
-    /// per session in the low 32 bits, published together by one store.
+    memory_bytes: u128,
+    /// `max_sessions` in the high 32 bits and `max_datagram_size` in the low
+    /// 32 bits, published together by one store.
     shape: AtomicU64,
     live_sessions: AtomicUsize,
     used: AtomicUsize,
@@ -138,47 +138,63 @@ pub struct QueueBudget {
 impl QueueBudget {
     #[must_use]
     pub fn new(service: &ServiceConfig) -> Arc<Self> {
+        Self::with_memory(
+            MAX_SESSION_DATAGRAM_MEMORY_BYTES,
+            service.max_sessions,
+            service.max_datagram_size,
+        )
+    }
+
+    fn with_memory(memory_bytes: u128, max_sessions: usize, max_datagram_size: usize) -> Arc<Self> {
         Arc::new(Self {
-            total: u64::try_from(MAX_SESSION_DATAGRAM_MEMORY_BYTES).unwrap_or(u64::MAX),
-            shape: AtomicU64::new(Self::shape(service)),
+            memory_bytes,
+            shape: AtomicU64::new(Self::shape(max_sessions, max_datagram_size)),
             live_sessions: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
         })
     }
 
-    /// A budget with a fixed limit and no per-session reservation.
+    /// A budget of `limit` bytes while no session is live.
     #[cfg(test)]
     pub(crate) fn with_limit(limit: usize) -> Arc<Self> {
         Self::for_test(limit, 0, 0)
     }
 
-    /// A budget of `total` bytes reserving `per_session` bytes for each of
-    /// `max(live, max_sessions)` sessions.
+    /// A budget of `memory_bytes` with the given configured shape.
     #[cfg(test)]
-    pub(crate) fn for_test(total: usize, max_sessions: u32, per_session: u32) -> Arc<Self> {
-        Arc::new(Self {
-            total: u64::try_from(total).unwrap_or(u64::MAX),
-            shape: AtomicU64::new((u64::from(max_sessions) << 32) | u64::from(per_session)),
-            live_sessions: AtomicUsize::new(0),
-            used: AtomicUsize::new(0),
-        })
+    pub(crate) fn for_test(
+        memory_bytes: usize,
+        max_sessions: usize,
+        max_datagram_size: usize,
+    ) -> Arc<Self> {
+        Self::with_memory(memory_bytes as u128, max_sessions, max_datagram_size)
     }
 
-    fn shape(service: &ServiceConfig) -> u64 {
-        let per_session = u64::try_from(service.max_datagram_size)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(u64::try_from(SESSION_FIXED_DATAGRAM_BUFFERS).unwrap_or(u64::MAX))
-            .saturating_add(1)
-            .min(u64::from(u32::MAX));
-        let max_sessions = u64::try_from(service.max_sessions)
-            .unwrap_or(u64::MAX)
-            .min(u64::from(u32::MAX));
-        (max_sessions << 32) | per_session
+    fn shape(max_sessions: usize, max_datagram_size: usize) -> u64 {
+        // Both are validated far below `u32::MAX`; clamp defensively.
+        let clamp = |value: usize| {
+            u64::try_from(value).map_or(u64::from(u32::MAX), |value| value.min(u64::from(u32::MAX)))
+        };
+        (clamp(max_sessions) << 32) | clamp(max_datagram_size)
+    }
+
+    fn unpack(shape: u64) -> (usize, usize) {
+        let to_usize = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+        (to_usize(shape >> 32), to_usize(shape & u64::from(u32::MAX)))
     }
 
     /// Applies reloaded limits to subsequent reservations.
     pub fn configure(&self, service: &ServiceConfig) {
-        self.shape.store(Self::shape(service), Ordering::Release);
+        self.shape.store(
+            Self::shape(service.max_sessions, service.max_datagram_size),
+            Ordering::Release,
+        );
+    }
+
+    /// The configured `(max_sessions, max_datagram_size)` the limit uses.
+    #[must_use]
+    pub fn configured(&self) -> (usize, usize) {
+        Self::unpack(self.shape.load(Ordering::Acquire))
     }
 
     /// Bytes currently charged to queued datagrams.
@@ -196,12 +212,25 @@ impl QueueBudget {
     /// Current limit for queued datagrams.
     #[must_use]
     pub fn limit(&self) -> usize {
-        let shape = self.shape.load(Ordering::Acquire);
-        let max_sessions = shape >> 32;
-        let per_session = shape & u64::from(u32::MAX);
-        let live = u64::try_from(self.live_sessions()).unwrap_or(u64::MAX);
-        let fixed = live.max(max_sessions).saturating_mul(per_session);
-        usize::try_from(self.total.saturating_sub(fixed)).unwrap_or(usize::MAX)
+        let (max_sessions, max_datagram_size) = self.configured();
+        queued_datagram_budget(
+            self.memory_bytes,
+            self.live_sessions().max(max_sessions),
+            max_datagram_size,
+        )
+    }
+
+    /// Whether live sessions' receive buffers currently leave nothing for
+    /// queued datagrams, so every queued datagram drops as
+    /// `budget_exhausted` until enough of those sessions end.
+    ///
+    /// Validation guarantees a positive budget for `max_sessions`, so this
+    /// only happens when a reload left more live sessions than the new
+    /// configuration allows for, or raised `max_datagram_size` under a large
+    /// live population.
+    #[must_use]
+    pub fn exhausted_by_live_sessions(&self) -> bool {
+        self.live_sessions() > 0 && self.limit() == 0
     }
 
     /// Counts one session's receive buffers until the guard is dropped.
@@ -514,15 +543,37 @@ impl SessionHandle {
             Ok(()) => {}
             Err(reason) => {
                 record_drop(metrics, listener_counters, reason);
-                if reason == DropReason::QueueFull && log_limiter.should_log("session-queue-full") {
-                    warn!(
-                        listener = %self.session.listener_name,
-                        session_id = %self.session.id,
-                        queued_bytes = self.queue_budget.used(),
-                        "session queue full; dropping client datagram"
-                    );
-                }
+                self.log_enqueue_drop(reason, datagram.len(), log_limiter);
             }
+        }
+    }
+
+    fn log_enqueue_drop(&self, reason: DropReason, size: usize, log_limiter: &LogRateLimiter) {
+        match reason {
+            DropReason::QueueFull if log_limiter.should_log("session-queue-full") => {
+                warn!(
+                    listener = %self.session.listener_name,
+                    session_id = %self.session.id,
+                    queue_depth = self.client_datagrams.max_capacity(),
+                    "session queue full (service.session_queue_depth); dropping client datagram"
+                );
+            }
+            DropReason::BudgetExhausted if log_limiter.should_log("queue-budget-exhausted") => {
+                let (max_sessions, max_datagram_size) = self.queue_budget.configured();
+                warn!(
+                    listener = %self.session.listener_name,
+                    datagram_bytes = size,
+                    budget_used_bytes = self.queue_budget.used(),
+                    budget_limit_bytes = self.queue_budget.limit(),
+                    live_sessions = self.queue_budget.live_sessions(),
+                    max_sessions,
+                    max_datagram_size,
+                    "process-wide queued-datagram memory budget exhausted; dropping client \
+                     datagram (lower service.max_sessions or service.max_datagram_size to \
+                     leave more for queues)"
+                );
+            }
+            _ => {}
         }
     }
 
@@ -539,7 +590,7 @@ impl SessionHandle {
         let reservation = self
             .queue_budget
             .try_reserve(datagram.len())
-            .ok_or(DropReason::QueueFull)?;
+            .ok_or(DropReason::BudgetExhausted)?;
         self.pending.fetch_add(1, Ordering::AcqRel);
         permit.send(QueuedDatagram {
             payload: datagram.to_vec(),
@@ -1059,6 +1110,8 @@ mod tests {
             ForwardOutcome::Sent
         } else if drops.1.queue_full > drops.0.queue_full {
             ForwardOutcome::Dropped(DropReason::QueueFull)
+        } else if drops.1.budget_exhausted > drops.0.budget_exhausted {
+            ForwardOutcome::Dropped(DropReason::BudgetExhausted)
         } else if drops.1.session_closed > drops.0.session_closed {
             ForwardOutcome::Dropped(DropReason::SessionClosed)
         } else if drops.1.send_error > drops.0.send_error {
@@ -1149,8 +1202,13 @@ mod tests {
         assert_eq!(harness.budget.used(), charge(60));
         assert_eq!(
             harness.forward(&[2; 60]),
-            ForwardOutcome::Dropped(DropReason::QueueFull)
+            ForwardOutcome::Dropped(DropReason::BudgetExhausted)
         );
+        // Budget exhaustion is reported separately from a full session queue.
+        let drops = harness.metrics.snapshot().datagrams_dropped;
+        assert_eq!((drops.budget_exhausted, drops.queue_full), (1, 0));
+        let drops = harness.counters.snapshot().datagrams_dropped;
+        assert_eq!((drops.budget_exhausted, drops.queue_full), (1, 0));
         assert_eq!(harness.forward(&[3; 40]), ForwardOutcome::Queued);
         assert_eq!(harness.budget.used(), charge(60) + charge(40));
         drop(harness.receiver.try_recv().unwrap());
@@ -1178,7 +1236,7 @@ mod tests {
         for datagram in [&[][..], &[0][..]] {
             assert_eq!(
                 harness.forward(datagram),
-                ForwardOutcome::Dropped(DropReason::QueueFull)
+                ForwardOutcome::Dropped(DropReason::BudgetExhausted)
             );
         }
         assert_eq!(harness.budget.used(), budget);
@@ -1187,23 +1245,23 @@ mod tests {
     #[tokio::test]
     async fn a_lowered_limit_applies_while_more_is_already_used() {
         let charge = QueueBudget::charge(100);
-        let per_session = u32::try_from(charge).unwrap();
-        let budget = QueueBudget::for_test(2 * charge, 0, per_session);
+        // A 50-byte maximum datagram reserves 2 * 50 + 1 bytes per session.
+        let budget = QueueBudget::for_test(2 * charge, 0, 50);
         let mut harness = harness_with_budget(16, 1, budget).await;
         assert_eq!(harness.forward(&[1; 100]), ForwardOutcome::Queued);
         assert_eq!(harness.forward(&[2; 100]), ForwardOutcome::Queued);
-        // A new live session's receive buffers lower the limit.
+        // A new live session's receive buffers lower the limit below use.
         let _live = harness.budget.session_started();
-        assert_eq!(harness.budget.limit(), charge);
+        assert_eq!(harness.budget.limit(), 2 * charge - 101);
         assert_eq!(
             harness.forward(&[3; 1]),
-            ForwardOutcome::Dropped(DropReason::QueueFull)
+            ForwardOutcome::Dropped(DropReason::BudgetExhausted)
         );
         drop(harness.receiver.try_recv().unwrap());
-        // Still at the new limit: nothing more fits.
+        // Still at the new limit: a small datagram does not fit beside one.
         assert_eq!(
             harness.forward(&[4; 1]),
-            ForwardOutcome::Dropped(DropReason::QueueFull)
+            ForwardOutcome::Dropped(DropReason::BudgetExhausted)
         );
         drop(harness.receiver.try_recv().unwrap());
         assert_eq!(harness.forward(&[5; 100]), ForwardOutcome::Queued);
@@ -1425,6 +1483,7 @@ mod tests {
         let live: Vec<_> = (0..40_000).map(|_| budget.session_started()).collect();
         budget.configure(&lowered);
         assert_eq!(budget.limit(), 0);
+        assert!(budget.exhausted_by_live_sessions());
         assert_eq!(
             budget.limit(),
             lowered.queued_datagram_budget_with_live_sessions(live.len())
@@ -1447,6 +1506,38 @@ mod tests {
         assert_eq!(budget.live_sessions(), 0);
         assert_eq!(budget.limit(), lowered.queued_datagram_budget());
         assert!(budget.limit() > 0);
+        assert!(!budget.exhausted_by_live_sessions());
+    }
+
+    #[test]
+    fn raising_the_datagram_size_under_many_live_sessions_is_detected() {
+        let before = ServiceConfig {
+            max_sessions: 50_000,
+            max_datagram_size: 4096,
+            ..ServiceConfig::default()
+        };
+        // Valid on its own: a positive steady-state budget for 1000 sessions.
+        let after = ServiceConfig {
+            max_sessions: 1_000,
+            max_datagram_size: 65_507,
+            ..ServiceConfig::default()
+        };
+        assert!(after.queued_datagram_budget() > 0);
+
+        let budget = QueueBudget::new(&before);
+        let live: Vec<_> = (0..40_000).map(|_| budget.session_started()).collect();
+        assert!(budget.limit() > 0);
+        assert!(!budget.exhausted_by_live_sessions());
+
+        // Live sessions resize their receive buffers to the new maximum, so
+        // 40 000 * (2 * 65507 + 1) bytes exceed the 4 GiB ceiling.
+        budget.configure(&after);
+        assert_eq!(budget.limit(), 0);
+        assert!(budget.exhausted_by_live_sessions());
+
+        drop(live);
+        assert!(!budget.exhausted_by_live_sessions());
+        assert_eq!(budget.limit(), after.queued_datagram_budget());
     }
 
     #[test]

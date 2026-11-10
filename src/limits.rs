@@ -5,7 +5,10 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -162,11 +165,41 @@ impl Drop for AdmissionLease {
     }
 }
 
+/// Every rate-limited log site in the daemon.
+///
+/// The limiter keeps one atomic timestamp per entry, so `should_log` never
+/// locks. A site missing from this table shares the last, catch-all slot (and
+/// trips a debug assertion in tests).
+pub const LOG_SITES: &[&str] = &[
+    "backend-send-error",
+    "backend-unresolved",
+    "client-send-error",
+    "dns-refresh-error",
+    "global-session-limit",
+    "listener-recv-error",
+    "partial-backend-send",
+    "partial-client-send",
+    "per-ip-session-limit",
+    "queue-budget-exhausted",
+    "session-queue-full",
+    "session-rate-limit",
+    "upstream-connect-error",
+    "upstream-local-address-error",
+    "upstream-recv-error",
+];
+
 /// A small helper for suppressing repetitive log sites.
+///
+/// Each site allows one event per interval. The state is a lock-free atomic
+/// timestamp per site, because sites such as `session-queue-full` fire on the
+/// datagram drop path exactly when the relay is overloaded.
 #[derive(Debug)]
 pub struct LogRateLimiter {
-    interval: Duration,
-    sites: Mutex<HashMap<&'static str, Instant>>,
+    interval_nanos: u64,
+    origin: Instant,
+    /// Nanoseconds since `origin` plus one of each site's last event; zero
+    /// means the site has not logged yet. One extra slot for unknown sites.
+    last: Box<[AtomicU64]>,
 }
 
 impl LogRateLimiter {
@@ -174,26 +207,31 @@ impl LogRateLimiter {
     #[must_use]
     pub fn new(interval: Duration) -> Self {
         Self {
-            interval,
-            sites: Mutex::new(HashMap::new()),
+            interval_nanos: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+            origin: Instant::now(),
+            last: (0..=LOG_SITES.len()).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
     /// Returns true when the caller should emit this log event.
     pub fn should_log(&self, site: &'static str) -> bool {
-        let now = Instant::now();
-        let mut sites = lock_unpoisoned(&self.sites);
-        match sites.get_mut(site) {
-            Some(last) if now.saturating_duration_since(*last) < self.interval => false,
-            Some(last) => {
-                *last = now;
-                true
-            }
-            None => {
-                sites.insert(site, now);
-                true
-            }
+        self.should_log_at(site, Instant::now())
+    }
+
+    fn should_log_at(&self, site: &'static str, now: Instant) -> bool {
+        let index = LOG_SITES.iter().position(|known| *known == site);
+        debug_assert!(index.is_some(), "unregistered log site {site:?}");
+        let slot = &self.last[index.unwrap_or(LOG_SITES.len())];
+        let now = u64::try_from(now.saturating_duration_since(self.origin).as_nanos())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
+        let last = slot.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < self.interval_nanos {
+            return false;
         }
+        // Only one caller wins a given interval; the losers stay quiet.
+        slot.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 }
 
@@ -224,6 +262,62 @@ mod tests {
         assert_eq!(controller.active(), 1);
         drop(second);
         assert_eq!(controller.active(), 0);
+    }
+
+    #[test]
+    fn log_sites_allow_one_event_per_interval_independently() {
+        let limiter = LogRateLimiter::new(Duration::from_secs(5));
+        let start = limiter.origin;
+        assert!(limiter.should_log_at("session-queue-full", start));
+        assert!(!limiter.should_log_at("session-queue-full", start));
+        assert!(!limiter.should_log_at("session-queue-full", start + Duration::from_millis(4_999)));
+        // Another site has its own slot.
+        assert!(limiter.should_log_at("queue-budget-exhausted", start));
+        assert!(limiter.should_log_at("session-queue-full", start + Duration::from_secs(5)));
+        assert!(!limiter.should_log_at("session-queue-full", start + Duration::from_secs(6)));
+        assert!(limiter.should_log_at("session-queue-full", start + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn concurrent_callers_log_a_site_once_per_interval() {
+        let limiter = LogRateLimiter::new(Duration::from_secs(3_600));
+        let logged = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1_000 {
+                        if limiter.should_log("backend-send-error") {
+                            logged.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(logged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn every_log_site_in_the_tree_is_registered() {
+        let sources = [
+            include_str!("relay/listener.rs"),
+            include_str!("relay/session.rs"),
+            include_str!("dns.rs"),
+        ]
+        .concat();
+        let marker = "should_log(\"";
+        for (offset, _) in sources.match_indices(marker) {
+            let rest = &sources[offset + marker.len()..];
+            let site = &rest[..rest.find('"').unwrap()];
+            assert!(LOG_SITES.contains(&site), "unregistered log site {site:?}");
+        }
+        // Every registered site is used, including the admission-rejection
+        // sites chosen by a `match` before the call.
+        for site in LOG_SITES {
+            assert!(
+                sources.contains(&format!("\"{site}\"")),
+                "stale log site {site:?}"
+            );
+        }
     }
 
     #[test]

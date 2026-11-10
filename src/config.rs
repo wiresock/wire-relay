@@ -224,6 +224,32 @@ impl Default for ServiceConfig {
     }
 }
 
+/// Fixed receive-buffer memory for `sessions` sessions: two
+/// `max_datagram_size` buffers plus one byte of truncation detection each.
+#[must_use]
+pub fn fixed_datagram_memory(sessions: usize, max_datagram_size: usize) -> u128 {
+    let per_session = (max_datagram_size as u128)
+        .saturating_mul(SESSION_FIXED_DATAGRAM_BUFFERS)
+        .saturating_add(1);
+    (sessions as u128).saturating_mul(per_session)
+}
+
+/// Bytes left for queued datagrams after reserving fixed receive buffers for
+/// `sessions` sessions out of `memory_bytes`.
+///
+/// This is the single implementation of the queue budget; configuration
+/// helpers and the runtime budget both call it. Production passes
+/// [`MAX_SESSION_DATAGRAM_MEMORY_BYTES`] and `max(live, max_sessions)`.
+#[must_use]
+pub fn queued_datagram_budget(
+    memory_bytes: u128,
+    sessions: usize,
+    max_datagram_size: usize,
+) -> usize {
+    let remaining = memory_bytes.saturating_sub(fixed_datagram_memory(sessions, max_datagram_size));
+    usize::try_from(remaining).unwrap_or(usize::MAX)
+}
+
 impl ServiceConfig {
     /// Bytes that queued client datagrams may occupy across all sessions.
     ///
@@ -244,21 +270,15 @@ impl ServiceConfig {
     /// whichever is larger: the live sessions or the configured limit.
     #[must_use]
     pub fn queued_datagram_budget_with_live_sessions(&self, live_sessions: usize) -> usize {
-        let sessions = self.max_sessions.max(live_sessions);
-        let remaining = MAX_SESSION_DATAGRAM_MEMORY_BYTES
-            .saturating_sub(self.fixed_datagram_memory_for(sessions));
-        usize::try_from(remaining).unwrap_or(usize::MAX)
-    }
-
-    fn fixed_datagram_memory_for(&self, sessions: usize) -> u128 {
-        let per_session = (self.max_datagram_size as u128)
-            .saturating_mul(SESSION_FIXED_DATAGRAM_BUFFERS)
-            .saturating_add(1);
-        (sessions as u128).saturating_mul(per_session)
+        queued_datagram_budget(
+            MAX_SESSION_DATAGRAM_MEMORY_BYTES,
+            self.max_sessions.max(live_sessions),
+            self.max_datagram_size,
+        )
     }
 
     fn fixed_session_datagram_memory(&self) -> u128 {
-        self.fixed_datagram_memory_for(self.max_sessions)
+        fixed_datagram_memory(self.max_sessions, self.max_datagram_size)
     }
 
     /// Budget charged by one completely full queue of maximum-sized datagrams.

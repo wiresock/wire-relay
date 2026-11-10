@@ -446,22 +446,26 @@ fn render_listeners(listeners: &[ListenerSnapshot]) -> String {
         return "no listeners\n".to_owned();
     }
     let mut output = String::from(
-        "NAME                 BIND                     BACKEND                  RESOLVED                 STATUS       SESSIONS  DROPPED   QUEUE FULL\n",
+        "NAME                 BIND                     BACKEND                  RESOLVED                 STATUS       SESSIONS  DROPPED   QUEUE FULL BUDGET\n",
     );
     for listener in listeners {
         let resolved = listener
             .resolved_backend
             .map_or_else(|| "-".to_owned(), |address| address.to_string());
         let counters = &listener.counters;
-        let queue_full = if counters.datagrams_dropped.is_reported_for(counters.dropped) {
-            counters.datagrams_dropped.queue_full.to_string()
+        let drops = &counters.datagrams_dropped;
+        let (queue_full, budget) = if drops.is_reported_for(counters.dropped) {
+            (
+                drops.queue_full.to_string(),
+                drops.budget_exhausted.to_string(),
+            )
         } else {
             // An older daemon reports drops without a per-reason breakdown.
-            "-".to_owned()
+            ("-".to_owned(), "-".to_owned())
         };
         let _ = writeln!(
             output,
-            "{:<20} {:<24} {:<24} {:<24} {:<12} {:<9} {:<9} {}",
+            "{:<20} {:<24} {:<24} {:<24} {:<12} {:<9} {:<9} {:<10} {}",
             listener.name,
             listener.bind,
             listener.configured_backend,
@@ -469,7 +473,8 @@ fn render_listeners(listeners: &[ListenerSnapshot]) -> String {
             format!("{:?}", listener.status),
             counters.active_sessions,
             counters.dropped,
-            queue_full
+            queue_full,
+            budget
         );
     }
     output
@@ -535,9 +540,10 @@ fn render_stats(stats: &MetricsSnapshot) -> String {
     if drops.is_reported_for(stats.datagrams_dropped_total) {
         let _ = write!(
             output,
-            "  oversize: {}\n  queue full: {}\n  session closed: {}\n  rejected: {}\n  send error: {}\n",
+            "  oversize: {}\n  queue full: {}\n  queue budget exhausted: {}\n  session closed: {}\n  rejected: {}\n  send error: {}\n",
             drops.oversize,
             drops.queue_full,
+            drops.budget_exhausted,
             drops.session_closed,
             drops.rejected,
             drops.send_error
@@ -698,7 +704,7 @@ mod tests {
     #[test]
     fn human_listener_queue_full_column_distinguishes_unknown_from_zero() {
         let none = listener_row(ListenerCounterSnapshot::default());
-        assert!(none.ends_with(" 0"), "{none}");
+        assert!(none.ends_with(" 0          0"), "{none}");
 
         let counted = listener_row(ListenerCounterSnapshot {
             dropped: 3,
@@ -709,7 +715,18 @@ mod tests {
             },
             ..ListenerCounterSnapshot::default()
         });
-        assert!(counted.ends_with(" 2"), "{counted}");
+        assert!(counted.ends_with(" 2          0"), "{counted}");
+
+        let budget = listener_row(ListenerCounterSnapshot {
+            dropped: 4,
+            datagrams_dropped: crate::metrics::DropSnapshot {
+                queue_full: 1,
+                budget_exhausted: 3,
+                ..crate::metrics::DropSnapshot::default()
+            },
+            ..ListenerCounterSnapshot::default()
+        });
+        assert!(budget.ends_with(" 4         1          3"), "{budget}");
 
         let genuine_zero = listener_row(ListenerCounterSnapshot {
             dropped: 1,
@@ -719,23 +736,24 @@ mod tests {
             },
             ..ListenerCounterSnapshot::default()
         });
-        assert!(genuine_zero.ends_with(" 0"), "{genuine_zero}");
+        assert!(genuine_zero.ends_with(" 0          0"), "{genuine_zero}");
 
         // An older daemon: drops without any per-reason counters.
         let older = listener_row(ListenerCounterSnapshot {
             dropped: 5,
             ..ListenerCounterSnapshot::default()
         });
-        assert!(older.ends_with(" 5         -"), "{older}");
+        assert!(older.ends_with(" 5         -          -"), "{older}");
     }
 
     #[test]
     fn human_stats_output_breaks_down_drop_reasons() {
         let stats = MetricsSnapshot {
-            datagrams_dropped_total: 6,
+            datagrams_dropped_total: 10,
             datagrams_dropped: crate::metrics::DropSnapshot {
                 oversize: 1,
                 queue_full: 2,
+                budget_exhausted: 4,
                 session_closed: 0,
                 rejected: 3,
                 send_error: 0,
@@ -743,8 +761,8 @@ mod tests {
             ..MetricsSnapshot::default()
         };
         let rendered = render_stats(&stats);
-        assert!(rendered.contains("datagrams dropped: 6\n  oversize: 1\n"));
-        assert!(rendered.contains("  queue full: 2\n"));
+        assert!(rendered.contains("datagrams dropped: 10\n  oversize: 1\n"));
+        assert!(rendered.contains("  queue full: 2\n  queue budget exhausted: 4\n"));
         assert!(rendered.contains("  session closed: 0\n"));
         assert!(rendered.contains("  rejected: 3\n"));
         assert!(rendered.contains("  send error: 0\nrate limited: 0\n"));
@@ -763,6 +781,7 @@ mod tests {
         let rendered = render_stats(&stats);
         assert!(rendered.contains("datagrams dropped: 4\nrate limited: 0\n"));
         assert!(!rendered.contains("queue full"));
+        assert!(!rendered.contains("budget"));
         assert!(!rendered.contains("oversize"));
     }
 

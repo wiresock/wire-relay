@@ -30,9 +30,11 @@ const MAX_METRICS_CONNECTIONS: usize = 16;
 pub enum DropReason {
     /// The datagram exceeded `service.max_datagram_size`.
     Oversize,
-    /// The session's client-to-backend queue had no free slot, or the
-    /// process-wide queued-datagram memory budget was exhausted.
+    /// The session's client-to-backend queue had no free slot
+    /// (`service.session_queue_depth`).
     QueueFull,
+    /// The process-wide queued-datagram memory budget was exhausted.
+    BudgetExhausted,
     /// The session was closing or had already stopped.
     SessionClosed,
     /// No session could be created: admission limits, an unresolved backend,
@@ -47,6 +49,7 @@ pub enum DropReason {
 pub struct DropCounters {
     oversize: AtomicU64,
     queue_full: AtomicU64,
+    budget_exhausted: AtomicU64,
     session_closed: AtomicU64,
     rejected: AtomicU64,
     send_error: AtomicU64,
@@ -57,6 +60,7 @@ impl DropCounters {
         let counter = match reason {
             DropReason::Oversize => &self.oversize,
             DropReason::QueueFull => &self.queue_full,
+            DropReason::BudgetExhausted => &self.budget_exhausted,
             DropReason::SessionClosed => &self.session_closed,
             DropReason::Rejected => &self.rejected,
             DropReason::SendError => &self.send_error,
@@ -69,6 +73,7 @@ impl DropCounters {
         DropSnapshot {
             oversize: self.oversize.load(Ordering::Relaxed),
             queue_full: self.queue_full.load(Ordering::Relaxed),
+            budget_exhausted: self.budget_exhausted.load(Ordering::Relaxed),
             session_closed: self.session_closed.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             send_error: self.send_error.load(Ordering::Relaxed),
@@ -85,6 +90,7 @@ impl DropCounters {
 pub struct DropSnapshot {
     pub oversize: u64,
     pub queue_full: u64,
+    pub budget_exhausted: u64,
     pub session_closed: u64,
     pub rejected: u64,
     pub send_error: u64,
@@ -105,6 +111,7 @@ impl DropSnapshot {
     pub const fn total(&self) -> u64 {
         self.oversize
             .saturating_add(self.queue_full)
+            .saturating_add(self.budget_exhausted)
             .saturating_add(self.session_closed)
             .saturating_add(self.rejected)
             .saturating_add(self.send_error)
@@ -268,6 +275,10 @@ impl Metrics {
             (
                 "wire_relay_datagrams_dropped_queue_full_total",
                 values.datagrams_dropped.queue_full,
+            ),
+            (
+                "wire_relay_datagrams_dropped_budget_exhausted_total",
+                values.datagrams_dropped.budget_exhausted,
             ),
             (
                 "wire_relay_datagrams_dropped_session_closed_total",
@@ -482,21 +493,24 @@ mod tests {
         metrics.datagram_dropped(DropReason::QueueFull);
         metrics.datagram_dropped(DropReason::Oversize);
         metrics.datagram_dropped(DropReason::SendError);
+        metrics.datagram_dropped(DropReason::BudgetExhausted);
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.datagrams_dropped_total, 4);
+        assert_eq!(snapshot.datagrams_dropped_total, 5);
         assert_eq!(
             snapshot.datagrams_dropped,
             DropSnapshot {
                 oversize: 1,
                 queue_full: 2,
+                budget_exhausted: 1,
                 session_closed: 0,
                 rejected: 0,
                 send_error: 1,
             }
         );
         let output = metrics.render_prometheus();
-        assert!(output.contains("wire_relay_datagrams_dropped_total 4\n"));
+        assert!(output.contains("wire_relay_datagrams_dropped_total 5\n"));
         assert!(output.contains("wire_relay_datagrams_dropped_queue_full_total 2\n"));
+        assert!(output.contains("wire_relay_datagrams_dropped_budget_exhausted_total 1\n"));
         assert!(output.contains("wire_relay_datagrams_dropped_oversize_total 1\n"));
         assert!(output.contains("wire_relay_datagrams_dropped_session_closed_total 0\n"));
         assert!(output.contains("wire_relay_datagrams_dropped_rejected_total 0\n"));
@@ -510,6 +524,7 @@ mod tests {
         let reasons = [
             DropReason::Oversize,
             DropReason::QueueFull,
+            DropReason::BudgetExhausted,
             DropReason::SessionClosed,
             DropReason::Rejected,
             DropReason::SendError,
@@ -552,6 +567,25 @@ mod tests {
                 .datagrams_dropped
                 .is_reported_for(snapshot.datagrams_dropped_total)
         );
+
+        // A daemon from before the budget reason omits that field; it
+        // defaults to zero while the other reasons still decode.
+        let mut value = serde_json::to_value(DropSnapshot {
+            queue_full: 3,
+            ..DropSnapshot::default()
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("budget_exhausted");
+        let drops: DropSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(drops.budget_exhausted, 0);
+        assert_eq!(drops.queue_full, 3);
+        assert!(drops.is_reported_for(3));
+        // Only the new reason is non-zero: the breakdown is still known.
+        let drops = DropSnapshot {
+            budget_exhausted: 2,
+            ..DropSnapshot::default()
+        };
+        assert!(drops.is_reported_for(2));
     }
 
     #[tokio::test]
