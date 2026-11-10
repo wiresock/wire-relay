@@ -16,8 +16,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `service.session_queue_depth` (default 512) with a runtime-enforced queue
-  memory budget based on actual datagram sizes.
+- `service.session_queue_depth` (default 512) with a shared, runtime-enforced
+  queue memory budget charged with each datagram's size plus a fixed 64-byte
+  overhead. Under a tight configuration (high `max_sessions` and large
+  datagrams) the shared remainder can be small, and a few back-pressured
+  sessions can exhaust it so that others drop as `queue_full`.
 - Per-reason drop counters in `/metrics`, `wire-relay stats`, and
   `wire-relay listeners`, plus a rate-limited warning when a session queue is
   full. `wire_relay_datagrams_dropped_total` is unchanged.

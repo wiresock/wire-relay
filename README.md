@@ -258,13 +258,23 @@ immediately or earlier datagrams are still queued. When the queue is full the
 datagram is dropped and counted as `queue_full`. A reloaded depth applies to
 new sessions.
 
-Datagram memory is bounded by a defensive 4 GiB budget. Validation reserves two
-`max_datagram_size` receive buffers for every possible session and requires
-one completely full queue of maximum-sized datagrams to fit beside them, so the
-largest datagram and session-count ceilings cannot be selected simultaneously.
-The rest of the budget is shared by all session queues and is enforced at
-runtime using the actual length of each queued datagram; a datagram that would
-exceed it is dropped as `queue_full`.
+Datagram memory is bounded by a defensive 4 GiB budget. Each queued datagram
+is charged its length plus a fixed 64-byte overhead for the queue slot and
+allocator slack, so even empty datagrams consume budget. Validation reserves
+two `max_datagram_size` receive buffers for every possible session and requires
+one completely full queue of maximum-sized datagrams, with that overhead, to
+fit beside them, so the largest datagram and session-count ceilings cannot be
+selected simultaneously. The rest of the budget is shared by all session queues
+and is enforced at runtime; a datagram that would exceed it is dropped as
+`queue_full`. After a reload that lowers `max_sessions`, receive buffers stay
+reserved for sessions that are still active above the new limit.
+
+The shared remainder can be small. With a high `max_sessions` and a large
+`max_datagram_size`, the fixed receive buffers take most of the 4 GiB, and a
+few sessions whose upstream sockets are backed up can use the rest, so other
+sessions' datagrams are then dropped as `queue_full` even though their own
+queues are short. Lower `max_sessions` or `max_datagram_size` if
+`queue_full` drops appear on otherwise idle sessions.
 
 ## Running and operating
 
@@ -394,7 +404,9 @@ broken down, without labels, by reason:
 | `wire_relay_datagrams_dropped_send_error_total` | the OS refused or truncated a send in either direction |
 
 `wire-relay stats` shows the same breakdown, and `wire-relay listeners` shows
-each listener's total and `queue_full` drops. A growing `queue_full` count
+each listener's total and `queue_full` drops. Connected to an older daemon that
+reports no per-reason counters, `stats` omits the breakdown and `listeners`
+prints `-` for `QUEUE FULL`. A growing `queue_full` count
 means upstream sends cannot keep up; a rate-limited warning is also logged.
 
 ## Security model

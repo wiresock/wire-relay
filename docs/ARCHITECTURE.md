@@ -72,11 +72,22 @@ so client datagram order is preserved; the listener is the only producer for
 its sessions. Queue pressure drops and counts the datagram as `queue_full`
 rather than growing memory or blocking all clients on the listener.
 
-Queued datagrams also reserve their actual length from a process-wide queue
-memory budget: the defensive 4 GiB datagram budget minus every possible
-session's fixed receive buffers. The reservation is released when the queued
-datagram is dropped, including when a session stops with datagrams still
-queued.
+Queued datagrams also reserve their length plus a fixed 64-byte per-datagram
+overhead from a process-wide queue memory budget: the defensive 4 GiB datagram
+budget minus the fixed receive buffers of `max(max_sessions, live sessions)`,
+recomputed on reload. The reservation is released when the queued datagram is
+dropped, including when a session stops with datagrams still queued. A lowered
+limit applies immediately; new reservations fail until use drains below it.
+The budget is shared, not partitioned: under a tight configuration (high
+`max_sessions` and large datagrams) the remainder can be small, and a few
+back-pressured sessions can exhaust it so that other sessions drop as
+`queue_full`.
+
+The session task cancels its token on every exit path (idle expiry, closed
+idle-timeout channel, explicit close, shutdown) before its table entry is
+removed, so a listener still holding the handle drops later datagrams as
+`session_closed` instead of sending on the exiting session's socket. On idle
+timer expiry the task re-reads the current timeout before deciding to close.
 
 For a new session, the listener reserves global/per-IP/rate capacity before
 creating a socket. The listener's receive loop serializes creation for that
@@ -243,7 +254,7 @@ Every spawned task is either owned by a supervisor handle or a Tokio
   bounded.
 - A session-count/datagram-size/queue-depth combination is rejected when every
   session's fixed receive buffers plus one full queue of maximum-sized
-  datagrams exceeds 4 GiB.
+  datagrams, each with its per-datagram overhead, exceeds 4 GiB.
 - Fixed configured destinations prevent open-proxy behavior.
 - Drop (in total and per reason), reject, DNS, and socket counters are exposed
   without client-IP metric labels.
