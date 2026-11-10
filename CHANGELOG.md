@@ -20,17 +20,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   queue memory budget charged with each datagram's size plus a fixed 64-byte
   overhead. Under a tight configuration (high `max_sessions` and large
   datagrams) the shared remainder can be small, and a few back-pressured
-  sessions can exhaust it so that others drop as `queue_full`. After a reload
-  lowers `max_sessions` below the live session count, the budget recovers to
-  its full size as the surplus sessions end.
+  sessions can exhaust it so that others drop as `budget_exhausted`. After a
+  reload lowers `max_sessions` below the live session count, the budget
+  recovers to its full size as the surplus sessions end. A reload that leaves
+  live sessions' receive buffers covering the whole budget (for example by
+  raising `max_datagram_size` under many live sessions) logs a warning.
 - Per-reason drop counters in `/metrics`, `wire-relay stats`, and
-  `wire-relay listeners`, plus a rate-limited warning when a session queue is
-  full. `wire_relay_datagrams_dropped_total` is unchanged; it is now the sum
+  `wire-relay listeners`, including
+  `wire_relay_datagrams_dropped_budget_exhausted_total` for shared queue
+  memory, separate from a full per-session queue (`queue_full`), plus
+  rate-limited warnings for each. `wire_relay_datagrams_dropped_total` is unchanged; it is now the sum
   of the per-reason counters, and datagrams still queued when a session stops
   are counted as `session_closed`.
 
 ### Changed
 
+- Rate-limited log sites no longer take a process-wide lock; each known site
+  keeps an atomic timestamp.
 - Replaced the repository-only management wrapper with the self-contained
   `wire-relay-install.sh`, which supports reviewed downloads and direct
   `curl | sudo bash` installation.

@@ -84,12 +84,25 @@ budget as they end, without a recomputation that a concurrent reload or
 session exit could leave stale. The reservation is released when the queued
 datagram is dropped, including when a session stops with datagrams still
 queued. A lowered limit applies immediately; new reservations fail until use
-drains below it. The listener claims a queue slot before charging the budget
-or copying the datagram, so a full queue drops without either.
-The budget is shared, not partitioned: under a tight configuration (high
-`max_sessions` and large datagrams) the remainder can be small, and a few
-back-pressured sessions can exhaust it so that other sessions drop as
-`queue_full`.
+drains below it. Live sessions resize their receive buffers to the reloaded
+`max_datagram_size`, so the limit charges live sessions at the new size: a
+reload that raises `max_datagram_size` under a large live population, or
+shrinks `max_sessions` far below the live count, can drive the limit to zero
+although the new configuration is valid. The reload still applies and logs a
+warning; queued datagrams drop as `budget_exhausted` until enough sessions
+end. The limit formula lives in one function in `config.rs`, used by both the
+configuration helpers and the runtime budget.
+
+The listener claims a queue slot before charging the budget or copying the
+datagram, so a full queue drops without either. A full per-session queue is
+counted as `queue_full`; a failed budget reservation as `budget_exhausted`,
+with separate warnings. The budget is shared, not partitioned: under a tight
+configuration (high `max_sessions` and large datagrams) the remainder can be
+small, and a few back-pressured sessions can exhaust it so that other
+sessions drop as `budget_exhausted`.
+
+Rate-limited warnings use one atomic timestamp per known log site, so the
+drop path never takes a lock to decide whether to log.
 
 The session task closes its handle on every exit path (idle expiry, closed
 idle-timeout channel, explicit close, shutdown) before its table entry is

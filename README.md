@@ -266,17 +266,25 @@ one completely full queue of maximum-sized datagrams, with that overhead, to
 fit beside them, so the largest datagram and session-count ceilings cannot be
 selected simultaneously. The rest of the budget is shared by all session queues
 and is enforced at runtime; a datagram that would exceed it is dropped as
-`queue_full`. After a reload that lowers `max_sessions`, receive buffers stay
-reserved for sessions that are still active above the new limit, and the
-shared remainder grows back to the new configuration's full size as those
+`budget_exhausted`. Receive buffers stay reserved for every live session, at
+the current `max_datagram_size`, even when that is more sessions than the
+configured `max_sessions`. After a reload that lowers `max_sessions`, the
+shared remainder therefore grows back to the new configuration's full size
+only as the surplus sessions end. A reload that raises `max_datagram_size`
+while many sessions are live (or lowers `max_sessions` far below the live
+count) can leave no remainder at all, for example 40,000 live sessions after
+a reload to `max_datagram_size = 65507`. Such a configuration is still valid
+and the reload applies, but the daemon logs a warning, and every datagram
+that would be queued is dropped as `budget_exhausted` until enough of those
 sessions end.
 
 The shared remainder can be small. With a high `max_sessions` and a large
 `max_datagram_size`, the fixed receive buffers take most of the 4 GiB, and a
 few sessions whose upstream sockets are backed up can use the rest, so other
-sessions' datagrams are then dropped as `queue_full` even though their own
-queues are short. Lower `max_sessions` or `max_datagram_size` if
-`queue_full` drops appear on otherwise idle sessions.
+sessions' datagrams are then dropped as `budget_exhausted` even though their
+own queues are short. Lower `max_sessions` or `max_datagram_size` if
+`budget_exhausted` drops grow. `queue_full` instead means one session's queue
+reached `session_queue_depth`.
 
 ## Running and operating
 
@@ -400,16 +408,20 @@ broken down, without labels, by reason:
 | Metric | Reason |
 | --- | --- |
 | `wire_relay_datagrams_dropped_oversize_total` | larger than `max_datagram_size` |
-| `wire_relay_datagrams_dropped_queue_full_total` | session queue or shared queue memory full |
+| `wire_relay_datagrams_dropped_queue_full_total` | the session's queue reached `session_queue_depth` |
+| `wire_relay_datagrams_dropped_budget_exhausted_total` | the shared queued-datagram memory budget was exhausted |
 | `wire_relay_datagrams_dropped_session_closed_total` | session was closing, including datagrams still queued when it stopped |
 | `wire_relay_datagrams_dropped_rejected_total` | no session could be created (admission limits, unresolved backend, socket setup, route change) |
 | `wire_relay_datagrams_dropped_send_error_total` | the OS refused or truncated a send in either direction |
 
 `wire-relay stats` shows the same breakdown, and `wire-relay listeners` shows
-each listener's total and `queue_full` drops. Connected to an older daemon that
-reports no per-reason counters, `stats` omits the breakdown and `listeners`
-prints `-` for `QUEUE FULL`. A growing `queue_full` count
-means upstream sends cannot keep up; a rate-limited warning is also logged.
+each listener's total, `queue_full`, and `budget_exhausted` (`BUDGET`) drops.
+Connected to an older daemon that reports no per-reason counters, `stats`
+omits the breakdown and `listeners` prints `-` for `QUEUE FULL` and `BUDGET`;
+a daemon that predates only the budget reason reports it as 0. A growing
+`queue_full` count means one session's upstream sends cannot keep up; a
+growing `budget_exhausted` count means the shared queue memory is used up.
+Each logs its own rate-limited warning.
 
 ## Security model
 
