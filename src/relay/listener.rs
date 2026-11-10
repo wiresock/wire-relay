@@ -195,9 +195,12 @@ impl ListenerHandle {
         let _route_commit = lock_unpoisoned(&self.route_commit);
         self.route_epoch.fetch_add(1, Ordering::AcqRel);
         self.stopping.store(true, Ordering::Release);
+        // Closed before the token is cancelled, so the count is not lowered
+        // by session tasks that see the cancellation and close themselves.
+        let closed = self.sessions.close_listener(self.id);
         self.cancel.cancel();
         self.resolver.stop();
-        self.sessions.close_listener(self.id)
+        closed
     }
 }
 

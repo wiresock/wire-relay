@@ -393,7 +393,7 @@ async fn oversized_datagrams_are_dropped_without_truncated_forwarding() -> Resul
             runtime.status().stats.datagrams_dropped_total >= 2
         })
         .await?;
-        let drops = runtime.status().stats.datagrams_dropped;
+        let drops = runtime.status().stats.drops();
         ensure!(
             drops.oversize == 2,
             "oversized datagrams were not counted as oversize: {drops:?}"
