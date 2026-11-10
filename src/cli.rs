@@ -446,7 +446,7 @@ fn render_listeners(listeners: &[ListenerSnapshot]) -> String {
         return "no listeners\n".to_owned();
     }
     let mut output = String::from(
-        "NAME                 BIND                     BACKEND                  RESOLVED                 STATUS       SESSIONS\n",
+        "NAME                 BIND                     BACKEND                  RESOLVED                 STATUS       SESSIONS  DROPPED   QUEUE FULL\n",
     );
     for listener in listeners {
         let resolved = listener
@@ -454,13 +454,15 @@ fn render_listeners(listeners: &[ListenerSnapshot]) -> String {
             .map_or_else(|| "-".to_owned(), |address| address.to_string());
         let _ = writeln!(
             output,
-            "{:<20} {:<24} {:<24} {:<24} {:<12?} {}",
+            "{:<20} {:<24} {:<24} {:<24} {:<12} {:<9} {:<9} {}",
             listener.name,
             listener.bind,
             listener.configured_backend,
             resolved,
-            listener.status,
-            listener.counters.active_sessions
+            format!("{:?}", listener.status),
+            listener.counters.active_sessions,
+            listener.counters.dropped,
+            listener.counters.datagrams_dropped.queue_full
         );
     }
     output
@@ -509,7 +511,7 @@ fn render_session(session: &SessionSnapshot) -> String {
 
 fn render_stats(stats: &MetricsSnapshot) -> String {
     format!(
-        "active sessions: {}\nsessions created: {}\nsessions expired: {}\nsessions closed: {}\nsessions rejected: {}\npackets to backend: {}\npackets to client: {}\nbytes to backend: {}\nbytes to client: {}\ndatagrams dropped: {}\nrate limited: {}\nDNS errors: {}\nsocket errors: {}\n",
+        "active sessions: {}\nsessions created: {}\nsessions expired: {}\nsessions closed: {}\nsessions rejected: {}\npackets to backend: {}\npackets to client: {}\nbytes to backend: {}\nbytes to client: {}\ndatagrams dropped: {}\n  oversize: {}\n  queue full: {}\n  session closed: {}\n  rejected: {}\n  send error: {}\nrate limited: {}\nDNS errors: {}\nsocket errors: {}\n",
         stats.active_sessions,
         stats.sessions_created_total,
         stats.sessions_expired_total,
@@ -520,6 +522,11 @@ fn render_stats(stats: &MetricsSnapshot) -> String {
         stats.bytes_to_backend_total,
         stats.bytes_to_client_total,
         stats.datagrams_dropped_total,
+        stats.datagrams_dropped.oversize,
+        stats.datagrams_dropped.queue_full,
+        stats.datagrams_dropped.session_closed,
+        stats.datagrams_dropped.rejected,
+        stats.datagrams_dropped.send_error,
         stats.rate_limited_total,
         stats.dns_errors_total,
         stats.socket_errors_total
@@ -656,6 +663,27 @@ mod tests {
         let rendered = render_listeners(&[listener]);
         assert!(rendered.contains("germany"));
         assert!(rendered.contains("192.0.2.1:51820"));
+        assert!(rendered.contains("QUEUE FULL"));
+    }
+
+    #[test]
+    fn human_stats_output_breaks_down_drop_reasons() {
+        let stats = MetricsSnapshot {
+            datagrams_dropped_total: 6,
+            datagrams_dropped: crate::metrics::DropSnapshot {
+                oversize: 1,
+                queue_full: 2,
+                session_closed: 0,
+                rejected: 3,
+                send_error: 0,
+            },
+            ..MetricsSnapshot::default()
+        };
+        let rendered = render_stats(&stats);
+        assert!(rendered.contains("datagrams dropped: 6\n"));
+        assert!(rendered.contains("  oversize: 1\n"));
+        assert!(rendered.contains("  queue full: 2\n"));
+        assert!(rendered.contains("  rejected: 3\n"));
     }
 
     #[tokio::test]

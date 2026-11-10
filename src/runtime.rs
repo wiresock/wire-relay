@@ -43,7 +43,7 @@ use crate::{
     metrics::{Metrics, MetricsServerHandle, PreparedMetricsServer},
     relay::{
         ListenerHandle, ListenerId, ListenerSnapshot, PreparedListener, SessionSnapshot,
-        SessionTable, listener::ListenerContext,
+        SessionTable, listener::ListenerContext, session::QueueBudget,
     },
 };
 
@@ -88,6 +88,8 @@ struct RuntimeCore {
     metrics: Arc<Metrics>,
     idle_timeout: watch::Sender<Duration>,
     max_datagram_size: Arc<AtomicUsize>,
+    session_queue_depth: Arc<AtomicUsize>,
+    queue_budget: Arc<QueueBudget>,
     dns_refresh_interval_ms: Arc<AtomicU64>,
     cancel: CancellationToken,
     tracker: TaskTracker,
@@ -240,6 +242,8 @@ impl Runtime {
             metrics,
             idle_timeout,
             max_datagram_size: Arc::new(AtomicUsize::new(config.service.max_datagram_size)),
+            session_queue_depth: Arc::new(AtomicUsize::new(config.service.session_queue_depth)),
+            queue_budget: QueueBudget::new(config.service.queued_datagram_budget()),
             dns_refresh_interval_ms: Arc::new(AtomicU64::new(duration_millis_nonzero(
                 config.service.dns_refresh_interval,
             ))),
@@ -330,6 +334,8 @@ impl RuntimeCore {
             metrics: Arc::clone(&self.metrics),
             idle_timeout: self.idle_timeout.clone(),
             max_datagram_size: Arc::clone(&self.max_datagram_size),
+            session_queue_depth: Arc::clone(&self.session_queue_depth),
+            queue_budget: Arc::clone(&self.queue_budget),
             dns_refresh_interval_ms: Arc::clone(&self.dns_refresh_interval_ms),
             parent_cancel: self.cancel.clone(),
             tracker: self.tracker.clone(),
@@ -583,6 +589,10 @@ impl RuntimeCore {
             .send_replace(new_config.service.idle_timeout);
         self.max_datagram_size
             .store(new_config.service.max_datagram_size, Ordering::Relaxed);
+        self.session_queue_depth
+            .store(new_config.service.session_queue_depth, Ordering::Relaxed);
+        self.queue_budget
+            .set_limit(new_config.service.queued_datagram_budget());
         self.dns_refresh_interval_ms.store(
             duration_millis_nonzero(new_config.service.dns_refresh_interval),
             Ordering::Relaxed,

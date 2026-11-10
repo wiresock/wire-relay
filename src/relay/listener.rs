@@ -21,13 +21,14 @@ use crate::{
     config::ListenerConfig,
     dns::{BackendResolver, DnsSnapshot, PreparedBackend},
     limits::{AdmissionController, AdmissionRejection, LogRateLimiter},
-    metrics::Metrics,
+    metrics::{DropReason, Metrics},
 };
 
 use super::{
     ListenerId, Session, SessionKey, SessionTable,
     session::{
-        ListenerCounterSnapshot, ListenerCounters, QueueError, SessionLaunch, launch_session,
+        ListenerCounterSnapshot, ListenerCounters, QueueBudget, SessionLaunch, launch_session,
+        record_drop,
     },
     upstream,
 };
@@ -40,6 +41,8 @@ pub struct ListenerContext {
     pub metrics: Arc<Metrics>,
     pub idle_timeout: watch::Sender<Duration>,
     pub max_datagram_size: Arc<AtomicUsize>,
+    pub session_queue_depth: Arc<AtomicUsize>,
+    pub queue_budget: Arc<QueueBudget>,
     pub dns_refresh_interval_ms: Arc<AtomicU64>,
     pub parent_cancel: CancellationToken,
     pub tracker: TaskTracker,
@@ -253,31 +256,30 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
         };
 
         if size > max_size {
-            context.metrics.datagram_dropped();
-            handle.counters.dropped();
+            record_drop(&context.metrics, &handle.counters, DropReason::Oversize);
             continue;
         }
-        let datagram = buffer[..size].to_vec();
         let key = SessionKey::new(handle.id, client_addr);
 
         if let Some(session) = context.sessions.get_by_key(&key) {
-            if matches!(
-                session.try_send(datagram),
-                Err(QueueError::Full | QueueError::Closed)
-            ) {
-                context.metrics.datagram_dropped();
-                handle.counters.dropped();
-            }
+            // Fast path: send on the session's connected upstream socket from
+            // this task, queueing only when that socket is busy.
+            session.forward_from_client(
+                &buffer[..size],
+                &context.metrics,
+                &handle.counters,
+                &context.log_limiter,
+            );
             continue;
         }
+        let datagram = buffer[..size].to_vec();
 
         let admission = match context.admission.try_acquire(client_addr.ip()) {
             Ok(admission) => admission,
             Err(rejection) => {
                 let rate_limited = rejection == AdmissionRejection::RateLimited;
                 context.metrics.session_rejected(rate_limited);
-                context.metrics.datagram_dropped();
-                handle.counters.dropped();
+                record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
                 if context.log_limiter.should_log(match rejection {
                     AdmissionRejection::GlobalLimit => "global-session-limit",
                     AdmissionRejection::PerIpLimit => "per-ip-session-limit",
@@ -310,8 +312,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
                 break;
             }
             context.metrics.session_rejected(false);
-            context.metrics.datagram_dropped();
-            handle.counters.dropped();
+            record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
             drop(admission);
             if context.log_limiter.should_log("backend-unresolved") {
                 warn!(
@@ -327,8 +328,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             Err(error) => {
                 context.metrics.socket_error();
                 context.metrics.session_rejected(false);
-                context.metrics.datagram_dropped();
-                handle.counters.dropped();
+                record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
                 drop(admission);
                 if context.log_limiter.should_log("upstream-connect-error") {
                     warn!(
@@ -346,8 +346,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             Err(error) => {
                 context.metrics.socket_error();
                 context.metrics.session_rejected(false);
-                context.metrics.datagram_dropped();
-                handle.counters.dropped();
+                record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
                 drop(admission);
                 if context
                     .log_limiter
@@ -381,6 +380,8 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             listener_counters: Arc::clone(&handle.counters),
             idle_timeout: context.idle_timeout.subscribe(),
             max_datagram_size: Arc::clone(&context.max_datagram_size),
+            queue_depth: context.session_queue_depth.load(Ordering::Relaxed),
+            queue_budget: Arc::clone(&context.queue_budget),
             parent_cancel: handle.cancel.clone(),
             tracker: context.tracker.clone(),
             log_limiter: Arc::clone(&context.log_limiter),
@@ -391,8 +392,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             drop(route_commit);
             drop(launch);
             context.metrics.session_rejected(false);
-            context.metrics.datagram_dropped();
-            handle.counters.dropped();
+            record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
             continue;
         }
         let launched = launch_session(launch);
@@ -402,8 +402,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             // one receive loop serializes session creation per listener.
             drop(admission);
             context.metrics.session_rejected(false);
-            context.metrics.datagram_dropped();
-            handle.counters.dropped();
+            record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
         }
     }
 

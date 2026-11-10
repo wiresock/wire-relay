@@ -388,6 +388,21 @@ async fn oversized_datagrams_are_dropped_without_truncated_forwarding() -> Resul
             "oversized datagram affected session creation accounting"
         );
 
+        send_datagram(&client, &[0xa5; 65]).await?;
+        wait_until("oversized existing-session datagram drop", || {
+            runtime.status().stats.datagrams_dropped_total >= 2
+        })
+        .await?;
+        let drops = runtime.status().stats.datagrams_dropped;
+        ensure!(
+            drops.oversize == 2,
+            "oversized datagrams were not counted as oversize: {drops:?}"
+        );
+        ensure!(
+            drops.queue_full == 0 && drops.rejected == 0 && drops.send_error == 0,
+            "oversized datagrams were attributed to another drop reason: {drops:?}"
+        );
+
         Ok(())
     }
     .await;

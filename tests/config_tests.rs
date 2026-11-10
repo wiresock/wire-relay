@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use wire_relay::config::{
     BackendEndpoint, BackendEndpointError, BackendHost, Config, ConfigError,
-    DEFAULT_CONTROL_SOCKET, MAX_CONFIGURED_SESSIONS, MAX_LISTENERS, MAX_NEW_SESSIONS_PER_SECOND,
-    MAX_UDP_DATAGRAM_SIZE,
+    DEFAULT_CONTROL_SOCKET, DEFAULT_SESSION_QUEUE_DEPTH, MAX_CONFIGURED_SESSIONS, MAX_LISTENERS,
+    MAX_NEW_SESSIONS_PER_SECOND, MAX_SESSION_QUEUE_DEPTH, MAX_UDP_DATAGRAM_SIZE, ServiceConfig,
 };
 
 const MINIMAL: &str = r#"
@@ -38,6 +38,10 @@ fn service_defaults_are_materialized() {
     assert_eq!(config.service.log_level.as_str(), "info");
     assert_eq!(config.service.idle_timeout.as_secs(), 180);
     assert_eq!(config.service.max_datagram_size, 4096);
+    assert_eq!(
+        config.service.session_queue_depth,
+        DEFAULT_SESSION_QUEUE_DEPTH
+    );
     assert_eq!(config.service.max_sessions, 10_000);
     assert_eq!(config.service.max_sessions_per_ip, 64);
     assert_eq!(config.service.new_sessions_per_second, 100);
@@ -417,6 +421,15 @@ fn defensive_resource_ceilings_are_enforced() {
         "unexpected error: {error}"
     );
 
+    for depth in [0, MAX_SESSION_QUEUE_DEPTH + 1] {
+        let input = format!("[service]\nsession_queue_depth = {depth}\n{MINIMAL}");
+        let error = Config::parse_str(&input).expect_err("queue depth must be range checked");
+        assert!(
+            error.to_string().contains("session_queue_depth"),
+            "unexpected error: {error}"
+        );
+    }
+
     let mut listeners = String::new();
     for index in 0..=MAX_LISTENERS {
         listeners.push_str(&listener(
@@ -474,4 +487,43 @@ fn excessive_durations_are_rejected_before_runtime_timer_arithmetic() {
             "{field}={value}"
         );
     }
+}
+
+#[test]
+fn session_queue_depth_parses_and_shares_a_runtime_memory_budget() {
+    let input = format!("[service]\nsession_queue_depth = 1024\n{MINIMAL}");
+    let config = Config::parse_str(&input).expect("queue depth should be configurable");
+    assert_eq!(config.service.session_queue_depth, 1024);
+
+    // Deep default queues do not require every session to own a full queue
+    // of maximum-sized datagrams; the remainder of the budget is shared.
+    let defaults = ServiceConfig::default();
+    let fixed = defaults.max_sessions * (defaults.max_datagram_size * 2 + 1);
+    assert_eq!(
+        defaults.queued_datagram_budget(),
+        4 * 1024 * 1024 * 1024 - fixed
+    );
+}
+
+#[test]
+fn configurations_accepted_by_the_previous_eight_slot_budget_remain_valid() {
+    // The old guard accepted sessions * (datagram * 10 + 1) <= 4 GiB.
+    let input = format!(
+        "[service]\nmax_sessions = 100000\nmax_sessions_per_ip = 1\n\
+         max_datagram_size = 4096\n{MINIMAL}"
+    );
+    Config::parse_str(&input).expect("previously valid limits must stay valid");
+}
+
+#[test]
+fn one_full_queue_must_fit_beside_fixed_session_buffers() {
+    let input = format!(
+        "[service]\nmax_sessions = 30000\nmax_sessions_per_ip = 1\n\
+         max_datagram_size = 65507\nsession_queue_depth = 65536\n{MINIMAL}"
+    );
+    let error = Config::parse_str(&input).expect_err("oversized queue budget must be rejected");
+    assert!(
+        error.to_string().contains("session_queue_depth"),
+        "unexpected error: {error}"
+    );
 }

@@ -33,8 +33,12 @@ pub const MAX_CONFIGURED_SESSIONS: usize = 100_000;
 /// Defensive ceiling for the new-session token bucket.
 pub const MAX_NEW_SESSIONS_PER_SECOND: u32 = 100_000;
 
-/// Maximum client datagrams waiting behind one upstream socket.
-pub const MAX_QUEUED_CLIENT_DATAGRAMS: usize = 8;
+/// Default number of client datagrams that may wait behind one upstream
+/// socket when it cannot accept a datagram immediately.
+pub const DEFAULT_SESSION_QUEUE_DEPTH: usize = 512;
+
+/// Defensive ceiling for `service.session_queue_depth`.
+pub const MAX_SESSION_QUEUE_DEPTH: usize = 65_536;
 
 /// Default local control-plane Unix-domain socket.
 pub const DEFAULT_CONTROL_SOCKET: &str = "/run/wire-relay/control.sock";
@@ -55,7 +59,9 @@ const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const MAX_DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_SESSION_DATAGRAM_MEMORY_BYTES: u128 = 4 * 1024 * 1024 * 1024;
-const SESSION_DATAGRAM_SLOTS: u128 = MAX_QUEUED_CLIENT_DATAGRAMS as u128 + 2;
+/// Receive buffers of `max_datagram_size` bytes that every session may own
+/// regardless of queue use.
+const SESSION_FIXED_DATAGRAM_BUFFERS: u128 = 2;
 
 /// Fully typed configuration loaded from TOML.
 ///
@@ -181,6 +187,7 @@ pub struct ServiceConfig {
     #[serde(with = "humantime_serde")]
     pub idle_timeout: Duration,
     pub max_datagram_size: usize,
+    pub session_queue_depth: usize,
     pub max_sessions: usize,
     pub max_sessions_per_ip: usize,
     pub new_sessions_per_second: u32,
@@ -197,12 +204,36 @@ impl Default for ServiceConfig {
             log_level: LogLevel::Info,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             max_datagram_size: DEFAULT_MAX_DATAGRAM_SIZE,
+            session_queue_depth: DEFAULT_SESSION_QUEUE_DEPTH,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_sessions_per_ip: DEFAULT_MAX_SESSIONS_PER_IP,
             new_sessions_per_second: DEFAULT_NEW_SESSIONS_PER_SECOND,
             dns_refresh_interval: Duration::from_secs(DEFAULT_DNS_REFRESH_INTERVAL_SECS),
             shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
         }
+    }
+}
+
+impl ServiceConfig {
+    /// Bytes that queued client datagrams may occupy across all sessions.
+    ///
+    /// The defensive datagram-memory budget first reserves every session's
+    /// fixed receive buffers. The remainder is enforced at runtime against the
+    /// actual size of each queued datagram, so a deep per-session queue does
+    /// not require the pessimistic `max_sessions * depth * max_datagram_size`
+    /// allocation to fit.
+    #[must_use]
+    pub fn queued_datagram_budget(&self) -> usize {
+        let remaining =
+            MAX_SESSION_DATAGRAM_MEMORY_BYTES.saturating_sub(self.fixed_session_datagram_memory());
+        usize::try_from(remaining).unwrap_or(usize::MAX)
+    }
+
+    fn fixed_session_datagram_memory(&self) -> u128 {
+        let per_session = (self.max_datagram_size as u128)
+            .saturating_mul(SESSION_FIXED_DATAGRAM_BUFFERS)
+            .saturating_add(1);
+        (self.max_sessions as u128).saturating_mul(per_session)
     }
 }
 
@@ -647,17 +678,28 @@ fn validate_service(service: &ServiceConfig) -> Result<(), ConfigError> {
         ));
     }
 
-    let per_session_datagram_memory = (service.max_datagram_size as u128)
-        .saturating_mul(SESSION_DATAGRAM_SLOTS)
-        .saturating_add(1);
-    let worst_case_datagram_memory =
-        (service.max_sessions as u128).saturating_mul(per_session_datagram_memory);
+    if !(1..=MAX_SESSION_QUEUE_DEPTH).contains(&service.session_queue_depth) {
+        return Err(invalid_value(
+            "service.session_queue_depth",
+            format!("must be between 1 and {MAX_SESSION_QUEUE_DEPTH}"),
+        ));
+    }
+
+    // Every session's fixed receive buffers plus one completely full queue of
+    // maximum-sized datagrams must fit. Queues beyond that share the remaining
+    // budget, which the relay enforces using actual queued datagram sizes.
+    let one_full_queue =
+        (service.max_datagram_size as u128).saturating_mul(service.session_queue_depth as u128);
+    let worst_case_datagram_memory = service
+        .fixed_session_datagram_memory()
+        .saturating_add(one_full_queue);
     if worst_case_datagram_memory > MAX_SESSION_DATAGRAM_MEMORY_BYTES {
         return Err(invalid_value(
             "service.max_sessions",
             format!(
-                "combined with service.max_datagram_size, the worst-case per-session datagram \
-                 buffers exceed the defensive {} GiB budget; reduce one of those values",
+                "combined with service.max_datagram_size and service.session_queue_depth, the \
+                 worst-case per-session datagram buffers plus one full session queue exceed the \
+                 defensive {} GiB budget; reduce one of those values",
                 MAX_SESSION_DATAGRAM_MEMORY_BYTES / (1024 * 1024 * 1024)
             ),
         ));

@@ -224,8 +224,8 @@ mod tests {
         assert_eq!(id.to_string().parse::<SessionId>().unwrap(), id);
     }
 
-    #[test]
-    fn removal_requires_the_current_session_incarnation() {
+    #[tokio::test]
+    async fn removal_requires_the_current_session_incarnation() {
         let table = SessionTable::new();
         let session = test_session_handle();
         let key = session.session().key();

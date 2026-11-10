@@ -3,9 +3,10 @@
 //! Per-client connected upstream socket and lifecycle.
 
 use std::{
+    io,
     net::SocketAddr,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -23,15 +24,15 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, warn};
 
 use crate::{
-    config::MAX_QUEUED_CLIENT_DATAGRAMS,
     limits::{AdmissionLease, LogRateLimiter},
-    metrics::Metrics,
+    metrics::{DropCounters, DropReason, DropSnapshot, Metrics},
 };
 
 use super::{ListenerId, SessionId, SessionKey, SessionTable};
 
-/// Number of client datagrams that may wait behind an upstream socket.
-pub const SESSION_QUEUE_CAPACITY: usize = MAX_QUEUED_CLIENT_DATAGRAMS;
+/// Maximum queued client datagrams a session sends before it polls its other
+/// event sources again.
+pub const QUEUE_DRAIN_BATCH: usize = 64;
 
 /// Cumulative counters owned by one listener incarnation.
 #[derive(Debug, Default)]
@@ -42,6 +43,7 @@ pub struct ListenerCounters {
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
     dropped: AtomicU64,
+    drops: DropCounters,
 }
 
 impl ListenerCounters {
@@ -65,8 +67,9 @@ impl ListenerCounters {
             .fetch_add(saturating_u64(bytes), Ordering::Relaxed);
     }
 
-    pub fn dropped(&self) {
+    pub fn dropped(&self, reason: DropReason) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.drops.record(reason);
     }
 
     #[must_use]
@@ -78,6 +81,7 @@ impl ListenerCounters {
             bytes_to_backend: self.bytes_to_backend.load(Ordering::Relaxed),
             bytes_to_client: self.bytes_to_client.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            datagrams_dropped: self.drops.snapshot(),
         }
     }
 }
@@ -91,12 +95,92 @@ pub struct ListenerCounterSnapshot {
     pub bytes_to_backend: u64,
     pub bytes_to_client: u64,
     pub dropped: u64,
+    /// Breakdown of `dropped` by reason.
+    #[serde(default)]
+    pub datagrams_dropped: DropSnapshot,
+}
+
+/// Records one discarded datagram in the process and listener counters.
+pub fn record_drop(metrics: &Metrics, listener_counters: &ListenerCounters, reason: DropReason) {
+    metrics.datagram_dropped(reason);
+    listener_counters.dropped(reason);
+}
+
+/// Process-wide byte budget for client datagrams waiting in session queues.
+///
+/// Reservations are charged with each datagram's actual length and released
+/// when the queued datagram is dropped, whether it was sent or discarded
+/// during session teardown.
+#[derive(Debug)]
+pub struct QueueBudget {
+    limit: AtomicUsize,
+    used: AtomicUsize,
+}
+
+impl QueueBudget {
+    #[must_use]
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(limit),
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    /// Applies a reloaded limit to subsequent reservations.
+    pub fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// Bytes currently held by queued datagrams.
+    #[must_use]
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<QueueReservation> {
+        let limit = self.limit.load(Ordering::Relaxed);
+        let mut used = self.used.load(Ordering::Acquire);
+        loop {
+            let total = used.checked_add(bytes).filter(|total| *total <= limit)?;
+            match self
+                .used
+                .compare_exchange_weak(used, total, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(current) => used = current,
+            }
+        }
+        Some(QueueReservation {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
 }
 
 #[derive(Debug)]
+struct QueueReservation {
+    budget: Arc<QueueBudget>,
+    bytes: usize,
+}
+
+impl Drop for QueueReservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// A client datagram waiting for its session's upstream socket.
+#[derive(Debug)]
+pub struct QueuedDatagram {
+    payload: Vec<u8>,
+    _reservation: QueueReservation,
+}
+
+/// Lock-free activity timestamps, stored as nanoseconds after creation.
+#[derive(Debug, Default)]
 struct Activity {
-    last_client: Instant,
-    last_backend: Instant,
+    last_client_ns: AtomicU64,
+    last_backend_ns: AtomicU64,
 }
 
 /// Runtime information for one mapping.
@@ -109,7 +193,7 @@ pub struct Session {
     pub upstream_local_addr: SocketAddr,
     pub backend_addr: SocketAddr,
     created_at: Instant,
-    activity: Mutex<Activity>,
+    activity: Activity,
     packets_to_backend: AtomicU64,
     packets_to_client: AtomicU64,
     bytes_to_backend: AtomicU64,
@@ -134,10 +218,7 @@ impl Session {
             upstream_local_addr,
             backend_addr,
             created_at: now,
-            activity: Mutex::new(Activity {
-                last_client: now,
-                last_backend: now,
-            }),
+            activity: Activity::default(),
             packets_to_backend: AtomicU64::new(0),
             packets_to_client: AtomicU64::new(0),
             bytes_to_backend: AtomicU64::new(0),
@@ -150,17 +231,39 @@ impl Session {
         SessionKey::new(self.listener_id, self.client_addr)
     }
 
+    fn elapsed_ns(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.created_at).as_nanos()).unwrap_or(u64::MAX)
+    }
+
     fn touch_client(&self) {
-        lock_unpoisoned(&self.activity).last_client = Instant::now();
+        let now = self.elapsed_ns(Instant::now());
+        self.activity
+            .last_client_ns
+            .fetch_max(now, Ordering::Relaxed);
     }
 
     fn touch_backend(&self) {
-        lock_unpoisoned(&self.activity).last_backend = Instant::now();
+        let now = self.elapsed_ns(Instant::now());
+        self.activity
+            .last_backend_ns
+            .fetch_max(now, Ordering::Relaxed);
+    }
+
+    fn at_offset(&self, nanos: u64) -> Instant {
+        self.created_at + Duration::from_nanos(nanos)
+    }
+
+    fn last_client_activity(&self) -> Instant {
+        self.at_offset(self.activity.last_client_ns.load(Ordering::Relaxed))
+    }
+
+    fn last_backend_activity(&self) -> Instant {
+        self.at_offset(self.activity.last_backend_ns.load(Ordering::Relaxed))
     }
 
     fn last_activity(&self) -> Instant {
-        let activity = lock_unpoisoned(&self.activity);
-        activity.last_client.max(activity.last_backend)
+        self.last_client_activity()
+            .max(self.last_backend_activity())
     }
 
     fn record_to_backend(&self, bytes: usize) {
@@ -178,7 +281,8 @@ impl Session {
     #[must_use]
     pub fn snapshot(&self) -> SessionSnapshot {
         let now = Instant::now();
-        let activity = lock_unpoisoned(&self.activity);
+        let last_client = self.last_client_activity();
+        let last_backend = self.last_backend_activity();
         SessionSnapshot {
             id: self.id,
             listener_id: self.listener_id,
@@ -187,15 +291,9 @@ impl Session {
             upstream_local_addr: self.upstream_local_addr,
             backend_addr: self.backend_addr,
             age_ms: duration_millis(now.saturating_duration_since(self.created_at)),
-            idle_ms: duration_millis(
-                now.saturating_duration_since(activity.last_client.max(activity.last_backend)),
-            ),
-            last_client_activity_ms: duration_millis(
-                now.saturating_duration_since(activity.last_client),
-            ),
-            last_backend_activity_ms: duration_millis(
-                now.saturating_duration_since(activity.last_backend),
-            ),
+            idle_ms: duration_millis(now.saturating_duration_since(last_client.max(last_backend))),
+            last_client_activity_ms: duration_millis(now.saturating_duration_since(last_client)),
+            last_backend_activity_ms: duration_millis(now.saturating_duration_since(last_backend)),
             packets_to_backend: self.packets_to_backend.load(Ordering::Relaxed),
             packets_to_client: self.packets_to_client.load(Ordering::Relaxed),
             bytes_to_backend: self.bytes_to_backend.load(Ordering::Relaxed),
@@ -223,21 +321,51 @@ pub struct SessionSnapshot {
     pub bytes_to_client: u64,
 }
 
-/// Sender and cancellation handle stored in the session table.
+/// Forwarding state stored in the session table.
+///
+/// The listener sends a client datagram directly on the session's connected
+/// upstream socket when nothing is queued ahead of it. Only when that socket
+/// cannot accept the datagram immediately is the datagram copied into the
+/// bounded per-session queue that the session task drains. Because one
+/// listener task is the only producer for a session, sending directly only
+/// while `pending` is zero preserves client datagram order.
 #[derive(Debug)]
 pub struct SessionHandle {
     session: Arc<Session>,
-    client_datagrams: Sender<Vec<u8>>,
+    upstream: Arc<UdpSocket>,
+    client_datagrams: Sender<QueuedDatagram>,
+    /// Client datagrams queued or being sent by the session task.
+    pending: AtomicUsize,
+    queue_budget: Arc<QueueBudget>,
     cancel: CancellationToken,
+}
+
+/// What happened to one client datagram offered to a session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardOutcome {
+    /// Sent directly on the upstream socket.
+    Sent,
+    /// Queued for the session task because the upstream socket was busy or
+    /// earlier datagrams were still queued.
+    Queued,
+    /// Discarded and counted.
+    Dropped(DropReason),
 }
 
 impl SessionHandle {
     #[cfg(test)]
     pub(super) fn for_test(session: Session) -> Arc<Self> {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
+        socket
+            .set_nonblocking(true)
+            .expect("make test socket nonblocking");
         let (client_datagrams, _receiver) = mpsc::channel(1);
         Arc::new(Self {
             session: Arc::new(session),
+            upstream: Arc::new(UdpSocket::from_std(socket).expect("register test socket")),
             client_datagrams,
+            pending: AtomicUsize::new(0),
+            queue_budget: QueueBudget::new(usize::MAX),
             cancel: CancellationToken::new(),
         })
     }
@@ -247,27 +375,86 @@ impl SessionHandle {
         &self.session
     }
 
-    /// Queue an already size-validated client datagram without waiting.
-    pub fn try_send(&self, datagram: Vec<u8>) -> Result<(), QueueError> {
+    /// Forwards an already size-validated client datagram without waiting.
+    ///
+    /// All success, drop, and error accounting happens here. This never blocks
+    /// the listener's receive loop.
+    pub fn forward_from_client(
+        &self,
+        datagram: &[u8],
+        metrics: &Metrics,
+        listener_counters: &ListenerCounters,
+        log_limiter: &LogRateLimiter,
+    ) -> ForwardOutcome {
         self.session.touch_client();
-        self.client_datagrams
-            .try_send(datagram)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => QueueError::Full,
-                TrySendError::Closed(_) => QueueError::Closed,
-            })
+        if self.cancel.is_cancelled() {
+            record_drop(metrics, listener_counters, DropReason::SessionClosed);
+            return ForwardOutcome::Dropped(DropReason::SessionClosed);
+        }
+
+        if self.pending.load(Ordering::Acquire) == 0 {
+            match self.upstream.try_send(datagram) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => {
+                    return if record_backend_send(
+                        &self.session,
+                        datagram.len(),
+                        result,
+                        metrics,
+                        listener_counters,
+                        log_limiter,
+                    ) {
+                        ForwardOutcome::Sent
+                    } else {
+                        ForwardOutcome::Dropped(DropReason::SendError)
+                    };
+                }
+            }
+        }
+
+        match self.enqueue(datagram) {
+            Ok(()) => ForwardOutcome::Queued,
+            Err(reason) => {
+                record_drop(metrics, listener_counters, reason);
+                if reason == DropReason::QueueFull && log_limiter.should_log("session-queue-full") {
+                    warn!(
+                        listener = %self.session.listener_name,
+                        session_id = %self.session.id,
+                        queued_bytes = self.queue_budget.used(),
+                        "session queue full; dropping client datagram"
+                    );
+                }
+                ForwardOutcome::Dropped(reason)
+            }
+        }
+    }
+
+    fn enqueue(&self, datagram: &[u8]) -> Result<(), DropReason> {
+        let reservation = self
+            .queue_budget
+            .try_reserve(datagram.len())
+            .ok_or(DropReason::QueueFull)?;
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let queued = QueuedDatagram {
+            payload: datagram.to_vec(),
+            _reservation: reservation,
+        };
+        self.client_datagrams.try_send(queued).map_err(|error| {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            match error {
+                TrySendError::Full(_) => DropReason::QueueFull,
+                TrySendError::Closed(_) => DropReason::SessionClosed,
+            }
+        })
+    }
+
+    fn finish_pending(&self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
     }
 
     pub fn close(&self) {
         self.cancel.cancel();
     }
-}
-
-/// A bounded session queue refused a datagram.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueueError {
-    Full,
-    Closed,
 }
 
 /// Why a session task exited.
@@ -289,6 +476,8 @@ pub struct SessionLaunch {
     pub listener_counters: Arc<ListenerCounters>,
     pub idle_timeout: watch::Receiver<Duration>,
     pub max_datagram_size: Arc<AtomicUsize>,
+    pub queue_depth: usize,
+    pub queue_budget: Arc<QueueBudget>,
     pub parent_cancel: CancellationToken,
     pub tracker: TaskTracker,
     pub log_limiter: Arc<LogRateLimiter>,
@@ -296,113 +485,186 @@ pub struct SessionLaunch {
 
 /// Inserts and starts one long-lived session task.
 pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, AdmissionLease> {
-    let (sender, receiver) = mpsc::channel(SESSION_QUEUE_CAPACITY);
-    let cancel = launch.parent_cancel.child_token();
+    let SessionLaunch {
+        session,
+        first_datagram,
+        upstream,
+        listener_socket,
+        table,
+        admission,
+        metrics,
+        listener_counters,
+        idle_timeout,
+        max_datagram_size,
+        queue_depth,
+        queue_budget,
+        parent_cancel,
+        tracker,
+        log_limiter,
+    } = launch;
+    let (sender, receiver) = mpsc::channel(queue_depth.max(1));
+    let cancel = parent_cancel.child_token();
     let handle = Arc::new(SessionHandle {
-        session: Arc::clone(&launch.session),
+        session: Arc::clone(&session),
+        upstream: Arc::new(upstream),
         client_datagrams: sender,
+        // The first datagram is in flight in the session task, so later
+        // datagrams must queue behind it until it has been sent.
+        pending: AtomicUsize::new(1),
+        queue_budget,
         cancel: cancel.clone(),
     });
 
-    if launch.table.insert(Arc::clone(&handle)).is_err() {
-        return Err(launch.admission);
+    if table.insert(Arc::clone(&handle)).is_err() {
+        return Err(admission);
     }
 
-    launch.metrics.session_created();
-    launch.listener_counters.session_started();
+    metrics.session_created();
+    listener_counters.session_started();
 
+    let task = SessionTask {
+        first_datagram,
+        listener_socket,
+        table,
+        admission,
+        metrics,
+        listener_counters,
+        idle_timeout,
+        max_datagram_size,
+        log_limiter,
+    };
     let task_handle = Arc::clone(&handle);
-    launch.tracker.clone().spawn(async move {
-        run_session(task_handle, receiver, cancel, launch).await;
+    tracker.spawn(async move {
+        run_session(task_handle, receiver, cancel, task).await;
     });
     Ok(handle)
 }
 
+/// Resources owned by a running session task.
+struct SessionTask {
+    first_datagram: Vec<u8>,
+    listener_socket: Arc<UdpSocket>,
+    table: Arc<SessionTable>,
+    admission: AdmissionLease,
+    metrics: Arc<Metrics>,
+    listener_counters: Arc<ListenerCounters>,
+    idle_timeout: watch::Receiver<Duration>,
+    max_datagram_size: Arc<AtomicUsize>,
+    log_limiter: Arc<LogRateLimiter>,
+}
+
 async fn run_session(
     handle: Arc<SessionHandle>,
-    mut receiver: Receiver<Vec<u8>>,
+    mut receiver: Receiver<QueuedDatagram>,
     cancel: CancellationToken,
-    mut launch: SessionLaunch,
+    mut task: SessionTask,
 ) {
     let mut cleanup = SessionCleanup {
-        table: Arc::clone(&launch.table),
+        table: Arc::clone(&task.table),
         session: Arc::clone(&handle.session),
-        admission: Some(launch.admission),
-        metrics: Arc::clone(&launch.metrics),
-        listener_counters: Arc::clone(&launch.listener_counters),
+        admission: Some(task.admission),
+        metrics: Arc::clone(&task.metrics),
+        listener_counters: Arc::clone(&task.listener_counters),
         reason: SessionCloseReason::Closed,
     };
-    let mut backend_buffer = vec![0_u8; launch.max_datagram_size.load(Ordering::Relaxed) + 1];
+    let upstream = Arc::clone(&handle.upstream);
+    let mut backend_buffer = vec![0_u8; task.max_datagram_size.load(Ordering::Relaxed) + 1];
 
     tokio::select! {
         biased;
         () = cancel.cancelled() => return,
         () = send_to_backend(
             &handle.session,
-            &launch.upstream,
-            &launch.first_datagram,
-            &launch.metrics,
-            &launch.listener_counters,
-            &launch.log_limiter,
+            &upstream,
+            &task.first_datagram,
+            &task.metrics,
+            &task.listener_counters,
+            &task.log_limiter,
         ) => {}
     }
+    task.first_datagram = Vec::new();
+    handle.finish_pending();
 
-    loop {
-        let max_size = launch.max_datagram_size.load(Ordering::Relaxed);
+    // The idle deadline is armed once and only recomputed when it fires or
+    // the configured timeout changes, so packet forwarding does not touch the
+    // timer wheel.
+    let mut idle_timeout = *task.idle_timeout.borrow_and_update();
+    let idle_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
+        handle.session.last_activity() + idle_timeout,
+    ));
+    tokio::pin!(idle_sleep);
+
+    'session: loop {
+        let max_size = task.max_datagram_size.load(Ordering::Relaxed);
         if backend_buffer.len() != max_size.saturating_add(1) {
             backend_buffer.resize(max_size.saturating_add(1), 0);
         }
-        let idle_timeout = *launch.idle_timeout.borrow_and_update();
-        let elapsed = Instant::now().saturating_duration_since(handle.session.last_activity());
-        let idle_sleep = tokio::time::sleep(idle_timeout.saturating_sub(elapsed));
-        tokio::pin!(idle_sleep);
 
         tokio::select! {
             () = cancel.cancelled() => break,
-            changed = launch.idle_timeout.changed() => {
+            changed = task.idle_timeout.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                continue;
+                idle_timeout = *task.idle_timeout.borrow_and_update();
+                idle_sleep.as_mut().reset(tokio::time::Instant::from_std(
+                    handle.session.last_activity() + idle_timeout,
+                ));
             }
             datagram = receiver.recv() => {
-                let Some(datagram) = datagram else {
+                let Some(mut datagram) = datagram else {
                     break;
                 };
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => break,
-                    () = send_to_backend(
-                        &handle.session,
-                        &launch.upstream,
-                        &datagram,
-                        &launch.metrics,
-                        &launch.listener_counters,
-                        &launch.log_limiter,
-                    ) => {}
+                let mut drained = 0;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => break 'session,
+                        () = send_to_backend(
+                            &handle.session,
+                            &upstream,
+                            &datagram.payload,
+                            &task.metrics,
+                            &task.listener_counters,
+                            &task.log_limiter,
+                        ) => {}
+                    }
+                    drop(datagram);
+                    handle.finish_pending();
+                    drained += 1;
+                    if drained >= QUEUE_DRAIN_BATCH {
+                        break;
+                    }
+                    match receiver.try_recv() {
+                        Ok(next) => datagram = next,
+                        Err(_) => break,
+                    }
                 }
             }
-            received = launch.upstream.recv(&mut backend_buffer) => {
+            received = upstream.recv(&mut backend_buffer) => {
                 match received {
                     Ok(size) if size <= max_size => {
                         // Backend activity is independent of whether the local
                         // client send succeeds.
                         handle.session.touch_backend();
                         let payload = &backend_buffer[..size];
-                        match launch.listener_socket.send_to(
+                        match task.listener_socket.send_to(
                             payload,
                             handle.session.client_addr,
                         ).await {
                             Ok(sent) if sent == size => {
                                 handle.session.record_to_client(size);
-                                launch.listener_counters.to_client(size);
-                                launch.metrics.packet_to_client(size);
+                                task.listener_counters.to_client(size);
+                                task.metrics.packet_to_client(size);
                             }
                             Ok(sent) => {
-                                launch.metrics.socket_error();
-                                launch.metrics.datagram_dropped();
-                                launch.listener_counters.dropped();
-                                if launch.log_limiter.should_log("partial-client-send") {
+                                task.metrics.socket_error();
+                                record_drop(
+                                    &task.metrics,
+                                    &task.listener_counters,
+                                    DropReason::SendError,
+                                );
+                                if task.log_limiter.should_log("partial-client-send") {
                                     warn!(
                                         session_id = %handle.session.id,
                                         expected = size,
@@ -412,10 +674,13 @@ async fn run_session(
                                 }
                             }
                             Err(error) => {
-                                launch.metrics.socket_error();
-                                launch.metrics.datagram_dropped();
-                                launch.listener_counters.dropped();
-                                if launch.log_limiter.should_log("client-send-error") {
+                                task.metrics.socket_error();
+                                record_drop(
+                                    &task.metrics,
+                                    &task.listener_counters,
+                                    DropReason::SendError,
+                                );
+                                if task.log_limiter.should_log("client-send-error") {
                                     warn!(
                                         session_id = %handle.session.id,
                                         %error,
@@ -426,12 +691,11 @@ async fn run_session(
                         }
                     }
                     Ok(_) => {
-                        launch.metrics.datagram_dropped();
-                        launch.listener_counters.dropped();
+                        record_drop(&task.metrics, &task.listener_counters, DropReason::Oversize);
                     }
                     Err(error) => {
-                        launch.metrics.socket_error();
-                        if launch.log_limiter.should_log("upstream-recv-error") {
+                        task.metrics.socket_error();
+                        if task.log_limiter.should_log("upstream-recv-error") {
                             warn!(
                                 session_id = %handle.session.id,
                                 %error,
@@ -443,13 +707,14 @@ async fn run_session(
                 }
             }
             () = &mut idle_sleep => {
-                let current_timeout = *launch.idle_timeout.borrow_and_update();
-                if Instant::now().saturating_duration_since(handle.session.last_activity())
-                    >= current_timeout
-                {
+                let deadline = handle.session.last_activity() + idle_timeout;
+                if Instant::now() >= deadline {
                     cleanup.reason = SessionCloseReason::Idle;
                     break;
                 }
+                idle_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::from_std(deadline));
             }
         }
     }
@@ -469,29 +734,49 @@ async fn send_to_backend(
     listener_counters: &ListenerCounters,
     log_limiter: &LogRateLimiter,
 ) {
-    match upstream.send(datagram).await {
-        Ok(sent) if sent == datagram.len() => {
+    let result = upstream.send(datagram).await;
+    record_backend_send(
+        session,
+        datagram.len(),
+        result,
+        metrics,
+        listener_counters,
+        log_limiter,
+    );
+}
+
+/// Accounts for one client-to-backend send and reports whether it succeeded.
+fn record_backend_send(
+    session: &Session,
+    expected: usize,
+    result: io::Result<usize>,
+    metrics: &Metrics,
+    listener_counters: &ListenerCounters,
+    log_limiter: &LogRateLimiter,
+) -> bool {
+    match result {
+        Ok(sent) if sent == expected => {
             session.record_to_backend(sent);
             listener_counters.to_backend(sent);
             metrics.packet_to_backend(sent);
+            true
         }
         Ok(sent) => {
             metrics.socket_error();
-            metrics.datagram_dropped();
-            listener_counters.dropped();
+            record_drop(metrics, listener_counters, DropReason::SendError);
             if log_limiter.should_log("partial-backend-send") {
                 warn!(
                     session_id = %session.id,
-                    expected = datagram.len(),
+                    expected,
                     sent,
                     "UDP send reported a partial datagram"
                 );
             }
+            false
         }
         Err(error) => {
             metrics.socket_error();
-            metrics.datagram_dropped();
-            listener_counters.dropped();
+            record_drop(metrics, listener_counters, DropReason::SendError);
             if log_limiter.should_log("backend-send-error") {
                 warn!(
                     session_id = %session.id,
@@ -499,6 +784,7 @@ async fn send_to_backend(
                     "failed to send client datagram to backend"
                 );
             }
+            false
         }
     }
 }
@@ -530,15 +816,153 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Harness {
+        handle: Arc<SessionHandle>,
+        receiver: Receiver<QueuedDatagram>,
+        backend: UdpSocket,
+        metrics: Metrics,
+        counters: ListenerCounters,
+        log_limiter: LogRateLimiter,
+        budget: Arc<QueueBudget>,
+    }
+
+    async fn harness(capacity: usize, pending: usize, budget_bytes: usize) -> Harness {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        upstream
+            .connect(backend.local_addr().unwrap())
+            .await
+            .unwrap();
+        let session = Session::new(
+            ListenerId::new(1),
+            "test".to_owned(),
+            "127.0.0.1:40000".parse().unwrap(),
+            upstream.local_addr().unwrap(),
+            backend.local_addr().unwrap(),
+        );
+        let (client_datagrams, receiver) = mpsc::channel(capacity);
+        let budget = QueueBudget::new(budget_bytes);
+        let handle = Arc::new(SessionHandle {
+            session: Arc::new(session),
+            upstream: Arc::new(upstream),
+            client_datagrams,
+            pending: AtomicUsize::new(pending),
+            queue_budget: Arc::clone(&budget),
+            cancel: CancellationToken::new(),
+        });
+        Harness {
+            handle,
+            receiver,
+            backend,
+            metrics: Metrics::default(),
+            counters: ListenerCounters::default(),
+            log_limiter: LogRateLimiter::new(Duration::from_secs(60)),
+            budget,
+        }
+    }
+
+    impl Harness {
+        fn forward(&self, datagram: &[u8]) -> ForwardOutcome {
+            self.handle.forward_from_client(
+                datagram,
+                &self.metrics,
+                &self.counters,
+                &self.log_limiter,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_upstream_sends_directly_without_queueing() {
+        let harness = harness(4, 0, usize::MAX).await;
+        // A freshly registered socket may not have reported writability yet;
+        // either outcome is valid, and a queued datagram must stay queued.
+        let outcome = harness.forward(b"direct");
+        let mut buffer = [0_u8; 16];
+        match outcome {
+            ForwardOutcome::Sent => {
+                let size =
+                    tokio::time::timeout(Duration::from_secs(5), harness.backend.recv(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(&buffer[..size], b"direct");
+                assert_eq!(harness.metrics.snapshot().packets_to_backend_total, 1);
+                assert_eq!(harness.handle.pending.load(Ordering::Acquire), 0);
+            }
+            ForwardOutcome::Queued => {
+                assert_eq!(harness.handle.pending.load(Ordering::Acquire), 1);
+            }
+            ForwardOutcome::Dropped(reason) => panic!("unexpected drop: {reason:?}"),
+        }
+        assert_eq!(harness.metrics.snapshot().datagrams_dropped_total, 0);
+    }
+
+    #[tokio::test]
+    async fn datagrams_queue_behind_pending_work_to_preserve_order() {
+        let mut harness = harness(4, 1, usize::MAX).await;
+        assert_eq!(harness.forward(b"first"), ForwardOutcome::Queued);
+        assert_eq!(harness.forward(b"second"), ForwardOutcome::Queued);
+        assert_eq!(harness.receiver.try_recv().unwrap().payload, b"first");
+        assert_eq!(harness.receiver.try_recv().unwrap().payload, b"second");
+        assert_eq!(harness.metrics.snapshot().packets_to_backend_total, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_is_counted_as_queue_full() {
+        let harness = harness(2, 1, usize::MAX).await;
+        assert_eq!(harness.forward(b"one"), ForwardOutcome::Queued);
+        assert_eq!(harness.forward(b"two"), ForwardOutcome::Queued);
+        assert_eq!(
+            harness.forward(b"three"),
+            ForwardOutcome::Dropped(DropReason::QueueFull)
+        );
+        let stats = harness.metrics.snapshot();
+        assert_eq!(stats.datagrams_dropped_total, 1);
+        assert_eq!(stats.datagrams_dropped.queue_full, 1);
+        assert_eq!(stats.datagrams_dropped.oversize, 0);
+        let listener = harness.counters.snapshot();
+        assert_eq!(listener.dropped, 1);
+        assert_eq!(listener.datagrams_dropped.queue_full, 1);
+        // The failed enqueue must not leave a phantom pending datagram.
+        assert_eq!(harness.handle.pending.load(Ordering::Acquire), 3);
+    }
+
+    #[tokio::test]
+    async fn queue_memory_budget_uses_actual_sizes_and_is_released() {
+        let mut harness = harness(16, 1, 100).await;
+        assert_eq!(harness.forward(&[1; 60]), ForwardOutcome::Queued);
+        assert_eq!(harness.budget.used(), 60);
+        assert_eq!(
+            harness.forward(&[2; 60]),
+            ForwardOutcome::Dropped(DropReason::QueueFull)
+        );
+        assert_eq!(harness.forward(&[3; 40]), ForwardOutcome::Queued);
+        assert_eq!(harness.budget.used(), 100);
+        drop(harness.receiver.try_recv().unwrap());
+        assert_eq!(harness.budget.used(), 40);
+        harness.receiver.close();
+        while harness.receiver.try_recv().is_ok() {}
+        assert_eq!(harness.budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_sessions_count_session_closed_drops() {
+        let harness = harness(4, 0, usize::MAX).await;
+        harness.handle.close();
+        assert_eq!(
+            harness.forward(b"late"),
+            ForwardOutcome::Dropped(DropReason::SessionClosed)
+        );
+        assert_eq!(
+            harness.metrics.snapshot().datagrams_dropped.session_closed,
+            1
+        );
+    }
 
     #[test]
     fn snapshots_report_both_direction_counters() {
