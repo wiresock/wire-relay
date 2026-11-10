@@ -13,12 +13,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   eight-datagram per-session queue. The listener now sends directly on the
   session's connected upstream socket and only queues when that socket is
   busy.
-- A closed session no longer keeps its route while it drains, so the next
-  datagram from the same client opens a new session instead of being dropped
-  as `session_closed`. A session task dropped before it first runs still
-  removes its table entry and gauges.
-- Datagrams a session drops no longer refresh its idle timer, so a client
-  sending only into a full queue or exhausted budget still idles out.
+- A closed session no longer keeps its route or admission slot while it
+  drains, so the next datagram from the same client opens a new session
+  instead of being dropped as `session_closed` or `rejected`, even with
+  `max_sessions_per_ip = 1`. The draining session still counts toward the
+  queue budget and session gauges until its task ends. A session task dropped
+  before it first runs still removes its table entry and gauges and counts its
+  unsent first datagram as `session_closed`.
+- Datagrams the relay drops itself (`queue_full`, `budget_exhausted`,
+  `session_closed`) no longer refresh a session's idle timer, so a client
+  sending only into a full queue or exhausted budget still idles out. Backend
+  send errors still count as client activity.
+- Sessions of a stopping listener reject datagrams immediately instead of
+  sending or queueing them until their tasks wake up.
 
 ### Added
 
@@ -44,7 +51,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Rate-limited log sites no longer take a process-wide lock or search by
-  name; each site has an enum-indexed atomic timestamp.
+  name; each site has an enum-indexed atomic timestamp, declared from one
+  list.
 - Replaced the repository-only management wrapper with the self-contained
   `wire-relay-install.sh`, which supports reviewed downloads and direct
   `curl | sudo bash` installation.

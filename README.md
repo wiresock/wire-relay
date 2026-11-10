@@ -278,9 +278,20 @@ nothing at all: for example 40,000 live sessions after a reload to
 reload applies, but the daemon logs a warning whenever the remainder is
 smaller than one `max_datagram_size` datagram plus its 64-byte overhead, and
 datagrams that have to queue are dropped as `budget_exhausted` until enough of
-those sessions end. Dropped datagrams do not count as client activity, so
+those sessions end. Datagrams the relay drops itself (`queue_full`,
+`budget_exhausted`, `session_closed`) do not count as client activity, so
 sessions whose clients only send into a full queue or exhausted budget still
-idle out and release their buffers.
+idle out and release their buffers. A send the OS refuses (`send_error`) does
+count, so a backend outage does not expire sessions whose clients keep
+sending.
+
+Closing a session (backend change, listener removal, `close-session`, idle
+expiry) releases its route and admission slot at once, so the client's next
+datagram opens a new session even with `max_sessions_per_ip = 1` or a full
+global limit. The old session keeps draining its queue and still counts as
+live in the queue budget, the session gauges, and `wire-relay sessions` until
+its task ends, so after a mass close and reopen the budget can briefly
+reserve receive buffers for both the old and the new sessions.
 
 The shared remainder can be small. With a high `max_sessions` and a large
 `max_datagram_size`, the fixed receive buffers take most of the 4 GiB, and a

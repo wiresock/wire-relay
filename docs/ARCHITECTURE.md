@@ -77,7 +77,11 @@ overhead from a process-wide queue memory budget: the defensive 4 GiB datagram
 budget minus the fixed receive buffers of `max(max_sessions, live sessions)`.
 The limit is not stored: every reservation derives it from the current
 `max_sessions` and `max_datagram_size` (updated on reload, after the admission
-limits) and an atomic live-session count kept by each session task. A reload
+limits) and an atomic live-session count kept by each session task. The budget
+holds the only runtime copy of `max_datagram_size`: listeners and sessions
+size their receive buffers from it, so one store publishes the new size and
+the budget shape that charges for it, and buffer sizing and the limit cannot
+disagree. A reload
 that shrinks `max_sessions` below the live count therefore lowers the limit
 only while the surplus sessions exist, and it returns to the steady-state
 budget as they end, without a recomputation that a concurrent reload or
@@ -93,7 +97,7 @@ valid. The reload still applies and logs a warning whenever the limit is below
 the charge of one `max_datagram_size` datagram; queued datagrams drop as
 `budget_exhausted` until enough sessions end. The limit formula, including
 the `max(live, max_sessions)` rule, lives in one function in `config.rs`,
-used by both the configuration helpers and the runtime budget.
+used by both the test-only configuration helpers and the runtime budget.
 
 The listener claims a queue slot before charging the budget or copying the
 datagram, so a full queue drops without either. A full per-session queue is
@@ -104,24 +108,33 @@ small, and a few back-pressured sessions can exhaust it so that other
 sessions drop as `budget_exhausted`.
 
 Rate-limited warnings use one atomic timestamp per log site, indexed by a
-`LogSite` enum, so the drop path neither locks nor searches to decide whether
-to log.
+`LogSite` enum declared from a single macro list (which also derives the slot
+count), so the drop path neither locks nor searches to decide whether to log.
 
 Closing a session (idle expiry, closed idle-timeout channel, explicit close,
 listener removal or backend change, shutdown) first unpublishes its routing
-entry, then sets an atomic flag the listener checks without locking and
-cancels the token the task waits on. The next datagram from the same client
-therefore finds no route and opens a new session (for example a WireGuard
-handshake retry after a backend change), while the old task still drains.
-Route removal is guarded by session ID, so a stale task never removes a newer
-session's route; the ID entry and gauges are removed by the task's cleanup. A
-listener that fetched the old handle just before the close drops the datagram
-as `session_closed` instead of sending on the exiting session's socket. The
-cleanup guard is created before the task is spawned, so a task dropped before
-its first poll still removes its entry, ends its gauges, and releases
-admission. The task then closes its queue and counts every datagram
-still in it, and an unsent first datagram, as `session_closed`; datagrams
-already sent are not counted. On idle timer expiry the task re-reads the
+entry and releases its admission lease, then sets an atomic flag the listener
+checks without locking and cancels the token the task waits on. The task
+closes its own session the moment it decides to stop, before draining. A
+stopping listener sets a shared flag before cancelling its token, and every
+session of that listener checks it on the hot path too, so no datagram is sent
+or queued after `stop` while the session tasks are still waking up.
+
+The next datagram from the same client therefore finds no route and is
+admitted as a new session even with a per-IP limit of one (for example a
+WireGuard handshake retry after a backend change), while the old task still
+drains. The draining session keeps its receive-buffer reservation, gauges, and
+ID entry until its task ends, so the queue budget stays conservative and can
+briefly count both incarnations. Route removal is guarded by session ID, so a
+stale task never removes a newer session's route, and the lease is released
+once. A listener that fetched the old handle just before the close drops the
+datagram as `session_closed` instead of sending on the exiting session's
+socket. The cleanup guard is created before the task is spawned, so a task
+dropped before its first poll still removes its entry, ends its gauges,
+releases admission, and counts its unsent first datagram. The task then
+closes its queue and counts every datagram still in it as `session_closed`;
+the unsent first datagram is counted once by the cleanup guard, and
+datagrams already sent are not counted. On idle timer expiry the task re-reads the
 current timeout before deciding to close.
 
 For a new session, the listener reserves global/per-IP/rate capacity before
@@ -165,8 +178,9 @@ kill sessions; it prevents new admission until use falls below the limit.
 A session receives a UUID identifier and immutable listener, client, selected
 backend, creation, and upstream-local information. Its counters are atomic.
 Client and backend activity both extend the idle deadline. Client activity
-counts only datagrams the session accepted (sent or queued); dropped ones do
-not extend it. There is no hard session lifetime.
+counts datagrams the session sent, queued, or tried to send (a refused or
+partial backend send still counts); datagrams the relay drops itself as
+`queue_full`, `budget_exhausted`, or `session_closed` do not extend it. There is no hard session lifetime.
 
 Creation follows this order:
 
