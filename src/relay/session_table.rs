@@ -10,13 +10,14 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{SessionHandle, SessionSnapshot};
+use super::{SessionHandle, SessionSnapshot, session::Expiry};
 
 /// Stable identity of one listener incarnation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -108,20 +109,19 @@ impl SessionTable {
     pub fn insert(&self, session: Arc<SessionHandle>) -> Result<(), Arc<SessionHandle>> {
         let key = session.session().key();
         let id = session.session().id;
-        match self.by_id.entry(id) {
-            dashmap::mapref::entry::Entry::Occupied(_) => return Err(session),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(&session));
-            }
-        }
-
+        // The route is claimed first and held while the ID entry is added,
+        // so a session that loses the key is never visible by ID, not even
+        // briefly, and a close found through the ID waits for the route.
         match self.by_key.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                self.by_id.remove(&id);
-                Err(session)
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(&session));
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(session),
+            dashmap::mapref::entry::Entry::Vacant(route) => {
+                match self.by_id.entry(id) {
+                    dashmap::mapref::entry::Entry::Occupied(_) => return Err(session),
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(Arc::clone(&session));
+                    }
+                }
+                route.insert(session);
                 self.count.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -162,6 +162,30 @@ impl SessionTable {
         // Covers a session whose route was already gone or never published.
         session.release_admission();
         session.close()
+    }
+
+    /// Expires an idle session: if it is still idle, its route, admission
+    /// lease, and forwarding path all go in one step under the route's shard
+    /// lock, so a listener either still reaches the open session or finds no
+    /// route and a free admission slot.
+    pub(super) fn expire(&self, session: &SessionHandle, idle_timeout: Duration) -> Expiry {
+        let id = session.session().id;
+        let mut outcome = None;
+        self.by_key
+            .remove_if(&session.session().key(), |_, current| {
+                if current.session().id != id {
+                    return false;
+                }
+                let expiry = session.try_expire(idle_timeout);
+                outcome = Some(expiry);
+                if expiry == Expiry::Expired {
+                    session.release_admission();
+                }
+                expiry == Expiry::Expired
+            });
+        // Without a route of its own the session was closed or never
+        // published; decide on the handle alone.
+        outcome.unwrap_or_else(|| session.try_expire(idle_timeout))
     }
 
     /// Removes the routing entry only if it still maps to `id`, so a stale
@@ -206,23 +230,21 @@ impl SessionTable {
     /// call closed; sessions that were already closed and are only still
     /// listed while their tasks stop are not counted again.
     pub fn close_listener(&self, listener_id: ListenerId) -> usize {
-        let sessions: Vec<_> = self
-            .by_id
-            .iter()
-            .filter(|entry| entry.session().listener_id == listener_id)
-            .map(|entry| Arc::clone(entry.value()))
-            .collect();
-        sessions
-            .iter()
-            .filter(|session| self.close(session))
-            .count()
+        self.close_where(|session| session.session().listener_id == listener_id)
     }
 
     /// Closes every active session and returns how many this call closed.
     pub fn close_all(&self) -> usize {
+        self.close_where(|_| true)
+    }
+
+    fn close_where(&self, mut selected: impl FnMut(&SessionHandle) -> bool) -> usize {
+        // Collected first: closing takes route locks, which must not nest
+        // inside the ID index's.
         let sessions: Vec<_> = self
             .by_id
             .iter()
+            .filter(|entry| selected(entry.value()))
             .map(|entry| Arc::clone(entry.value()))
             .collect();
         sessions
@@ -355,6 +377,20 @@ mod tests {
         assert_eq!(table.close_listener(ListenerId::new(7)), 1);
         assert!(table.get_by_key(&key).is_none());
         assert!(table.insert(test_session_handle()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_loses_its_key_is_never_listed() {
+        let table = SessionTable::new();
+        let current = test_session_handle();
+        assert!(table.insert(Arc::clone(&current)).is_ok());
+
+        let loser = test_session_handle();
+        let loser_id = loser.session().id;
+        assert!(table.insert(loser).is_err());
+        assert!(table.get_by_id(&loser_id).is_none());
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.close_all(), 1);
     }
 
     #[tokio::test]

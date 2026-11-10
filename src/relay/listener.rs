@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -104,7 +104,6 @@ impl PreparedListener {
             socket,
             resolver,
             cancel,
-            stopping: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(ListenerCounters::default()),
             sessions: Arc::clone(&context.sessions),
             route_epoch: AtomicU64::new(1),
@@ -127,8 +126,6 @@ pub struct ListenerHandle {
     socket: Arc<UdpSocket>,
     resolver: Arc<BackendResolver>,
     cancel: CancellationToken,
-    /// Set before `cancel`, so sessions see a stopping listener lock-free.
-    stopping: Arc<AtomicBool>,
     counters: Arc<ListenerCounters>,
     sessions: Arc<SessionTable>,
     route_epoch: AtomicU64,
@@ -194,9 +191,11 @@ impl ListenerHandle {
     pub fn stop(&self) -> usize {
         let _route_commit = lock_unpoisoned(&self.route_commit);
         self.route_epoch.fetch_add(1, Ordering::AcqRel);
-        self.stopping.store(true, Ordering::Release);
-        // Closed before the token is cancelled, so the count is not lowered
-        // by session tasks that see the cancellation and close themselves.
+        // Every session is closed before the token is cancelled, while the
+        // route lock keeps new ones from being launched: the listener's
+        // forwarding path refuses them at once, without waiting for their
+        // tasks to wake up, and the count is not lowered by tasks that see
+        // the cancellation and close themselves.
         let closed = self.sessions.close_listener(self.id);
         self.cancel.cancel();
         self.resolver.stop();
@@ -391,7 +390,6 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             queue_depth: context.session_queue_depth.load(Ordering::Relaxed),
             queue_budget: Arc::clone(&context.queue_budget),
             parent_cancel: handle.cancel.clone(),
-            parent_stopping: Arc::clone(&handle.stopping),
             tracker: context.tracker.clone(),
             log_limiter: Arc::clone(&context.log_limiter),
         };
@@ -406,10 +404,9 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
         }
         let launched = launch_session(launch);
         drop(route_commit);
-        if let Err(admission) = launched {
+        if launched.is_none() {
             // A newer mapping won the key race. This path is defensive because
             // one receive loop serializes session creation per listener.
-            drop(admission);
             context.metrics.session_rejected(false);
             record_drop(&context.metrics, &handle.counters, DropReason::Rejected);
         }
