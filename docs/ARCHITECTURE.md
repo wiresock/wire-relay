@@ -87,11 +87,13 @@ queued. A lowered limit applies immediately; new reservations fail until use
 drains below it. Live sessions resize their receive buffers to the reloaded
 `max_datagram_size`, so the limit charges live sessions at the new size: a
 reload that raises `max_datagram_size` under a large live population, or
-shrinks `max_sessions` far below the live count, can drive the limit to zero
-although the new configuration is valid. The reload still applies and logs a
-warning; queued datagrams drop as `budget_exhausted` until enough sessions
-end. The limit formula lives in one function in `config.rs`, used by both the
-configuration helpers and the runtime budget.
+shrinks `max_sessions` far below the live count, can drive the limit below
+one maximum-sized datagram, or to zero, although the new configuration is
+valid. The reload still applies and logs a warning whenever the limit is below
+the charge of one `max_datagram_size` datagram; queued datagrams drop as
+`budget_exhausted` until enough sessions end. The limit formula, including
+the `max(live, max_sessions)` rule, lives in one function in `config.rs`,
+used by both the configuration helpers and the runtime budget.
 
 The listener claims a queue slot before charging the budget or copying the
 datagram, so a full queue drops without either. A full per-session queue is
@@ -101,15 +103,23 @@ configuration (high `max_sessions` and large datagrams) the remainder can be
 small, and a few back-pressured sessions can exhaust it so that other
 sessions drop as `budget_exhausted`.
 
-Rate-limited warnings use one atomic timestamp per known log site, so the
-drop path never takes a lock to decide whether to log.
+Rate-limited warnings use one atomic timestamp per log site, indexed by a
+`LogSite` enum, so the drop path neither locks nor searches to decide whether
+to log.
 
-The session task closes its handle on every exit path (idle expiry, closed
-idle-timeout channel, explicit close, shutdown) before its table entry is
-removed: an atomic flag the listener checks without locking, plus the
-cancellation token the task waits on. A listener still holding the handle then
-drops later datagrams as `session_closed` instead of sending on the exiting
-session's socket. The task then closes its queue and counts every datagram
+Closing a session (idle expiry, closed idle-timeout channel, explicit close,
+listener removal or backend change, shutdown) first unpublishes its routing
+entry, then sets an atomic flag the listener checks without locking and
+cancels the token the task waits on. The next datagram from the same client
+therefore finds no route and opens a new session (for example a WireGuard
+handshake retry after a backend change), while the old task still drains.
+Route removal is guarded by session ID, so a stale task never removes a newer
+session's route; the ID entry and gauges are removed by the task's cleanup. A
+listener that fetched the old handle just before the close drops the datagram
+as `session_closed` instead of sending on the exiting session's socket. The
+cleanup guard is created before the task is spawned, so a task dropped before
+its first poll still removes its entry, ends its gauges, and releases
+admission. The task then closes its queue and counts every datagram
 still in it, and an unsent first datagram, as `session_closed`; datagrams
 already sent are not counted. On idle timer expiry the task re-reads the
 current timeout before deciding to close.
@@ -154,8 +164,9 @@ kill sessions; it prevents new admission until use falls below the limit.
 
 A session receives a UUID identifier and immutable listener, client, selected
 backend, creation, and upstream-local information. Its counters are atomic.
-Client and backend activity both extend the idle deadline. There is no hard
-session lifetime.
+Client and backend activity both extend the idle deadline. Client activity
+counts only datagrams the session accepted (sent or queued); dropped ones do
+not extend it. There is no hard session lifetime.
 
 Creation follows this order:
 

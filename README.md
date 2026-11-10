@@ -272,11 +272,15 @@ configured `max_sessions`. After a reload that lowers `max_sessions`, the
 shared remainder therefore grows back to the new configuration's full size
 only as the surplus sessions end. A reload that raises `max_datagram_size`
 while many sessions are live (or lowers `max_sessions` far below the live
-count) can leave no remainder at all, for example 40,000 live sessions after
-a reload to `max_datagram_size = 65507`. Such a configuration is still valid
-and the reload applies, but the daemon logs a warning, and every datagram
-that would be queued is dropped as `budget_exhausted` until enough of those
-sessions end.
+count) can leave too little for even one maximum-sized queued datagram, or
+nothing at all: for example 40,000 live sessions after a reload to
+`max_datagram_size = 65507`. Such a configuration is still valid and the
+reload applies, but the daemon logs a warning whenever the remainder is
+smaller than one `max_datagram_size` datagram plus its 64-byte overhead, and
+datagrams that have to queue are dropped as `budget_exhausted` until enough of
+those sessions end. Dropped datagrams do not count as client activity, so
+sessions whose clients only send into a full queue or exhausted budget still
+idle out and release their buffers.
 
 The shared remainder can be small. With a high `max_sessions` and a large
 `max_datagram_size`, the fixed receive buffers take most of the 4 GiB, and a
