@@ -243,7 +243,7 @@ impl Runtime {
             idle_timeout,
             max_datagram_size: Arc::new(AtomicUsize::new(config.service.max_datagram_size)),
             session_queue_depth: Arc::new(AtomicUsize::new(config.service.session_queue_depth)),
-            queue_budget: QueueBudget::new(config.service.queued_datagram_budget()),
+            queue_budget: QueueBudget::new(&config.service),
             dns_refresh_interval_ms: Arc::new(AtomicU64::new(duration_millis_nonzero(
                 config.service.dns_refresh_interval,
             ))),
@@ -591,23 +591,20 @@ impl RuntimeCore {
             .store(new_config.service.max_datagram_size, Ordering::Relaxed);
         self.session_queue_depth
             .store(new_config.service.session_queue_depth, Ordering::Relaxed);
-        // Sessions admitted under the previous limits keep their receive
-        // buffers, so reserve fixed memory for them even if `max_sessions`
-        // shrinks; queued datagrams get only what remains.
-        let live_sessions = self.admission.active().max(self.sessions.len());
-        self.queue_budget.set_limit(
-            new_config
-                .service
-                .queued_datagram_budget_with_live_sessions(live_sessions),
-        );
-        self.dns_refresh_interval_ms.store(
-            duration_millis_nonzero(new_config.service.dns_refresh_interval),
-            Ordering::Relaxed,
-        );
+        // Apply the new admission limits before the queue budget so no
+        // session is admitted under the old limits after the budget changes.
         self.admission.update(
             new_config.service.max_sessions,
             new_config.service.max_sessions_per_ip,
             new_config.service.new_sessions_per_second,
+        );
+        // The budget derives its limit from the live session count on every
+        // reservation, so sessions admitted under the previous limits keep
+        // their receive buffers reserved, and the limit recovers as they end.
+        self.queue_budget.configure(&new_config.service);
+        self.dns_refresh_interval_ms.store(
+            duration_millis_nonzero(new_config.service.dns_refresh_interval),
+            Ordering::Relaxed,
         );
 
         let refresh_interval = new_config.service.dns_refresh_interval;
@@ -1124,13 +1121,52 @@ mod tests {
         listener: std::net::SocketAddr,
         backend: std::net::SocketAddr,
         max_sessions: usize,
+        idle_timeout: &str,
     ) -> String {
         format!(
             "[service]\nmax_datagram_size = 4096\nmax_sessions = {max_sessions}\n\
              max_sessions_per_ip = {max_sessions}\nnew_sessions_per_second = 1000\n\
-             shutdown_timeout = \"3s\"\n\n[[listeners]]\nname = \"budget\"\n\
-             bind = \"{listener}\"\nbackend = \"{backend}\"\n"
+             idle_timeout = \"{idle_timeout}\"\nshutdown_timeout = \"3s\"\n\n\
+             [[listeners]]\nname = \"budget\"\nbind = \"{listener}\"\n\
+             backend = \"{backend}\"\n"
         )
+    }
+
+    /// Starts a runtime on a free listener port, retrying when another
+    /// process takes the probed port before the runtime binds it.
+    async fn start_budget_runtime(
+        path: &std::path::Path,
+        backend: std::net::SocketAddr,
+        max_sessions: usize,
+    ) -> (Runtime, std::net::SocketAddr) {
+        const ATTEMPTS: usize = 10;
+        let mut last_error = None;
+        for _ in 0..ATTEMPTS {
+            let listener_addr = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let text = queue_budget_test_config(listener_addr, backend, max_sessions, "5m");
+            std::fs::write(path, &text).unwrap();
+            let config = crate::config::Config::parse_str(&text)
+                .unwrap()
+                .into_normalized()
+                .unwrap();
+            match Runtime::start_with_options(
+                config,
+                path,
+                RuntimeOptions {
+                    control: false,
+                    metrics: false,
+                },
+            )
+            .await
+            {
+                Ok(runtime) => return (runtime, listener_addr),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        panic!("failed to start the runtime after {ATTEMPTS} port attempts: {last_error:?}");
     }
 
     #[tokio::test]
@@ -1139,26 +1175,7 @@ mod tests {
         let path = directory.path().join("config.toml");
         let backend = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend.local_addr().unwrap();
-        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let listener_addr = listener.local_addr().unwrap();
-        drop(listener);
-
-        let text = queue_budget_test_config(listener_addr, backend_addr, 4);
-        std::fs::write(&path, &text).unwrap();
-        let config = crate::config::Config::parse_str(&text)
-            .unwrap()
-            .into_normalized()
-            .unwrap();
-        let runtime = Runtime::start_with_options(
-            config,
-            &path,
-            RuntimeOptions {
-                control: false,
-                metrics: false,
-            },
-        )
-        .await
-        .unwrap();
+        let (runtime, listener_addr) = start_budget_runtime(&path, backend_addr, 4).await;
 
         let mut clients = Vec::new();
         for _ in 0..3 {
@@ -1174,7 +1191,9 @@ mod tests {
         .await
         .expect("three sessions must start");
 
-        let lowered = queue_budget_test_config(listener_addr, backend_addr, 1);
+        // Lower `max_sessions` below the live count and let the surplus
+        // sessions expire soon after the reload.
+        let lowered = queue_budget_test_config(listener_addr, backend_addr, 1, "300ms");
         std::fs::write(&path, &lowered).unwrap();
         let result = runtime.reload().await.unwrap();
         assert!(result.applied, "{}", result.message);
@@ -1189,10 +1208,25 @@ mod tests {
         let expected =
             usize::try_from(crate::config::MAX_SESSION_DATAGRAM_MEMORY_BYTES - 3 * per_session)
                 .unwrap();
+        assert_eq!(runtime.core.queue_budget.live_sessions(), 3);
         assert_eq!(runtime.core.queue_budget.limit(), expected);
         assert!(
             runtime.core.queue_budget.limit() < new_service.queued_datagram_budget(),
             "live sessions above the new limit must keep their buffer reservation"
+        );
+
+        // Once the surplus sessions end, the limit must return to the
+        // steady-state budget for the new configuration.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !runtime.sessions().is_empty() || runtime.core.queue_budget.live_sessions() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sessions must expire under the lowered idle timeout");
+        assert_eq!(
+            runtime.core.queue_budget.limit(),
+            new_service.queued_datagram_budget()
         );
 
         runtime.shutdown().await.unwrap();

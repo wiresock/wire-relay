@@ -7,7 +7,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -24,7 +24,10 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug, warn};
 
 use crate::{
-    config::QUEUED_DATAGRAM_OVERHEAD_BYTES,
+    config::{
+        MAX_SESSION_DATAGRAM_MEMORY_BYTES, QUEUED_DATAGRAM_OVERHEAD_BYTES,
+        SESSION_FIXED_DATAGRAM_BUFFERS, ServiceConfig,
+    },
     limits::{AdmissionLease, LogRateLimiter},
     metrics::{DropCounters, DropReason, DropSnapshot, Metrics},
 };
@@ -43,7 +46,6 @@ pub struct ListenerCounters {
     packets_to_client: AtomicU64,
     bytes_to_backend: AtomicU64,
     bytes_to_client: AtomicU64,
-    dropped: AtomicU64,
     drops: DropCounters,
 }
 
@@ -69,20 +71,21 @@ impl ListenerCounters {
     }
 
     pub fn dropped(&self, reason: DropReason) {
-        self.dropped.fetch_add(1, Ordering::Relaxed);
         self.drops.record(reason);
     }
 
     #[must_use]
     pub fn snapshot(&self) -> ListenerCounterSnapshot {
+        let datagrams_dropped = self.drops.snapshot();
         ListenerCounterSnapshot {
             active_sessions: self.active_sessions.load(Ordering::Relaxed),
             packets_to_backend: self.packets_to_backend.load(Ordering::Relaxed),
             packets_to_client: self.packets_to_client.load(Ordering::Relaxed),
             bytes_to_backend: self.bytes_to_backend.load(Ordering::Relaxed),
             bytes_to_client: self.bytes_to_client.load(Ordering::Relaxed),
-            dropped: self.dropped.load(Ordering::Relaxed),
-            datagrams_dropped: self.drops.snapshot(),
+            // Derived from the breakdown so the two can never disagree.
+            dropped: datagrams_dropped.total(),
+            datagrams_dropped,
         }
     }
 }
@@ -112,26 +115,70 @@ pub fn record_drop(metrics: &Metrics, listener_counters: &ListenerCounters, reas
 /// Each reservation is charged with the datagram's actual length plus
 /// [`QUEUED_DATAGRAM_OVERHEAD_BYTES`], so even empty datagrams consume budget,
 /// and is released when the queued datagram is dropped, whether it was sent
-/// or discarded during session teardown. A limit lowered below current use
-/// still applies: new reservations fail until enough queued datagrams drain.
+/// or discarded during session teardown.
+///
+/// The limit is not stored; every reservation derives it from the current
+/// configuration and live session count: the defensive datagram budget minus
+/// fixed receive buffers for `max(live sessions, max_sessions)`. A reload that
+/// lowers `max_sessions` therefore keeps buffers reserved for surplus live
+/// sessions, and the limit rises back to the steady-state budget as they end,
+/// without a separate recomputation that concurrent session ends or reloads
+/// could leave stale. A limit below current use still applies: new
+/// reservations fail until enough queued datagrams drain.
 #[derive(Debug)]
 pub struct QueueBudget {
-    limit: AtomicUsize,
+    total: u64,
+    /// `max_sessions` in the high 32 bits and the fixed receive-buffer bytes
+    /// per session in the low 32 bits, published together by one store.
+    shape: AtomicU64,
+    live_sessions: AtomicUsize,
     used: AtomicUsize,
 }
 
 impl QueueBudget {
     #[must_use]
-    pub fn new(limit: usize) -> Arc<Self> {
+    pub fn new(service: &ServiceConfig) -> Arc<Self> {
         Arc::new(Self {
-            limit: AtomicUsize::new(limit),
+            total: u64::try_from(MAX_SESSION_DATAGRAM_MEMORY_BYTES).unwrap_or(u64::MAX),
+            shape: AtomicU64::new(Self::shape(service)),
+            live_sessions: AtomicUsize::new(0),
             used: AtomicUsize::new(0),
         })
     }
 
-    /// Applies a reloaded limit to subsequent reservations.
-    pub fn set_limit(&self, limit: usize) {
-        self.limit.store(limit, Ordering::Relaxed);
+    /// A budget with a fixed limit and no per-session reservation.
+    #[cfg(test)]
+    pub(crate) fn with_limit(limit: usize) -> Arc<Self> {
+        Self::for_test(limit, 0, 0)
+    }
+
+    /// A budget of `total` bytes reserving `per_session` bytes for each of
+    /// `max(live, max_sessions)` sessions.
+    #[cfg(test)]
+    pub(crate) fn for_test(total: usize, max_sessions: u32, per_session: u32) -> Arc<Self> {
+        Arc::new(Self {
+            total: u64::try_from(total).unwrap_or(u64::MAX),
+            shape: AtomicU64::new((u64::from(max_sessions) << 32) | u64::from(per_session)),
+            live_sessions: AtomicUsize::new(0),
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    fn shape(service: &ServiceConfig) -> u64 {
+        let per_session = u64::try_from(service.max_datagram_size)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(SESSION_FIXED_DATAGRAM_BUFFERS).unwrap_or(u64::MAX))
+            .saturating_add(1)
+            .min(u64::from(u32::MAX));
+        let max_sessions = u64::try_from(service.max_sessions)
+            .unwrap_or(u64::MAX)
+            .min(u64::from(u32::MAX));
+        (max_sessions << 32) | per_session
+    }
+
+    /// Applies reloaded limits to subsequent reservations.
+    pub fn configure(&self, service: &ServiceConfig) {
+        self.shape.store(Self::shape(service), Ordering::Release);
     }
 
     /// Bytes currently charged to queued datagrams.
@@ -140,10 +187,30 @@ impl QueueBudget {
         self.used.load(Ordering::Relaxed)
     }
 
+    /// Sessions currently holding receive buffers.
+    #[must_use]
+    pub fn live_sessions(&self) -> usize {
+        self.live_sessions.load(Ordering::Acquire)
+    }
+
     /// Current limit for queued datagrams.
     #[must_use]
     pub fn limit(&self) -> usize {
-        self.limit.load(Ordering::Relaxed)
+        let shape = self.shape.load(Ordering::Acquire);
+        let max_sessions = shape >> 32;
+        let per_session = shape & u64::from(u32::MAX);
+        let live = u64::try_from(self.live_sessions()).unwrap_or(u64::MAX);
+        let fixed = live.max(max_sessions).saturating_mul(per_session);
+        usize::try_from(self.total.saturating_sub(fixed)).unwrap_or(usize::MAX)
+    }
+
+    /// Counts one session's receive buffers until the guard is dropped.
+    #[must_use]
+    pub fn session_started(self: &Arc<Self>) -> LiveSession {
+        self.live_sessions.fetch_add(1, Ordering::AcqRel);
+        LiveSession {
+            budget: Arc::clone(self),
+        }
     }
 
     /// Budget charged for queueing one datagram of `payload_len` bytes.
@@ -154,7 +221,7 @@ impl QueueBudget {
 
     fn try_reserve(self: &Arc<Self>, payload_len: usize) -> Option<QueueReservation> {
         let bytes = Self::charge(payload_len);
-        let limit = self.limit.load(Ordering::Relaxed);
+        let limit = self.limit();
         let mut used = self.used.load(Ordering::Acquire);
         loop {
             let total = used.checked_add(bytes).filter(|total| *total <= limit)?;
@@ -170,6 +237,18 @@ impl QueueBudget {
             budget: Arc::clone(self),
             bytes,
         })
+    }
+}
+
+/// Keeps one live session's receive buffers reserved in a [`QueueBudget`].
+#[derive(Debug)]
+pub struct LiveSession {
+    budget: Arc<QueueBudget>,
+}
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        self.budget.live_sessions.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -361,6 +440,9 @@ pub struct SessionHandle {
     /// Client datagrams queued or being sent by the session task.
     pending: AtomicUsize,
     queue_budget: Arc<QueueBudget>,
+    /// Set with the cancellation token; checked on the listener hot path
+    /// because `CancellationToken::is_cancelled` takes a lock.
+    closed: AtomicBool,
     cancel: CancellationToken,
 }
 
@@ -377,7 +459,8 @@ impl SessionHandle {
             upstream: Arc::new(UdpSocket::from_std(socket).expect("register test socket")),
             client_datagrams,
             pending: AtomicUsize::new(0),
-            queue_budget: QueueBudget::new(usize::MAX),
+            queue_budget: QueueBudget::with_limit(usize::MAX),
+            closed: AtomicBool::new(false),
             cancel: CancellationToken::new(),
         })
     }
@@ -392,7 +475,7 @@ impl SessionHandle {
     /// All success, drop, and error accounting happens here. This never blocks
     /// the listener's receive loop.
     ///
-    /// The session task cancels its token on every exit path, so a handle
+    /// The session task closes the handle on every exit path, so a handle
     /// still held after the task decided to stop drops the datagram as
     /// `session_closed` instead of sending on a dying upstream socket. A
     /// datagram that passes this check just before the task exits can still
@@ -405,7 +488,7 @@ impl SessionHandle {
         log_limiter: &LogRateLimiter,
     ) {
         self.session.touch_client();
-        if self.cancel.is_cancelled() {
+        if self.closed.load(Ordering::Acquire) {
             record_drop(metrics, listener_counters, DropReason::SessionClosed);
             return;
         }
@@ -444,22 +527,25 @@ impl SessionHandle {
     }
 
     fn enqueue(&self, datagram: &[u8]) -> Result<(), DropReason> {
+        // Claim a queue slot first so a full or closed queue drops without
+        // copying the datagram or touching the shared budget.
+        let permit = self
+            .client_datagrams
+            .try_reserve()
+            .map_err(|error| match error {
+                TrySendError::Full(()) => DropReason::QueueFull,
+                TrySendError::Closed(()) => DropReason::SessionClosed,
+            })?;
         let reservation = self
             .queue_budget
             .try_reserve(datagram.len())
             .ok_or(DropReason::QueueFull)?;
         self.pending.fetch_add(1, Ordering::AcqRel);
-        let queued = QueuedDatagram {
+        permit.send(QueuedDatagram {
             payload: datagram.to_vec(),
             _reservation: reservation,
-        };
-        self.client_datagrams.try_send(queued).map_err(|error| {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
-            match error {
-                TrySendError::Full(_) => DropReason::QueueFull,
-                TrySendError::Closed(_) => DropReason::SessionClosed,
-            }
-        })
+        });
+        Ok(())
     }
 
     fn finish_pending(&self) {
@@ -467,6 +553,7 @@ impl SessionHandle {
     }
 
     pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         self.cancel.cancel();
     }
 }
@@ -526,21 +613,24 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
         // datagrams must queue behind it until it has been sent.
         pending: AtomicUsize::new(1),
         queue_budget,
+        closed: AtomicBool::new(false),
         cancel: cancel.clone(),
     });
 
     if table.insert(Arc::clone(&handle)).is_err() {
         return Err(admission);
     }
+    let live = handle.queue_budget.session_started();
 
     metrics.session_created();
     listener_counters.session_started();
 
     let task = SessionTask {
+        _live: live,
         first_datagram,
         listener_socket,
         table,
-        admission,
+        admission: Some(admission),
         metrics,
         listener_counters,
         idle_timeout,
@@ -556,10 +646,12 @@ pub fn launch_session(launch: SessionLaunch) -> Result<Arc<SessionHandle>, Admis
 
 /// Resources owned by a running session task.
 struct SessionTask {
+    /// Released when the task, and with it the receive buffer, is gone.
+    _live: LiveSession,
     first_datagram: Vec<u8>,
     listener_socket: Arc<UdpSocket>,
     table: Arc<SessionTable>,
-    admission: AdmissionLease,
+    admission: Option<AdmissionLease>,
     metrics: Arc<Metrics>,
     listener_counters: Arc<ListenerCounters>,
     idle_timeout: watch::Receiver<Duration>,
@@ -574,20 +666,19 @@ async fn run_session(
     mut task: SessionTask,
 ) {
     let mut cleanup = SessionCleanup {
-        cancel: cancel.clone(),
+        handle: Arc::clone(&handle),
         table: Arc::clone(&task.table),
         session: Arc::clone(&handle.session),
-        admission: Some(task.admission),
+        admission: task.admission.take(),
         metrics: Arc::clone(&task.metrics),
         listener_counters: Arc::clone(&task.listener_counters),
         reason: SessionCloseReason::Closed,
     };
     let upstream = Arc::clone(&handle.upstream);
-    let mut backend_buffer = vec![0_u8; task.max_datagram_size.load(Ordering::Relaxed) + 1];
 
-    tokio::select! {
+    let first_sent = tokio::select! {
         biased;
-        () = cancel.cancelled() => return,
+        () = cancel.cancelled() => false,
         () = send_to_backend(
             &handle.session,
             &upstream,
@@ -595,10 +686,59 @@ async fn run_session(
             &task.metrics,
             &task.listener_counters,
             &task.log_limiter,
-        ) => {}
-    }
+        ) => true,
+    };
     task.first_datagram = Vec::new();
-    handle.finish_pending();
+    if first_sent {
+        handle.finish_pending();
+        forward_until_stopped(
+            &handle,
+            &mut receiver,
+            &cancel,
+            &mut task,
+            &mut cleanup,
+            &upstream,
+        )
+        .await;
+    } else {
+        record_drop(
+            &task.metrics,
+            &task.listener_counters,
+            DropReason::SessionClosed,
+        );
+    }
+
+    // Stop the listener's direct-send path as soon as the task decides to
+    // exit, before the table entry is removed, then count every datagram
+    // still queued. After `close`, the listener's enqueues fail as closed
+    // and are counted there; `recv` also waits out a slot the listener
+    // reserved just before, so nothing is released uncounted.
+    handle.close();
+    receiver.close();
+    while let Some(datagram) = receiver.recv().await {
+        drop(datagram);
+        record_drop(
+            &task.metrics,
+            &task.listener_counters,
+            DropReason::SessionClosed,
+        );
+    }
+    debug!(
+        session_id = %handle.session.id,
+        reason = ?cleanup.reason,
+        "session stopped"
+    );
+}
+
+async fn forward_until_stopped(
+    handle: &Arc<SessionHandle>,
+    receiver: &mut Receiver<QueuedDatagram>,
+    cancel: &CancellationToken,
+    task: &mut SessionTask,
+    cleanup: &mut SessionCleanup,
+    upstream: &UdpSocket,
+) {
+    let mut backend_buffer = vec![0_u8; task.max_datagram_size.load(Ordering::Relaxed) + 1];
 
     // The idle deadline is armed once and only recomputed when it fires or
     // the configured timeout changes, so packet forwarding does not touch the
@@ -634,10 +774,18 @@ async fn run_session(
                 loop {
                     tokio::select! {
                         biased;
-                        () = cancel.cancelled() => break 'session,
+                        () = cancel.cancelled() => {
+                            // Taken from the queue but never sent.
+                            record_drop(
+                                &task.metrics,
+                                &task.listener_counters,
+                                DropReason::SessionClosed,
+                            );
+                            break 'session;
+                        }
                         () = send_to_backend(
                             &handle.session,
-                            &upstream,
+                            upstream,
                             &datagram.payload,
                             &task.metrics,
                             &task.listener_counters,
@@ -736,15 +884,6 @@ async fn run_session(
             }
         }
     }
-
-    // Stop the listener's direct-send path as soon as the task decides to
-    // exit, before the table entry is removed.
-    cancel.cancel();
-    debug!(
-        session_id = %handle.session.id,
-        reason = ?cleanup.reason,
-        "session stopped"
-    );
 }
 
 async fn send_to_backend(
@@ -766,7 +905,7 @@ async fn send_to_backend(
     );
 }
 
-/// Accounts for one client-to-backend send and reports whether it succeeded.
+/// Accounts for one client-to-backend send.
 fn record_backend_send(
     session: &Session,
     expected: usize,
@@ -774,13 +913,12 @@ fn record_backend_send(
     metrics: &Metrics,
     listener_counters: &ListenerCounters,
     log_limiter: &LogRateLimiter,
-) -> bool {
+) {
     match result {
         Ok(sent) if sent == expected => {
             session.record_to_backend(sent);
             listener_counters.to_backend(sent);
             metrics.packet_to_backend(sent);
-            true
         }
         Ok(sent) => {
             metrics.socket_error();
@@ -793,7 +931,6 @@ fn record_backend_send(
                     "UDP send reported a partial datagram"
                 );
             }
-            false
         }
         Err(error) => {
             metrics.socket_error();
@@ -805,13 +942,12 @@ fn record_backend_send(
                     "failed to send client datagram to backend"
                 );
             }
-            false
         }
     }
 }
 
 struct SessionCleanup {
-    cancel: CancellationToken,
+    handle: Arc<SessionHandle>,
     table: Arc<SessionTable>,
     session: Arc<Session>,
     admission: Option<AdmissionLease>,
@@ -822,9 +958,9 @@ struct SessionCleanup {
 
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
-        // Backstop for every exit path, including the early return before the
-        // first datagram is sent.
-        self.cancel.cancel();
+        // Backstop for every exit path, including a task that is dropped
+        // without running to completion.
+        self.handle.close();
         self.table.remove(&self.session.key(), self.session.id);
         self.listener_counters.session_ended();
         self.metrics
@@ -856,6 +992,14 @@ mod tests {
     }
 
     async fn harness(capacity: usize, pending: usize, budget_bytes: usize) -> Harness {
+        harness_with_budget(capacity, pending, QueueBudget::with_limit(budget_bytes)).await
+    }
+
+    async fn harness_with_budget(
+        capacity: usize,
+        pending: usize,
+        budget: Arc<QueueBudget>,
+    ) -> Harness {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         upstream
@@ -870,13 +1014,13 @@ mod tests {
             backend.local_addr().unwrap(),
         );
         let (client_datagrams, receiver) = mpsc::channel(capacity);
-        let budget = QueueBudget::new(budget_bytes);
         let handle = Arc::new(SessionHandle {
             session: Arc::new(session),
             upstream: Arc::new(upstream),
             client_datagrams,
             pending: AtomicUsize::new(pending),
             queue_budget: Arc::clone(&budget),
+            closed: AtomicBool::new(false),
             cancel: CancellationToken::new(),
         });
         Harness {
@@ -1042,11 +1186,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_lowered_limit_applies_while_more_is_already_used() {
-        let mut harness = harness(16, 1, usize::MAX).await;
+        let charge = QueueBudget::charge(100);
+        let per_session = u32::try_from(charge).unwrap();
+        let budget = QueueBudget::for_test(2 * charge, 0, per_session);
+        let mut harness = harness_with_budget(16, 1, budget).await;
         assert_eq!(harness.forward(&[1; 100]), ForwardOutcome::Queued);
         assert_eq!(harness.forward(&[2; 100]), ForwardOutcome::Queued);
-        harness.budget.set_limit(QueueBudget::charge(100));
-        assert_eq!(harness.budget.limit(), QueueBudget::charge(100));
+        // A new live session's receive buffers lower the limit.
+        let _live = harness.budget.session_started();
+        assert_eq!(harness.budget.limit(), charge);
         assert_eq!(
             harness.forward(&[3; 1]),
             ForwardOutcome::Dropped(DropReason::QueueFull)
@@ -1088,6 +1236,19 @@ mod tests {
     }
 
     async fn launch_running(idle_timeout: Duration) -> Running {
+        let running = launch_unstarted(idle_timeout, QueueBudget::with_limit(usize::MAX)).await;
+        let mut buffer = [0_u8; 64];
+        let size = tokio::time::timeout(Duration::from_secs(5), running.backend.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..size], b"first");
+        running
+    }
+
+    /// Launches a session whose task has not been polled yet: the tests run
+    /// on a current-thread runtime, so it starts at the next yield.
+    async fn launch_unstarted(idle_timeout: Duration, budget: Arc<QueueBudget>) -> Running {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         upstream
@@ -1125,18 +1286,12 @@ mod tests {
             idle_timeout: idle_receiver,
             max_datagram_size: Arc::new(AtomicUsize::new(4096)),
             queue_depth: 16,
-            queue_budget: QueueBudget::new(usize::MAX),
+            queue_budget: budget,
             parent_cancel: parent.clone(),
             tracker: tracker.clone(),
             log_limiter: Arc::clone(&log_limiter),
         })
         .unwrap();
-        let mut buffer = [0_u8; 64];
-        let size = tokio::time::timeout(Duration::from_secs(5), backend.recv(&mut buffer))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&buffer[..size], b"first");
         Running {
             handle,
             backend,
@@ -1218,6 +1373,151 @@ mod tests {
         );
         assert_eq!(running.metrics.snapshot().packets_to_backend_total, 1);
         running.stop().await;
+    }
+
+    impl Running {
+        fn forward(&self, datagram: &[u8]) -> ForwardOutcome {
+            observe(
+                &self.handle,
+                &self.metrics,
+                &self.counters,
+                &self.log_limiter,
+                datagram,
+            )
+        }
+
+        /// Asserts `expected` `session_closed` drops in the process and
+        /// listener counters, with totals derived from the breakdown.
+        fn assert_session_closed_drops(&self, expected: u64) {
+            let process = self.metrics.snapshot();
+            let listener = self.counters.snapshot();
+            assert_eq!(process.datagrams_dropped.session_closed, expected);
+            assert_eq!(listener.datagrams_dropped.session_closed, expected);
+            assert_eq!(process.datagrams_dropped_total, expected);
+            assert_eq!(listener.dropped, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_full_drops_do_not_charge_the_budget() {
+        let harness = harness(1, 1, usize::MAX).await;
+        assert_eq!(harness.forward(&[1; 100]), ForwardOutcome::Queued);
+        let used = harness.budget.used();
+        assert_eq!(used, QueueBudget::charge(100));
+        assert_eq!(
+            harness.forward(&[2; 1000]),
+            ForwardOutcome::Dropped(DropReason::QueueFull)
+        );
+        assert_eq!(harness.budget.used(), used);
+        assert_eq!(harness.handle.pending.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn the_budget_recovers_once_surplus_sessions_end() {
+        let lowered = ServiceConfig {
+            max_sessions: 1,
+            max_datagram_size: 65_507,
+            ..ServiceConfig::default()
+        };
+        let budget = QueueBudget::new(&ServiceConfig::default());
+        // Enough live sessions that their receive buffers use the whole
+        // budget once `max_sessions` shrinks.
+        let live: Vec<_> = (0..40_000).map(|_| budget.session_started()).collect();
+        budget.configure(&lowered);
+        assert_eq!(budget.limit(), 0);
+        assert_eq!(
+            budget.limit(),
+            lowered.queued_datagram_budget_with_live_sessions(live.len())
+        );
+
+        // End the sessions on several threads while reloads race with them.
+        let mut live = live;
+        let chunks: Vec<Vec<_>> = (0..4)
+            .map(|_| live.split_off(live.len() - 10_000))
+            .collect();
+        std::thread::scope(|scope| {
+            for chunk in chunks {
+                scope.spawn(move || drop(chunk));
+            }
+            for _ in 0..1_000 {
+                budget.configure(&ServiceConfig::default());
+                budget.configure(&lowered);
+            }
+        });
+        assert_eq!(budget.live_sessions(), 0);
+        assert_eq!(budget.limit(), lowered.queued_datagram_budget());
+        assert!(budget.limit() > 0);
+    }
+
+    #[test]
+    fn the_budget_matches_the_configured_steady_state() {
+        let service = ServiceConfig::default();
+        let budget = QueueBudget::new(&service);
+        assert_eq!(budget.limit(), service.queued_datagram_budget());
+        let extra = service.max_sessions + 3;
+        let live: Vec<_> = (0..extra).map(|_| budget.session_started()).collect();
+        assert_eq!(
+            budget.limit(),
+            service.queued_datagram_budget_with_live_sessions(extra)
+        );
+        drop(live);
+        assert_eq!(budget.limit(), service.queued_datagram_budget());
+    }
+
+    #[tokio::test]
+    async fn a_launched_session_reserves_its_buffers_immediately() {
+        let budget = QueueBudget::with_limit(usize::MAX);
+        let running = launch_unstarted(Duration::from_secs(30), Arc::clone(&budget)).await;
+        assert_eq!(budget.live_sessions(), 1);
+        running.stop().await;
+        assert_eq!(budget.live_sessions(), 0);
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_counts_its_queued_datagrams() {
+        let budget = QueueBudget::with_limit(usize::MAX);
+        let running = launch_unstarted(Duration::from_secs(30), Arc::clone(&budget)).await;
+        let mut buffer = [0_u8; 64];
+        tokio::time::timeout(Duration::from_secs(5), running.backend.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        // Force the queued path; the session task cannot run until this
+        // test yields, so every datagram is still queued at close.
+        running.handle.pending.fetch_add(1, Ordering::AcqRel);
+        for _ in 0..5 {
+            assert_eq!(running.forward(b"queued"), ForwardOutcome::Queued);
+        }
+        running.handle.close();
+        running.wait_until_removed().await;
+        running.tracker.close();
+        running.tracker.wait().await;
+
+        running.assert_session_closed_drops(5);
+        assert_eq!(running.metrics.snapshot().packets_to_backend_total, 1);
+        assert_eq!(budget.used(), 0);
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_the_first_send_counts_every_datagram_once() {
+        let budget = QueueBudget::with_limit(usize::MAX);
+        let running = launch_unstarted(Duration::from_secs(30), Arc::clone(&budget)).await;
+        for _ in 0..3 {
+            assert_eq!(running.forward(b"queued"), ForwardOutcome::Queued);
+        }
+        let metrics = Arc::clone(&running.metrics);
+        let counters = Arc::clone(&running.counters);
+        running.stop().await;
+
+        // The unsent first datagram plus the three queued behind it.
+        assert_eq!(metrics.snapshot().datagrams_dropped.session_closed, 4);
+        assert_eq!(metrics.snapshot().datagrams_dropped_total, 4);
+        assert_eq!(counters.snapshot().datagrams_dropped.session_closed, 4);
+        assert_eq!(counters.snapshot().dropped, 4);
+        assert_eq!(metrics.snapshot().packets_to_backend_total, 0);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.live_sessions(), 0);
     }
 
     #[test]

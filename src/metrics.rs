@@ -99,6 +99,16 @@ impl DropSnapshot {
     pub fn is_reported_for(&self, total: u64) -> bool {
         total == 0 || *self != Self::default()
     }
+
+    /// Sum of all reasons; the reported total for in-process counters.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.oversize
+            .saturating_add(self.queue_full)
+            .saturating_add(self.session_closed)
+            .saturating_add(self.rejected)
+            .saturating_add(self.send_error)
+    }
 }
 
 /// A serializable snapshot used by the control API.
@@ -134,7 +144,6 @@ pub struct Metrics {
     packets_to_client_total: AtomicU64,
     bytes_to_backend_total: AtomicU64,
     bytes_to_client_total: AtomicU64,
-    datagrams_dropped_total: AtomicU64,
     rate_limited_total: AtomicU64,
     dns_errors_total: AtomicU64,
     socket_errors_total: AtomicU64,
@@ -177,7 +186,6 @@ impl Metrics {
     }
 
     pub fn datagram_dropped(&self, reason: DropReason) {
-        self.datagrams_dropped_total.fetch_add(1, Ordering::Relaxed);
         self.datagrams_dropped.record(reason);
     }
 
@@ -191,6 +199,7 @@ impl Metrics {
 
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
+        let datagrams_dropped = self.datagrams_dropped.snapshot();
         MetricsSnapshot {
             active_sessions: self.active_sessions.load(Ordering::Relaxed),
             sessions_created_total: self.sessions_created_total.load(Ordering::Relaxed),
@@ -201,11 +210,12 @@ impl Metrics {
             packets_to_client_total: self.packets_to_client_total.load(Ordering::Relaxed),
             bytes_to_backend_total: self.bytes_to_backend_total.load(Ordering::Relaxed),
             bytes_to_client_total: self.bytes_to_client_total.load(Ordering::Relaxed),
-            datagrams_dropped_total: self.datagrams_dropped_total.load(Ordering::Relaxed),
+            // Derived from the breakdown so the two can never disagree.
+            datagrams_dropped_total: datagrams_dropped.total(),
             rate_limited_total: self.rate_limited_total.load(Ordering::Relaxed),
             dns_errors_total: self.dns_errors_total.load(Ordering::Relaxed),
             socket_errors_total: self.socket_errors_total.load(Ordering::Relaxed),
-            datagrams_dropped: self.datagrams_dropped.snapshot(),
+            datagrams_dropped,
         }
     }
 
@@ -494,11 +504,54 @@ mod tests {
     }
 
     #[test]
+    fn in_process_drop_totals_always_equal_the_sum_of_reasons() {
+        let metrics = Metrics::default();
+        let listener = crate::relay::session::ListenerCounters::default();
+        let reasons = [
+            DropReason::Oversize,
+            DropReason::QueueFull,
+            DropReason::SessionClosed,
+            DropReason::Rejected,
+            DropReason::SendError,
+        ];
+        for (index, reason) in reasons.into_iter().cycle().take(23).enumerate() {
+            metrics.datagram_dropped(reason);
+            listener.dropped(reason);
+            let process = metrics.snapshot();
+            let listener = listener.snapshot();
+            let expected = u64::try_from(index + 1).unwrap();
+            assert_eq!(process.datagrams_dropped.total(), expected);
+            assert_eq!(process.datagrams_dropped_total, expected);
+            assert_eq!(listener.datagrams_dropped.total(), expected);
+            assert_eq!(listener.dropped, expected);
+        }
+        assert!(
+            metrics
+                .render_prometheus()
+                .contains("wire_relay_datagrams_dropped_total 23\n")
+        );
+    }
+
+    #[test]
     fn snapshots_without_a_drop_breakdown_still_deserialize() {
         let mut value = serde_json::to_value(MetricsSnapshot::default()).unwrap();
         value.as_object_mut().unwrap().remove("datagrams_dropped");
         let snapshot: MetricsSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(snapshot.datagrams_dropped, DropSnapshot::default());
+
+        // An older daemon reports only the stored total; decoding keeps it
+        // and the breakdown is marked unknown rather than zero.
+        let mut value = serde_json::to_value(MetricsSnapshot::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("datagrams_dropped");
+        object.insert("datagrams_dropped_total".to_owned(), 5.into());
+        let snapshot: MetricsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snapshot.datagrams_dropped_total, 5);
+        assert!(
+            !snapshot
+                .datagrams_dropped
+                .is_reported_for(snapshot.datagrams_dropped_total)
+        );
     }
 
     #[tokio::test]
