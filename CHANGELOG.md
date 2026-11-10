@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Client-to-backend (upload) bursts are no longer silently dropped by the
+  eight-datagram per-session queue. The listener now sends directly on the
+  session's connected upstream socket and only queues when that socket is
+  busy.
+
+### Added
+
+- `service.session_queue_depth` (default 512) with a runtime-enforced queue
+  memory budget based on actual datagram sizes.
+- Per-reason drop counters in `/metrics`, `wire-relay stats`, and
+  `wire-relay listeners`, plus a rate-limited warning when a session queue is
+  full. `wire_relay_datagrams_dropped_total` is unchanged.
+
 ### Changed
 
 - Replaced the repository-only management wrapper with the self-contained

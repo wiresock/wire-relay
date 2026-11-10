@@ -62,19 +62,31 @@ The Tokio multi-thread scheduler runs several kinds of long-lived task:
 
 There is no task per packet. A listener reads into a buffer sized to
 `max_datagram_size + 1`, so it can reliably distinguish an acceptable
-datagram from a truncated oversized one. Existing-session datagrams are
-offered to a bounded per-session MPSC queue with `try_send`. Queue pressure
-drops and counts the datagram rather than growing memory or blocking all
-clients on the listener.
+datagram from a truncated oversized one. For an existing session, the
+listener sends the datagram directly with a non-blocking `try_send` on that
+session's connected upstream socket. Only if the socket reports `WouldBlock`,
+or earlier datagrams are still queued, is the datagram copied into a bounded
+per-session MPSC queue (`service.session_queue_depth`, default 512). A
+per-session pending count makes the listener queue behind earlier datagrams,
+so client datagram order is preserved; the listener is the only producer for
+its sessions. Queue pressure drops and counts the datagram as `queue_full`
+rather than growing memory or blocking all clients on the listener.
+
+Queued datagrams also reserve their actual length from a process-wide queue
+memory budget: the defensive 4 GiB datagram budget minus every possible
+session's fixed receive buffers. The reservation is released when the queued
+datagram is dropped, including when a session stops with datagrams still
+queued.
 
 For a new session, the listener reserves global/per-IP/rate capacity before
 creating a socket. The listener's receive loop serializes creation for that
 listener, preventing duplicate creation for the same key. Socket setup is
 bounded local work; admission is released on every setup failure.
 
-The session task owns its connected upstream socket and selects among:
+The session task shares its connected upstream socket with the session handle
+and selects among:
 
-- a queued client datagram;
+- queued client datagrams, of which it drains up to 64 per wakeup;
 - one backend datagram;
 - its idle deadline;
 - session or process cancellation.
@@ -89,9 +101,10 @@ socket means no protocol parsing is required to identify the client.
 
 ## Shared state and locking
 
-Session metadata is immutable where possible and uses atomics for counters.
-Activity timestamps and small DNS/config snapshots use short synchronous
-locks. A watch channel wakes sessions when the configured idle timeout
+Session metadata is immutable where possible and uses atomics for counters
+and activity timestamps. The idle deadline is armed once and recomputed only
+when it fires or the timeout changes, not per packet. Small DNS/config
+snapshots use short synchronous locks. A watch channel wakes sessions when the configured idle timeout
 changes, so reload immediately recomputes existing deadlines. A lock guard is
 always dropped before socket, file, channel, or timer awaits. Session maps
 support concurrent lookup and return owned handles before any await.
@@ -225,12 +238,15 @@ Every spawned task is either owned by a supervisor handle or a Tokio
 - Session count is capped globally and per source IP.
 - A global token bucket caps new sessions per second while allowing at most
   one second of burst capacity.
-- Per-session queues and control concurrency are fixed and bounded.
-- The session-count/datagram-size combination is rejected when its
-  conservative queued-buffer estimate exceeds 4 GiB.
+- Per-session queues are bounded by `session_queue_depth` and a shared,
+  runtime-enforced queue memory budget; control concurrency is fixed and
+  bounded.
+- A session-count/datagram-size/queue-depth combination is rejected when every
+  session's fixed receive buffers plus one full queue of maximum-sized
+  datagrams exceeds 4 GiB.
 - Fixed configured destinations prevent open-proxy behavior.
-- Drop, reject, DNS, and socket counters are exposed without client-IP metric
-  labels.
+- Drop (in total and per reason), reject, DNS, and socket counters are exposed
+  without client-IP metric labels.
 - Repetitive warning sites use time-based log suppression.
 - Network input is treated as untrusted and never reaches `unwrap`,
   `expect`, indexing assumptions, or payload logging.

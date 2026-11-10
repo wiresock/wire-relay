@@ -177,6 +177,7 @@ control_socket = "/run/wire-relay/control.sock"
 log_level = "info"
 idle_timeout = "180s"
 max_datagram_size = 4096
+session_queue_depth = 512
 max_sessions = 10000
 max_sessions_per_ip = 64
 new_sessions_per_second = 100
@@ -247,10 +248,23 @@ file-descriptor limit, and host memory together. Lowering a session limit on
 reload does not evict existing sessions; it blocks admission until usage falls
 below the new limit. The compiled ceiling is 100,000 active sessions and the
 packaged unit reserves 131,072 file descriptors; real memory and network
-capacity will usually require a lower value. Validation also caps the combined
-worst-case session datagram buffers and bounded queues at a defensive 4 GiB
-estimate, so the largest datagram and session-count ceilings cannot be selected
-simultaneously.
+capacity will usually require a lower value.
+
+`session_queue_depth` (default `512`, range `1..=65536`) is the number of
+client datagrams that may wait behind one session's upstream socket. The
+listener normally sends a client datagram straight to its session's connected
+upstream socket; a datagram is queued only when that socket cannot accept it
+immediately or earlier datagrams are still queued. When the queue is full the
+datagram is dropped and counted as `queue_full`. A reloaded depth applies to
+new sessions.
+
+Datagram memory is bounded by a defensive 4 GiB budget. Validation reserves two
+`max_datagram_size` receive buffers for every possible session and requires
+one completely full queue of maximum-sized datagrams to fit beside them, so the
+largest datagram and session-count ceilings cannot be selected simultaneously.
+The rest of the budget is shared by all session queues and is enforced at
+runtime using the actual length of each queued datagram; a datagram that would
+exceed it is dropped as `queue_full`.
 
 ## Running and operating
 
@@ -368,6 +382,21 @@ The example binds to loopback. Do not expose metrics publicly without an
 authenticated reverse proxy or equivalent network controls. Metrics avoid
 client IP and session ID labels.
 
+`wire_relay_datagrams_dropped_total` counts every discarded datagram. It is
+broken down, without labels, by reason:
+
+| Metric | Reason |
+| --- | --- |
+| `wire_relay_datagrams_dropped_oversize_total` | larger than `max_datagram_size` |
+| `wire_relay_datagrams_dropped_queue_full_total` | session queue or shared queue memory full |
+| `wire_relay_datagrams_dropped_session_closed_total` | session was closing |
+| `wire_relay_datagrams_dropped_rejected_total` | no session could be created (admission limits, unresolved backend, socket setup, route change) |
+| `wire_relay_datagrams_dropped_send_error_total` | the OS refused or truncated a send in either direction |
+
+`wire-relay stats` shows the same breakdown, and `wire-relay listeners` shows
+each listener's total and `queue_full` drops. A growing `queue_full` count
+means upstream sends cannot keep up; a rate-limited warning is also logged.
+
 ## Security model
 
 Clients cannot choose an upstream destination: every listener forwards only
@@ -399,14 +428,19 @@ See [`SECURITY.md`](SECURITY.md) for vulnerability reporting.
 ## Performance notes
 
 The normal data path performs one receive and one send per direction while
-preserving datagram boundaries. A dedicated connected upstream socket per
-session is an intentional correctness cost: it avoids parsing a protocol to
-demultiplex replies. The implementation does not spawn a task per packet and
+preserving datagram boundaries. Client-to-backend datagrams are sent from the
+listener task directly on the session's connected upstream socket, so the
+upload path, like the download path, has no task hand-off or per-packet copy
+unless the upstream socket is momentarily busy. A dedicated connected upstream
+socket per session is an intentional correctness cost: it avoids parsing a
+protocol to demultiplex replies. The implementation does not spawn a task per packet and
 uses atomic counters plus short-lived shared-state access.
 
 Bounded queues prefer dropping a datagram under sustained pressure over
 unbounded memory growth or head-of-line blocking across all clients. Observe
-drop counters while tuning. DNS resolution and control-plane serialization are
+the per-reason drop counters while tuning, and the kernel's UDP
+`RcvbufErrors`/`SndbufErrors` in `/proc/net/snmp`, which are outside the
+relay's counters. Socket buffer sizes use the operating-system defaults. DNS resolution and control-plane serialization are
 kept out of the packet path. Large session listings are sorted once on a
 bounded blocking worker and paged from a bounded, expiring daemon-side
 snapshot, avoiding repeated full-table scans on Tokio's packet-processing

@@ -34,7 +34,8 @@ readonly MINIMUM_RUST_VERSION="1.85.0"
 readonly MAX_SESSION_LIMIT=100000
 readonly MAX_SESSION_RATE=100000
 readonly MAX_SESSION_DATAGRAM_MEMORY_BYTES=4294967296
-readonly SESSION_DATAGRAM_SLOTS=10
+readonly SESSION_FIXED_DATAGRAM_BUFFERS=2
+readonly DEFAULT_SESSION_QUEUE_DEPTH=512
 readonly SEMANTIC_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 readonly DEFAULT_REPOSITORY_URL="https://github.com/wiresock/wire-relay.git"
 readonly REPOSITORY_URL="${WIRE_RELAY_REPOSITORY_URL:-$DEFAULT_REPOSITORY_URL}"
@@ -1090,7 +1091,10 @@ is_session_datagram_budget() {
     is_max_datagram_size "$max_datagram_size" || return 1
     sessions_decimal=$((10#$max_sessions))
     datagram_decimal=$((10#$max_datagram_size))
-    (( sessions_decimal * (datagram_decimal * SESSION_DATAGRAM_SLOTS + 1) <=
+    # Mirrors the daemon's validation: every session's fixed receive buffers
+    # plus one full default-depth queue of maximum-sized datagrams.
+    (( sessions_decimal * (datagram_decimal * SESSION_FIXED_DATAGRAM_BUFFERS + 1) +
+        datagram_decimal * DEFAULT_SESSION_QUEUE_DEPTH <=
         MAX_SESSION_DATAGRAM_MEMORY_BYTES ))
 }
 
