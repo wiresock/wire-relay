@@ -306,7 +306,7 @@ at once, so the client's next datagram opens a new session even with
 task stops at its next wake-up, without waiting for a pending send, and
 discards what is still queued as `session_closed`. Until its task has ended
 it still counts toward the session gauges, `active sessions` in `wire-relay
-status`, and `wire-relay sessions`, and until its upstream socket is closed
+stats`, and `wire-relay sessions`, and until its upstream socket is closed
 as well it still counts toward `max_sessions` and the queue budget.
 `max_sessions` therefore bounds the upstream sockets that exist, not only
 the sessions that can carry traffic, and is never exceeded by old and new

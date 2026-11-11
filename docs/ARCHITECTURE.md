@@ -153,7 +153,8 @@ rejected until closed sessions are gone. To keep that short, every wait in the s
 client-direction send and the receive-error back-off) is raced against the
 cancellation token, so a closed task exits at its next wake-up. Closing is
 reported once: a session that is already closed but still listed is not
-counted again by a later listener close or reload. Route removal is guarded
+counted again by a later listener close or reload, and `session close` on
+it returns a `not_found` error saying it is already closed. Route removal is guarded
 by session ID, so a stale task never removes a newer session's route, and
 each stage of the lease is released once. A listener that fetched the old
 handle just before the close does not send on the exiting session's socket:
