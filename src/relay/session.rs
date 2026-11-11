@@ -38,6 +38,15 @@ use super::{ListenerId, SessionId, SessionKey, SessionTable};
 /// event sources again.
 pub const QUEUE_DRAIN_BATCH: usize = 64;
 
+/// How long a session task waits before it tries idle expiry again after a
+/// listener forward withdrew the attempt without refreshing activity (the
+/// datagram was then dropped as `queue_full` or `budget_exhausted`). The
+/// deadline is still in the past then; re-arming the timer to it would fire
+/// at once and retry through the route shard lock in a loop while such
+/// datagrams keep arriving. Short against any idle timeout, so expiry is
+/// delayed only by this much.
+const IDLE_EXPIRY_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+
 /// Cumulative counters owned by one listener incarnation.
 #[derive(Debug, Default)]
 pub struct ListenerCounters {
@@ -645,9 +654,11 @@ impl SessionHandle {
     /// still held after the session was closed refuses the datagram with
     /// [`Forward::Closed`] instead of sending on a dying upstream socket;
     /// nothing is counted, and the caller treats the datagram as one from a
-    /// client without a session. A datagram that passes this check just
-    /// before the session closes can still be sent once; that is the same
-    /// window the queued path always had.
+    /// client without a session. The same holds for a datagram that has to
+    /// queue after the session's cleanup closed the queue: it is refused,
+    /// not dropped. A datagram that passes the check just before the
+    /// session closes and goes out on the direct path can still be sent
+    /// once.
     pub fn forward_from_client(
         &self,
         datagram: &[u8],
@@ -693,11 +704,18 @@ impl SessionHandle {
             self.session.touch_client();
         }
         drop(forwarding);
-        if let Err(reason) = queued {
-            record_drop(metrics, listener_counters, reason);
-            self.log_enqueue_drop(reason, datagram.len(), log_limiter);
+        match queued {
+            Ok(()) => Forward::Taken,
+            // The session's cleanup closes the queue only after it has
+            // closed the handle and removed the route, so this is a session
+            // that closed after the check above: the caller opens a new one.
+            Err(EnqueueError::Closed) => Forward::Closed,
+            Err(EnqueueError::Dropped(reason)) => {
+                record_drop(metrics, listener_counters, reason);
+                self.log_enqueue_drop(reason, datagram.len(), log_limiter);
+                Forward::Taken
+            }
         }
-        Forward::Taken
     }
 
     fn log_enqueue_drop(&self, reason: DropReason, size: usize, log_limiter: &LogRateLimiter) {
@@ -733,21 +751,21 @@ impl SessionHandle {
         }
     }
 
-    fn enqueue(&self, datagram: &[u8]) -> Result<(), DropReason> {
-        // Claim a queue slot first so a full or closed queue drops without
+    fn enqueue(&self, datagram: &[u8]) -> Result<(), EnqueueError> {
+        // Claim a queue slot first so a full or closed queue refuses without
         // copying the datagram or touching the shared budget.
         let permit = self
             .client_datagrams
             .try_reserve()
             .map_err(|error| match error {
-                TrySendError::Full(()) => DropReason::QueueFull,
-                TrySendError::Closed(()) => DropReason::SessionClosed,
+                TrySendError::Full(()) => EnqueueError::Dropped(DropReason::QueueFull),
+                TrySendError::Closed(()) => EnqueueError::Closed,
             })?;
         let charged = self
             .accounting
             .budget
             .try_charge(datagram.len())
-            .ok_or(DropReason::BudgetExhausted)?;
+            .ok_or(EnqueueError::Dropped(DropReason::BudgetExhausted))?;
         self.pending.fetch_add(1, Ordering::AcqRel);
         permit.send(QueuedDatagram {
             payload: datagram.to_vec(),
@@ -856,6 +874,15 @@ impl SessionHandle {
     }
 }
 
+/// Why a datagram was not queued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnqueueError {
+    /// The session's cleanup has closed the queue; nothing is counted.
+    Closed,
+    /// The queue or the shared budget is full; counted with this reason.
+    Dropped(DropReason),
+}
+
 /// Whether a session took a client datagram.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
@@ -863,8 +890,8 @@ pub enum Forward {
     /// The session took the datagram and accounted for it: sent, queued,
     /// or dropped with its reason counted.
     Taken,
-    /// The session was already closed and did not take the datagram;
-    /// nothing was counted.
+    /// The session was already closed, or its queue was, and did not take
+    /// the datagram; nothing was counted.
     Closed,
 }
 
@@ -1198,6 +1225,7 @@ async fn forward_until_stopped(
                 // `changed()` yet; always decide with the current value.
                 idle_timeout = *task.idle_timeout.borrow_and_update();
                 let deadline = handle.session.last_activity() + idle_timeout;
+                let mut withdrawn = false;
                 if Instant::now() >= deadline {
                     // The listener forwards on this session's socket from
                     // its own task, so the decision is made against it, and
@@ -1212,12 +1240,23 @@ async fn forward_until_stopped(
                         // A datagram was just accepted or is being forwarded
                         // right now; let it record its activity before the
                         // deadline is computed again.
-                        Expiry::Active => tokio::task::yield_now().await,
+                        Expiry::Active => {
+                            tokio::task::yield_now().await;
+                            withdrawn = true;
+                        }
                     }
                 }
-                idle_sleep.as_mut().reset(tokio::time::Instant::from_std(
-                    handle.session.last_activity() + idle_timeout,
-                ));
+                let mut next = handle.session.last_activity() + idle_timeout;
+                let now = Instant::now();
+                if withdrawn && next <= now {
+                    // The forward that withdrew the attempt was dropped and
+                    // did not refresh activity; retry after a short back-off
+                    // instead of at a deadline that has already passed.
+                    next = now + IDLE_EXPIRY_RETRY_BACKOFF;
+                }
+                idle_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::from_std(next));
             }
         }
     }
@@ -1606,6 +1645,25 @@ mod tests {
         assert_eq!(harness.forward(b"late"), ForwardOutcome::Refused);
         assert_eq!(harness.metrics.snapshot().drops().session_closed, 0);
         assert_eq!(harness.handle.pending.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn a_queue_closed_after_the_forward_check_refuses_the_datagram() {
+        let mut harness = harness(4, 0, usize::MAX).await;
+        // The handle still looks open, but the datagram has to queue and the
+        // session's cleanup has already closed the queue.
+        harness.handle.pending.fetch_add(1, Ordering::AcqRel);
+        harness.receiver.close();
+        // The listener gives a refused datagram a new session instead of
+        // counting it as `session_closed`.
+        assert_eq!(harness.forward(b"late"), ForwardOutcome::Refused);
+        let stats = harness.metrics.snapshot();
+        assert_eq!(stats.drops().total(), 0);
+        assert_eq!(stats.datagrams_dropped_total, 0);
+        assert_eq!(harness.counters.snapshot().drops().total(), 0);
+        assert_eq!(harness.budget.used(), 0);
+        assert_eq!(harness.handle.pending.load(Ordering::Acquire), 1);
+        assert!(!harness.handle.is_closed());
     }
 
     struct Running {

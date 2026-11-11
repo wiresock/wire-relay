@@ -367,9 +367,12 @@ impl ActiveConfigSnapshot {
         .collect()
     }
 
-    /// Validates the reported settings. A setting the daemon did not report
-    /// is checked at its default, which every configuration valid for a
-    /// daemon without that setting also satisfies.
+    /// Validates the reported settings against this release's
+    /// configuration-file rules, as if they were loaded from a file. A
+    /// setting the daemon did not report is checked at its default, which
+    /// every configuration valid for a daemon without that setting also
+    /// satisfies. [`Self::to_toml`] does not call this: a later daemon may
+    /// run with values this release would not load.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let service = &self.service;
         let defaults = ServiceConfig::default();
@@ -399,8 +402,13 @@ impl ActiveConfigSnapshot {
 
     /// Serializes the reported configuration as normalized TOML; settings the
     /// daemon did not report are omitted, not filled in with defaults.
+    ///
+    /// This shows what the daemon is running and does not re-check it
+    /// against this release's configuration-file limits ([`Self::validate`]):
+    /// a later daemon may accept values this CLI would reject when loading a
+    /// file, and its configuration must still be viewable. Loading the
+    /// output as a file is still validated as usual.
     pub fn to_toml(&self) -> Result<String, ConfigError> {
-        self.validate()?;
         toml::to_string_pretty(self).map_err(|source| ConfigError::Serialize { source })
     }
 }
@@ -680,6 +688,29 @@ mod tests {
             serde_json::from_value::<ActiveConfigSnapshot>(value).unwrap(),
             snapshot
         );
+    }
+
+    #[test]
+    fn the_running_configuration_is_shown_even_beyond_this_releases_file_limits() {
+        use crate::config::{Config, MAX_CONFIGURED_SESSIONS};
+
+        let config = sample_config();
+        let over = MAX_CONFIGURED_SESSIONS + 1;
+        // A later daemon running with a value this release would not load.
+        let mut snapshot = ActiveConfigSnapshot::extended(&config);
+        snapshot.service.max_sessions = over;
+        let toml = snapshot.to_toml().unwrap();
+        assert!(toml.contains(&format!("max_sessions = {over}\n")), "{toml}");
+        assert!(snapshot.validate().is_err());
+
+        // Loading that output as a configuration file still enforces the
+        // limit, through parsing and through validation.
+        let error = Config::parse_str(&toml).unwrap_err();
+        assert!(error.to_string().contains("max_sessions"), "{error}");
+        let mut file = config;
+        file.service.max_sessions = over;
+        assert!(file.validate().is_err());
+        assert!(file.to_toml().is_err());
     }
 
     #[test]
