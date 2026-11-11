@@ -15,10 +15,10 @@ use tracing::info;
 
 use crate::{
     VERSION,
-    config::{Config, DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET, LogLevel, NormalizedConfig},
+    config::{Config, DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET, LogLevel},
     control::{
         ControlClient, ControlRequest, ControlResponse,
-        protocol::{ReloadResult, SessionQuery, SessionSort, StatusSnapshot},
+        protocol::{ActiveConfigSnapshot, ReloadResult, SessionQuery, SessionSort, StatusSnapshot},
     },
     logging,
     metrics::MetricsSnapshot,
@@ -206,12 +206,21 @@ async fn execute_control(command: Command, client: ControlClient) -> Result<()> 
             print_json_or(output.json, &status, || render_status(&status))
         }
         Command::Config(output) => {
-            let config = expect_config(client.request(ControlRequest::ActiveConfig).await?)?;
+            // An older daemon does not know the extended request and closes
+            // the connection; it then reports the 0.1.6 settings only.
+            let config = expect_config(
+                client
+                    .request_with_fallback(
+                        ControlRequest::ActiveConfigExtended,
+                        ControlRequest::ActiveConfig,
+                    )
+                    .await?,
+            )?;
             if output.json {
                 println!("{}", serde_json::to_string_pretty(&config)?);
             } else {
                 // Normalized TOML is also the most useful default human form.
-                print!("{}", config.to_toml()?);
+                print!("{}", render_config_toml(&config)?);
             }
             Ok(())
         }
@@ -521,6 +530,23 @@ fn render_session(session: &SessionSnapshot) -> String {
     )
 }
 
+/// Normalized TOML of the reported configuration. Settings an older daemon
+/// does not have are omitted, with a comment saying so, instead of being
+/// shown at this release's defaults.
+fn render_config_toml(config: &ActiveConfigSnapshot) -> Result<String> {
+    let mut output = String::new();
+    let unreported = config.unreported_service_settings();
+    if !unreported.is_empty() {
+        let _ = writeln!(
+            output,
+            "# The running daemon predates {}; not shown.",
+            unreported.join(" and ")
+        );
+    }
+    output.push_str(&config.to_toml()?);
+    Ok(output)
+}
+
 fn render_stats(stats: &MetricsSnapshot) -> String {
     let mut output = format!(
         "active sessions: {}\nsessions created: {}\nsessions expired: {}\nsessions closed: {}\nsessions rejected: {}\npackets to backend: {}\npackets to client: {}\nbytes to backend: {}\nbytes to client: {}\ndatagrams dropped: {}\n",
@@ -602,9 +628,11 @@ fn expect_status(response: ControlResponse) -> Result<StatusSnapshot> {
     }
 }
 
-fn expect_config(response: ControlResponse) -> Result<NormalizedConfig> {
+fn expect_config(response: ControlResponse) -> Result<ActiveConfigSnapshot> {
     match response {
-        ControlResponse::ActiveConfig(value) => Ok(value),
+        ControlResponse::ActiveConfigExtended(value) | ControlResponse::ActiveConfig(value) => {
+            Ok(value)
+        }
         other => Err(unexpected_response("active config", &other)),
     }
 }

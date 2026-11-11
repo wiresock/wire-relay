@@ -31,8 +31,8 @@ use crate::{
     control::{
         ControlError, ControlErrorCode, ControlRequest, ControlResponse,
         protocol::{
-            ReloadResult, SessionCursor, SessionPage, SessionQuery, SessionSort, StatusSnapshot,
-            VersionSnapshot,
+            ActiveConfigSnapshot, ReloadResult, SessionCursor, SessionPage, SessionQuery,
+            SessionSort, StatusSnapshot, VersionSnapshot,
         },
         server::{ControlHandler, ControlServerHandle},
     },
@@ -925,9 +925,14 @@ impl ControlHandler for RuntimeCore {
         Box::pin(async move {
             match request {
                 ControlRequest::Status => Ok(ControlResponse::Status(self.status())),
-                ControlRequest::ActiveConfig => {
-                    Ok(ControlResponse::ActiveConfig(self.active_config()))
-                }
+                // Older CLIs reject unknown service keys, so this keeps the
+                // 0.1.6 shape; newer CLIs ask for the extended form.
+                ControlRequest::ActiveConfig => Ok(ControlResponse::ActiveConfig(
+                    ActiveConfigSnapshot::legacy(&self.active_config()),
+                )),
+                ControlRequest::ActiveConfigExtended => Ok(ControlResponse::ActiveConfigExtended(
+                    ActiveConfigSnapshot::extended(&self.active_config()),
+                )),
                 ControlRequest::Listeners => {
                     Ok(ControlResponse::Listeners(self.listener_snapshots()))
                 }
