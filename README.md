@@ -295,9 +295,11 @@ those sessions end. Datagrams the relay drops itself (`queue_full`,
 sessions whose clients only send into a full queue or exhausted budget still
 idle out and release their buffers. A send the OS refuses (`send_error`) does
 count, so a backend outage does not expire sessions whose clients keep
-sending.
+sending. Delivering a queued datagram counts too, so a session whose upstream
+socket was stalled for longer than `idle_timeout` is not expired, with
+datagrams still queued, the moment the socket recovers.
 
-Closing a session (backend change, listener removal, `close-session`, idle
+Closing a session (backend change, listener removal, `session close`, idle
 expiry) removes its route and frees its client's `max_sessions_per_ip` slot
 at once, so the client's next datagram opens a new session even with
 `max_sessions_per_ip = 1`. A closed session does no further forwarding: its

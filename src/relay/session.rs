@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 use crate::{
     config::{
         MAX_SESSION_DATAGRAM_MEMORY_BYTES, QUEUED_DATAGRAM_OVERHEAD_BYTES, ServiceConfig,
-        queued_datagram_budget,
+        queued_datagram_budget, queued_datagram_charge,
     },
     limits::{AdmissionLease, LogRateLimiter, LogSite},
     metrics::{DropCounters, DropReason, DropSnapshot, Metrics},
@@ -105,10 +105,10 @@ pub struct ListenerCounterSnapshot {
     pub datagrams_dropped: Option<DropSnapshot>,
 }
 
+#[cfg(test)]
 impl ListenerCounterSnapshot {
-    /// The per-reason breakdown, all zero when the daemon did not report one.
-    #[must_use]
-    pub fn drops(&self) -> DropSnapshot {
+    /// The per-reason breakdown of an in-process snapshot.
+    pub(crate) fn drops(&self) -> DropSnapshot {
         self.datagrams_dropped.clone().unwrap_or_default()
     }
 }
@@ -311,10 +311,12 @@ impl QueueBudget {
     /// Budget charged for queueing one datagram of `payload_len` bytes.
     #[must_use]
     pub const fn charge(payload_len: usize) -> usize {
-        payload_len.saturating_add(QUEUED_DATAGRAM_OVERHEAD_BYTES)
+        queued_datagram_charge(payload_len)
     }
 
-    fn try_reserve(self: &Arc<Self>, payload_len: usize) -> Option<QueueReservation> {
+    /// Charges one datagram of `payload_len` bytes and returns the bytes
+    /// charged, or `None` if they do not fit under the current limit.
+    fn try_charge(&self, payload_len: usize) -> Option<usize> {
         let bytes = Self::charge(payload_len);
         let limit = self.limit();
         let mut used = self.used.load(Ordering::Acquire);
@@ -324,14 +326,14 @@ impl QueueBudget {
                 .used
                 .compare_exchange_weak(used, total, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => break,
+                Ok(_) => return Some(bytes),
                 Err(current) => used = current,
             }
         }
-        Some(QueueReservation {
-            budget: Arc::clone(self),
-            bytes,
-        })
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
 
@@ -347,27 +349,51 @@ impl Drop for LiveSession {
     }
 }
 
+/// What a session's queued datagrams account against: the shared budget
+/// they are charged to and the counters an unsent one is recorded in.
 #[derive(Debug)]
-struct QueueReservation {
-    // An owned handle keeps release correct on every drop path, including
-    // datagrams discarded with the receiver at session teardown; the
-    // refcount is paid only on the queued fallback path, never on direct
-    // sends.
+struct QueueAccounting {
     budget: Arc<QueueBudget>,
-    bytes: usize,
-}
-
-impl Drop for QueueReservation {
-    fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
-    }
+    metrics: Arc<Metrics>,
+    listener_counters: Arc<ListenerCounters>,
 }
 
 /// A client datagram waiting for its session's upstream socket.
+///
+/// It accounts for itself when it is dropped, wherever that happens: its
+/// budget charge is released, and unless it was settled it is counted as
+/// `session_closed`. A datagram left in the queue when the session stops is
+/// therefore counted exactly once without the session's cleanup having to
+/// wait for the listener, including one the listener was still enqueueing.
 #[derive(Debug)]
 pub struct QueuedDatagram {
     payload: Vec<u8>,
-    _reservation: QueueReservation,
+    charged: usize,
+    // One reference to the session's own accounting, taken only on the
+    // queued fallback path, never on direct sends.
+    accounting: Arc<QueueAccounting>,
+    /// The send completed, or its failure has been counted.
+    settled: bool,
+}
+
+impl QueuedDatagram {
+    /// Consumes a datagram whose send has been accounted for.
+    fn settle(mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for QueuedDatagram {
+    fn drop(&mut self) {
+        self.accounting.budget.release(self.charged);
+        if !self.settled {
+            record_drop(
+                &self.accounting.metrics,
+                &self.accounting.listener_counters,
+                DropReason::SessionClosed,
+            );
+        }
+    }
 }
 
 // The fixed per-datagram charge must cover the queue slot itself; the rest
@@ -550,7 +576,7 @@ pub struct SessionHandle {
     client_datagrams: Sender<QueuedDatagram>,
     /// Client datagrams queued or being sent by the session task.
     pending: AtomicUsize,
-    queue_budget: Arc<QueueBudget>,
+    accounting: Arc<QueueAccounting>,
     /// [`STATE_CLOSED`] and [`STATE_EXPIRING`] flags plus a count of listener
     /// forwards in progress (in units of [`STATE_FORWARDING`]).
     ///
@@ -580,7 +606,11 @@ impl SessionHandle {
             upstream: Arc::new(UdpSocket::from_std(socket).expect("register test socket")),
             client_datagrams,
             pending: AtomicUsize::new(0),
-            queue_budget: QueueBudget::with_limit(usize::MAX),
+            accounting: Arc::new(QueueAccounting {
+                budget: QueueBudget::with_limit(usize::MAX),
+                metrics: Arc::new(Metrics::default()),
+                listener_counters: Arc::new(ListenerCounters::default()),
+            }),
             state: AtomicUsize::new(0),
             admission: Mutex::new(None),
             cancel: CancellationToken::new(),
@@ -667,14 +697,14 @@ impl SessionHandle {
             DropReason::BudgetExhausted
                 if log_limiter.should_log(LogSite::QueueBudgetExhausted) =>
             {
-                let (max_sessions, max_datagram_size) = self.queue_budget.configured();
+                let (max_sessions, max_datagram_size) = self.accounting.budget.configured();
                 warn!(
                     listener = %self.session.listener_name,
                     datagram_bytes = size,
-                    budget_used_bytes = self.queue_budget.used(),
-                    budget_limit_bytes = self.queue_budget.limit(),
-                    max_queue_memory_bytes = self.queue_budget.max_queue_memory(),
-                    live_sessions = self.queue_budget.live_sessions(),
+                    budget_used_bytes = self.accounting.budget.used(),
+                    budget_limit_bytes = self.accounting.budget.limit(),
+                    max_queue_memory_bytes = self.accounting.budget.max_queue_memory(),
+                    live_sessions = self.accounting.budget.live_sessions(),
                     max_sessions,
                     max_datagram_size,
                     "process-wide queued-datagram memory budget exhausted; dropping client \
@@ -697,14 +727,17 @@ impl SessionHandle {
                 TrySendError::Full(()) => DropReason::QueueFull,
                 TrySendError::Closed(()) => DropReason::SessionClosed,
             })?;
-        let reservation = self
-            .queue_budget
-            .try_reserve(datagram.len())
+        let charged = self
+            .accounting
+            .budget
+            .try_charge(datagram.len())
             .ok_or(DropReason::BudgetExhausted)?;
         self.pending.fetch_add(1, Ordering::AcqRel);
         permit.send(QueuedDatagram {
             payload: datagram.to_vec(),
-            _reservation: reservation,
+            charged,
+            accounting: Arc::clone(&self.accounting),
+            settled: false,
         });
         Ok(())
     }
@@ -763,25 +796,15 @@ impl SessionHandle {
     }
 
     /// Waits for a listener forward that began before the session was closed.
-    ///
-    /// A forward is registered only across a non-blocking send or enqueue,
-    /// never across logging or an await, so this normally finds none and
-    /// otherwise lasts a few instructions; yielding covers a listener thread
-    /// that the OS preempted in between.
+    #[cfg(test)]
     fn wait_for_forwards(&self) {
-        let mut spins = 0_u32;
         while self.state.load(Ordering::SeqCst) >= STATE_FORWARDING {
-            if spins < 64 {
-                std::hint::spin_loop();
-                spins += 1;
-            } else {
-                std::thread::yield_now();
-            }
+            std::thread::yield_now();
         }
     }
 
-    #[cfg(test)]
-    fn is_closed(&self) -> bool {
+    /// Whether the session is closed; its route is then gone as well.
+    pub(super) fn is_closed(&self) -> bool {
         self.state.load(Ordering::Acquire) & STATE_CLOSED != 0
     }
 
@@ -890,7 +913,11 @@ pub fn launch_session(launch: SessionLaunch) -> Option<Arc<SessionHandle>> {
         // The first datagram is in flight in the session task, so later
         // datagrams must queue behind it until it has been sent.
         pending: AtomicUsize::new(1),
-        queue_budget,
+        accounting: Arc::new(QueueAccounting {
+            budget: queue_budget,
+            metrics: Arc::clone(&metrics),
+            listener_counters: Arc::clone(&listener_counters),
+        }),
         state: AtomicUsize::new(0),
         // Stored before the handle is published, so a close that races the
         // insert always finds the lease to release.
@@ -902,7 +929,7 @@ pub fn launch_session(launch: SessionLaunch) -> Option<Arc<SessionHandle>> {
         // The lease goes with the unpublished handle.
         return None;
     }
-    let live = handle.queue_budget.session_started();
+    let live = handle.accounting.budget.session_started();
 
     metrics.session_created();
     listener_counters.session_started();
@@ -917,8 +944,7 @@ pub fn launch_session(launch: SessionLaunch) -> Option<Arc<SessionHandle>> {
         metrics: Arc::clone(&metrics),
         listener_counters: Arc::clone(&listener_counters),
         reason: SessionCloseReason::Closed,
-        // The first datagram.
-        unsent_in_flight: true,
+        first_datagram_unsent: true,
     };
 
     let task = SessionTask {
@@ -971,7 +997,7 @@ async fn run_session(
     };
     task.first_datagram = Vec::new();
     if first_sent {
-        cleanup.unsent_in_flight = false;
+        cleanup.first_datagram_unsent = false;
         handle.finish_pending();
         forward_until_stopped(&handle, &cancel, &mut task, &mut cleanup, &upstream).await;
     }
@@ -981,8 +1007,8 @@ async fn run_session(
         "session stopped"
     );
     // Dropping the cleanup guard closes the session for the listener the
-    // moment the task decides to exit and counts every datagram it did not
-    // send: one taken but unsent, and all still queued.
+    // moment the task decides to exit and discards what is still queued;
+    // every datagram the task did not send is counted as `session_closed`.
 }
 
 async fn forward_until_stopped(
@@ -992,7 +1018,7 @@ async fn forward_until_stopped(
     cleanup: &mut SessionCleanup,
     upstream: &UdpSocket,
 ) {
-    let mut backend_buffer = vec![0_u8; handle.queue_budget.max_datagram_size() + 1];
+    let mut backend_buffer = vec![0_u8; handle.accounting.budget.max_datagram_size() + 1];
 
     // The idle deadline is armed once and only recomputed when it fires or
     // the configured timeout changes, so packet forwarding does not touch the
@@ -1004,7 +1030,7 @@ async fn forward_until_stopped(
     tokio::pin!(idle_sleep);
 
     'session: loop {
-        let max_size = handle.queue_budget.max_datagram_size();
+        let max_size = handle.accounting.budget.max_datagram_size();
         if backend_buffer.len() != max_size.saturating_add(1) {
             backend_buffer.resize(max_size.saturating_add(1), 0);
         }
@@ -1026,11 +1052,9 @@ async fn forward_until_stopped(
                 };
                 let mut drained = 0;
                 loop {
-                    // Taken from the queue; counted by the cleanup guard if
-                    // the task stops before the send completes.
-                    cleanup.unsent_in_flight = true;
                     tokio::select! {
                         biased;
+                        // The unsent datagram counts itself when dropped.
                         () = cancel.cancelled() => break 'session,
                         () = send_to_backend(
                             &handle.session,
@@ -1041,8 +1065,13 @@ async fn forward_until_stopped(
                             &task.log_limiter,
                         ) => {}
                     }
-                    cleanup.unsent_in_flight = false;
-                    drop(datagram);
+                    datagram.settle();
+                    // Delivering a datagram the client sent earlier is
+                    // client activity, as on the direct path. Without it, a
+                    // session whose upstream socket was stalled for longer
+                    // than the idle timeout would expire the moment the
+                    // socket recovers, with accepted datagrams still queued.
+                    handle.session.touch_client();
                     handle.finish_pending();
                     drained += 1;
                     if drained >= QUEUE_DRAIN_BATCH {
@@ -1238,33 +1267,31 @@ struct SessionCleanup {
     metrics: Arc<Metrics>,
     listener_counters: Arc<ListenerCounters>,
     reason: SessionCloseReason,
-    /// The task holds a client datagram it has not finished sending: the
-    /// first datagram, or one taken from the queue.
-    unsent_in_flight: bool,
+    /// The first datagram was never sent; counted as `session_closed` once.
+    /// Queued datagrams count themselves.
+    first_datagram_unsent: bool,
 }
 
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         // The only close on the task's side, for every exit path including a
         // task dropped in mid-run or before its first poll. After it the
-        // listener refuses this session, so once a forward already under way
-        // has finished, the queue holds everything that will ever be in it.
+        // listener refuses this session.
         self.table.close(&self.handle);
-        self.handle.wait_for_forwards();
+        // Every datagram still queued counts itself as `session_closed` as
+        // it is dropped here; so does one the listener was still enqueueing
+        // when the session closed, once the queue itself is freed. Nothing
+        // here waits for the listener.
         self.receiver.close();
-        let mut unsent = usize::from(self.unsent_in_flight);
-        while self.receiver.try_recv().is_ok() {
-            unsent += 1;
-        }
-        for _ in 0..unsent {
+        while self.receiver.try_recv().is_ok() {}
+        if self.first_datagram_unsent {
             record_drop(
                 &self.metrics,
                 &self.listener_counters,
                 DropReason::SessionClosed,
             );
         }
-        let session = self.handle.session();
-        self.table.remove(&session.key(), session.id);
+        self.table.remove(&self.handle);
         self.listener_counters.session_ended();
         self.metrics
             .session_ended(self.reason == SessionCloseReason::Idle);
@@ -1298,8 +1325,8 @@ mod tests {
         handle: Arc<SessionHandle>,
         receiver: Receiver<QueuedDatagram>,
         backend: UdpSocket,
-        metrics: Metrics,
-        counters: ListenerCounters,
+        metrics: Arc<Metrics>,
+        counters: Arc<ListenerCounters>,
         log_limiter: LogRateLimiter,
         budget: Arc<QueueBudget>,
     }
@@ -1327,12 +1354,18 @@ mod tests {
             backend.local_addr().unwrap(),
         );
         let (client_datagrams, receiver) = mpsc::channel(capacity);
+        let metrics = Arc::new(Metrics::default());
+        let counters = Arc::new(ListenerCounters::default());
         let handle = Arc::new(SessionHandle {
             session: Arc::new(session),
             upstream: Arc::new(upstream),
             client_datagrams,
             pending: AtomicUsize::new(pending),
-            queue_budget: Arc::clone(&budget),
+            accounting: Arc::new(QueueAccounting {
+                budget: Arc::clone(&budget),
+                metrics: Arc::clone(&metrics),
+                listener_counters: Arc::clone(&counters),
+            }),
             state: AtomicUsize::new(0),
             admission: Mutex::new(None),
             cancel: CancellationToken::new(),
@@ -1341,8 +1374,8 @@ mod tests {
             handle,
             receiver,
             backend,
-            metrics: Metrics::default(),
-            counters: ListenerCounters::default(),
+            metrics,
+            counters,
             log_limiter: LogRateLimiter::new(Duration::from_secs(60)),
             budget,
         }
@@ -2181,6 +2214,75 @@ mod tests {
                 STATE_CLOSED
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delivering_a_queued_datagram_refreshes_client_activity() {
+        let running = launch_running(Duration::from_secs(30)).await;
+        // Queue behind a datagram the task is "still sending", as when the
+        // upstream socket is stalled.
+        running.handle.pending.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(running.forward(b"queued"), ForwardOutcome::Queued);
+        let enqueued = running.handle.session.last_client_activity();
+
+        // The stall: the session task cannot run while this thread blocks,
+        // and nothing the client sends meanwhile is accepted.
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(running.handle.session.last_client_activity(), enqueued);
+
+        // The socket recovers and the queued datagram is delivered. That
+        // counts as activity now, so an idle timeout that elapsed during
+        // the stall does not expire a session that is forwarding again.
+        let mut buffer = [0_u8; 64];
+        let size = tokio::time::timeout(Duration::from_secs(5), running.backend.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..size], b"queued");
+        tokio::task::yield_now().await;
+        assert!(
+            running.handle.session.last_client_activity() >= enqueued + Duration::from_millis(40)
+        );
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn queued_datagrams_account_for_themselves_wherever_they_are_dropped() {
+        let mut harness = harness(16, 1, usize::MAX).await;
+        for _ in 0..3 {
+            assert_eq!(harness.forward(&[7; 10]), ForwardOutcome::Queued);
+        }
+        assert_eq!(harness.budget.used(), 3 * QueueBudget::charge(10));
+
+        // One is delivered: settled, so released but not counted as a drop.
+        harness.receiver.recv().await.unwrap().settle();
+        assert_eq!(harness.budget.used(), 2 * QueueBudget::charge(10));
+        assert_eq!(harness.metrics.snapshot().drops().total(), 0);
+
+        // One is taken by the task but dropped unsent.
+        drop(harness.receiver.recv().await.unwrap());
+        assert_eq!(harness.metrics.snapshot().drops().session_closed, 1);
+
+        // The session's cleanup has drained and closed the queue, and the
+        // listener then finishes an enqueue it had already begun. Nobody
+        // receives that datagram; it is counted when the queue is freed.
+        let permit = harness.handle.client_datagrams.try_reserve().unwrap();
+        harness.receiver.close();
+        drop(harness.receiver.try_recv().unwrap());
+        assert_eq!(harness.metrics.snapshot().drops().session_closed, 2);
+        let charged = harness.budget.try_charge(10).unwrap();
+        permit.send(QueuedDatagram {
+            payload: vec![7; 10],
+            charged,
+            accounting: Arc::clone(&harness.handle.accounting),
+            settled: false,
+        });
+        assert_eq!(harness.budget.used(), QueueBudget::charge(10));
+        drop(harness.receiver);
+        drop(harness.handle);
+        assert_eq!(harness.budget.used(), 0);
+        assert_eq!(harness.metrics.snapshot().drops().session_closed, 3);
+        assert_eq!(harness.counters.snapshot().drops().session_closed, 3);
     }
 
     #[test]
