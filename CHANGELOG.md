@@ -17,12 +17,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_sessions_per_ip` slot while it stops, so the next datagram from the
   same client opens a new session instead of being dropped as
   `session_closed` or `rejected`, even with `max_sessions_per_ip = 1`. The
-  closed session still counts toward `max_sessions`, the queue budget and the
-  session gauges until its task ends, so `max_sessions` bounds the upstream
-  sockets that exist. At a relay that is at `max_sessions`, a returning
-  client can therefore still be dropped as `rejected` for the moment the
-  closed sessions' tasks take to end, for example right after a backend
-  change closes many sessions. A closed task no longer waits for a pending
+  closed session still counts toward the session gauges until its task ends,
+  and toward `max_sessions` and the queue budget until its upstream socket
+  is closed as well: its global admission slot is released only after the
+  socket and its receive-buffer reservation are gone, so `max_sessions`
+  bounds the upstream sockets that exist. At a relay that is at
+  `max_sessions`, a returning client can therefore still be dropped as
+  `rejected` for the moment the closed sessions take to end, for example
+  right after a backend change closes many sessions. A closed task no longer waits for a pending
   client-direction send. A reload or listener stop no longer counts sessions that were already
   closed, and a close that coincides with idle expiry is counted as a close.
   A session task dropped before it first runs or in mid-run still removes its
@@ -36,6 +38,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stalled upstream socket recovers.
 - Sessions of a stopping listener reject datagrams immediately instead of
   sending or queueing them until their tasks wake up.
+- A datagram that reaches a session just as it is closed or expires (for
+  example a keepalive at the idle timeout, or one during a backend change)
+  now opens a new session, as the client's next datagram would, instead of
+  being dropped as `session_closed` until the client retransmits. On a
+  stopping listener it is still counted as `session_closed`.
 - Idle expiry no longer races the direct upload path: a session is not
   expired under a datagram it has just accepted, and an expired session
   sends nothing further on its upstream socket.
@@ -45,7 +52,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still decode it. A current CLI asks for the new `active_config_extended`
   operation. If the daemon predates that operation, the CLI falls back to
   `active_config` and leaves the two settings out (with a TOML comment saying
-  so) instead of showing this release's defaults. The control protocol
+  so) instead of showing this release's defaults. The CLI falls back only
+  when the request is closed without any response twice in a row; a
+  connection error, a timeout, or a response that breaks off is an error.
+  Settings a later daemon adds under `[metrics]` or `[[listeners]]` are
+  ignored like those under `[service]`. The control protocol
   version stays 2. Configuration files still reject unknown keys. A 0.1.6
   CLI validates the TOML form against its own limits, so it refuses
   `config`/`--toml` for a configuration only this release accepts;

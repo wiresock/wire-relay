@@ -135,26 +135,39 @@ The next datagram from the same client therefore finds no route and is
 admitted as a new session even with a per-IP limit of one (for example a
 WireGuard handshake retry after a backend change), while the old task is
 still stopping. The admission lease is released in two stages: the per-IP
-slot with the route, and the global slot by the cleanup guard when the task
-has ended. Until then the closed session keeps its upstream socket,
-receive-buffer reservation, gauges, and ID entry, and it still counts toward
-`max_sessions`, so the global limit is a hard bound on the sockets, tasks,
-and receive buffers that exist; old and new sessions never add up to more.
-At the global limit a returning client is rejected until closed tasks have
-ended. To keep that short, every wait in the session task (including the
+slot with the route, and the global slot with the session handle itself.
+The lease is the handle's last field, and the handle is the only owner of
+the upstream socket and of the receive-buffer reservation, so the global
+slot is released only after the last reference to the handle is gone and
+the socket and reservation went before it. The session task holds the
+handle until it ends; the listener holds it only while it forwards one
+datagram. Until then the closed session keeps its upstream socket,
+receive-buffer reservation, and global slot; its gauges and ID entry go
+with the cleanup guard when the task stops. A new session takes its global
+slot before it opens its upstream socket, so the number of sessions that
+hold an upstream socket or a receive-buffer reservation never exceeds
+`max_sessions`, counting old and new sessions together (a reload that lowers
+`max_sessions` keeps the sessions already live; new ones are refused until
+the count is below the new limit). At the global limit a returning client is
+rejected until closed sessions are gone. To keep that short, every wait in the session task (including the
 client-direction send and the receive-error back-off) is raced against the
 cancellation token, so a closed task exits at its next wake-up. Closing is
 reported once: a session that is already closed but still listed is not
 counted again by a later listener close or reload. Route removal is guarded
 by session ID, so a stale task never removes a newer session's route, and
 each stage of the lease is released once. A listener that fetched the old
-handle just before the close drops the datagram as `session_closed` instead
-of sending on the exiting session's
-socket. The cleanup guard is created before the task is spawned and owns the
+handle just before the close does not send on the exiting session's socket:
+the closed handle refuses the datagram without counting it, and the
+listener treats it as one from a client without a session, once. It goes
+through admission and normally opens a new session; if the listener is
+stopping it is counted as `session_closed` instead, and if admission
+refuses it, as `rejected`. A datagram the session accepted before the close
+can still be sent once. The cleanup guard is created before the task is spawned and owns the
 queue, so it is the one place a session ends, however its task stops
 (returning, dropped in mid-run, or dropped before its first poll): it closes
 the session, discards the queue, counts an unsent first datagram, removes the
-entry, ends the gauges, and releases the global admission slot. Queued
+entry, and ends the gauges. The task's references to the handle are dropped
+with it, and the last one releases the global admission slot. Queued
 datagrams account for themselves: each holds a reference to its session's
 accounting and, when it is dropped, releases its budget charge and, unless
 its send was settled, counts itself as `session_closed`. That covers one the
@@ -280,16 +293,24 @@ run concurrently. Capacity pressure evicts the least-recently-used snapshot,
 and stale or mismatched cursors receive structured errors.
 
 The configuration file and the control protocol use separate types. The
-file types reject unknown keys. The active configuration travels as a wire
-type whose service settings added after 0.1.6 are optional, and which
-ignores keys it does not know. A CLI from 0.1.6 or earlier rejects unknown
-keys, so the `active_config` operation keeps the 0.1.6 shape and leaves out
-`session_queue_depth` and `max_queue_memory_bytes`. Current CLIs ask for
-`active_config_extended`, which carries every setting. A daemon that predates
-that operation cannot decode the request and closes the connection without a
-response; the CLI then repeats the request as `active_config` and treats the
-missing settings as absent rather than filling in defaults. The protocol
-version stays 2, so every pairing of these releases still talks.
+file types reject unknown keys. The active configuration travels as wire
+types whose service settings added after 0.1.6 are optional, and which
+ignore keys they do not know in every section (`[service]`, `[metrics]`, and
+each `[[listeners]]` entry). A test fails if a file type gains a setting
+the extended wire form does not carry. A CLI from 0.1.6 or earlier rejects
+unknown keys, so the `active_config` operation keeps the 0.1.6 shape and
+leaves out `session_queue_depth` and `max_queue_memory_bytes`. Current CLIs
+ask for `active_config_extended`, which carries every setting. A daemon that
+predates that operation cannot decode the request and closes the connection
+without a response. The CLI counts a request as unanswered only when it
+wrote the whole request and the connection ended before the first byte of a
+response; a failure to connect or write, a timeout, or a response that
+breaks off is an error. An unanswered request is sent once more on a new
+connection, since a current daemon that is restarting, or at its limit of
+concurrent control connections, can also close one unanswered. Only if that
+is unanswered too does the CLI repeat the request as `active_config` and
+treat the missing settings as absent rather than filling in defaults. The
+protocol version stays 2, so every pairing of these releases still talks.
 
 Unsupported versions and malformed input receive structured errors when
 safely possible. The socket parent and socket use restrictive Unix

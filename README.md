@@ -305,15 +305,18 @@ at once, so the client's next datagram opens a new session even with
 `max_sessions_per_ip = 1`. A closed session does no further forwarding: its
 task stops at its next wake-up, without waiting for a pending send, and
 discards what is still queued as `session_closed`. Until its task has ended
-it still owns its upstream socket, and it still counts toward `max_sessions`,
-the queue budget, the session gauges, `active sessions` in `wire-relay
-status`, and `wire-relay sessions`. `max_sessions` therefore bounds the
-upstream sockets and tasks that exist, not only the sessions that can carry
-traffic, and is never exceeded by old and new sessions overlapping. The cost
-is at a relay that is at its global limit: right after a mass close (for
-example a backend change) a returning client is rejected, and counted as
-`rejected`, for the moment it takes the closed sessions' tasks to end; below
-the limit it is admitted immediately.
+it still counts toward the session gauges, `active sessions` in `wire-relay
+status`, and `wire-relay sessions`, and until its upstream socket is closed
+as well it still counts toward `max_sessions` and the queue budget.
+`max_sessions` therefore bounds the upstream sockets that exist, not only
+the sessions that can carry traffic, and is never exceeded by old and new
+sessions overlapping. The cost is at a relay that is at its global limit:
+right after a mass close (for example a backend change) a returning client
+is rejected, and counted as `rejected`, for the moment it takes the closed
+sessions to end; below the limit it is admitted immediately. A datagram that
+arrives just as its session closes is not dropped as `session_closed`: it
+opens a new session like the client's next datagram would, unless the
+listener itself is stopping.
 
 Idle expiry is decided against the listener's forwarding path: a session is
 not expired under a datagram it has just accepted, and once it expires no
@@ -390,7 +393,11 @@ example a new CLI before the daemon has restarted. `wire-relay config`
 reports `session_queue_depth` and `max_queue_memory_bytes` only when the
 daemon has them. Connected to an older daemon, the CLI leaves both out of the
 TOML and JSON output instead of showing defaults that daemon does not use;
-the TOML output starts with a comment that says so. A CLI from 0.1.6 or
+the TOML output starts with a comment that says so. The CLI decides that the
+daemon is older only when two requests in a row are closed without any
+response; a connection error, a timeout, or a response that breaks off is
+reported as an error instead. Settings a newer daemon reports that this CLI
+does not know are ignored, in every section. A CLI from 0.1.6 or
 earlier connected to a newer daemon gets the configuration without those two
 settings. Such a CLI still validates the TOML form against its own, older
 limits, so for a configuration only a newer release accepts (for example
