@@ -35,7 +35,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sending only into a full queue or exhausted budget still idles out. Backend
   send errors still count as client activity, and so does delivering a queued
   datagram, so a session is not expired with datagrams still queued when a
-  stalled upstream socket recovers.
+  stalled upstream socket recovers. A session with datagrams still queued is
+  not idle-expired at all, so if its task was held up past the idle timeout,
+  those datagrams are delivered instead of discarded as `session_closed`.
 - Sessions of a stopping listener reject datagrams immediately instead of
   sending or queueing them until their tasks wake up.
 - A datagram that reaches a session just as it is closed or expires (for

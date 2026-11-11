@@ -293,11 +293,14 @@ datagrams that have to queue are dropped as `budget_exhausted` until enough of
 those sessions end. Datagrams the relay drops itself (`queue_full`,
 `budget_exhausted`, `session_closed`) do not count as client activity, so
 sessions whose clients only send into a full queue or exhausted budget still
-idle out and release their buffers. A send the OS refuses (`send_error`) does
+idle out, once nothing of theirs is left queued, and release their buffers. A send the OS refuses (`send_error`) does
 count, so a backend outage does not expire sessions whose clients keep
 sending. Delivering a queued datagram counts too, so a session whose upstream
 socket was stalled for longer than `idle_timeout` is not expired, with
-datagrams still queued, the moment the socket recovers.
+datagrams still queued, the moment the socket recovers. A session with
+datagrams still queued is never idle-expired, so if its task was held up past
+`idle_timeout` (a blocked send, or no CPU), those datagrams are delivered
+rather than discarded as `session_closed`.
 
 Closing a session (backend change, listener removal, `session close`, idle
 expiry) removes its route and frees its client's `max_sessions_per_ip` slot

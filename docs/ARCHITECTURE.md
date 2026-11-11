@@ -190,7 +190,12 @@ withdraws the announcement and is sent, so a datagram is refused only by a
 session that really closed. If that datagram is then dropped (`queue_full`
 or `budget_exhausted`), activity is not refreshed and the deadline has
 already passed, so the task tries again after a 10 ms back-off rather than
-at once. The expiry runs under the route's shard lock and
+at once. A session with datagrams still queued is not expired either: a
+forward increments the queued count while it is registered in the state
+word, so the task sees it in one or the other. If the task was held up past
+the idle timeout, it retries after the same back-off, by which time it has
+drained the queue (which refreshes activity) instead of discarding those
+datagrams as `session_closed`. The expiry runs under the route's shard lock and
 removes the route and releases admission in the same step, so the client's
 next datagram opens a new session. A session closed for another reason at
 that moment is counted as closed, not expired.
