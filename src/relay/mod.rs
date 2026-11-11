@@ -8,5 +8,5 @@ pub mod session_table;
 pub mod upstream;
 
 pub use listener::{ListenerHandle, ListenerSnapshot, ListenerStatus, PreparedListener};
-pub use session::{Session, SessionCloseReason, SessionHandle, SessionSnapshot};
+pub use session::{Forward, Session, SessionCloseReason, SessionHandle, SessionSnapshot};
 pub use session_table::{ListenerId, SessionId, SessionKey, SessionTable};

@@ -2,7 +2,12 @@
 
 //! Versioned, bounded length-prefixed JSON control protocol.
 
-use std::{fmt, io, net::IpAddr, path::PathBuf, time::Duration};
+use std::{
+    fmt, io,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -10,7 +15,10 @@ use uuid::Uuid;
 
 use crate::{
     CONTROL_PROTOCOL_VERSION,
-    config::NormalizedConfig,
+    config::{
+        BackendEndpoint, ConfigError, ListenerConfig, LogLevel, MetricsConfig, NormalizedConfig,
+        ServiceConfig, socket_addr_serde,
+    },
     metrics::MetricsSnapshot,
     relay::{ListenerSnapshot, SessionId, SessionSnapshot},
 };
@@ -49,13 +57,26 @@ impl RequestEnvelope {
 #[serde(tag = "operation", content = "parameters", rename_all = "snake_case")]
 pub enum ControlRequest {
     Status,
+    /// The active configuration in the shape every 0.1.x CLI decodes: only
+    /// the service settings those releases know, so a CLI that rejects
+    /// unknown fields can still read it.
     ActiveConfig,
+    /// The active configuration with every setting this daemon has.
+    ///
+    /// A daemon that predates this operation cannot decode the request and
+    /// closes the connection without answering; the CLI then falls back to
+    /// [`ControlRequest::ActiveConfig`].
+    ActiveConfigExtended,
     Listeners,
     Sessions(SessionQuery),
-    Session { id: SessionId },
+    Session {
+        id: SessionId,
+    },
     Stats,
     Reload,
-    CloseSession { id: SessionId },
+    CloseSession {
+        id: SessionId,
+    },
     Version,
 }
 
@@ -169,7 +190,8 @@ impl ResponseEnvelope {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ControlResponse {
     Status(StatusSnapshot),
-    ActiveConfig(NormalizedConfig),
+    ActiveConfig(ActiveConfigSnapshot),
+    ActiveConfigExtended(ActiveConfigSnapshot),
     Listeners(Vec<ListenerSnapshot>),
     Sessions(SessionPage),
     Session(SessionSnapshot),
@@ -177,6 +199,218 @@ pub enum ControlResponse {
     Reload(ReloadResult),
     SessionClosed { id: SessionId },
     Version(VersionSnapshot),
+}
+
+/// The active configuration as carried by the control protocol.
+///
+/// This is the wire form of [`NormalizedConfig`], kept apart from the strict
+/// file format. The configuration file still rejects unknown keys; none of
+/// the snapshot types do, at any level, so a CLI can read the configuration
+/// of a newer daemon that has settings this CLI does not know. Service
+/// settings added after 0.1.6 are optional, so a CLI can tell a daemon that
+/// does not have them from one that uses their defaults.
+///
+/// Every snapshot type carries each field of its file type with the same
+/// name and order; a test fails when a file type gains a field that the
+/// extended snapshot does not report.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveConfigSnapshot {
+    pub service: ActiveServiceSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<ActiveMetricsSnapshot>,
+    pub listeners: Vec<ActiveListenerSnapshot>,
+}
+
+/// `[metrics]` in an [`ActiveConfigSnapshot`]; the wire form of
+/// [`MetricsConfig`], which ignores unknown keys.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ActiveMetricsSnapshot {
+    pub enabled: bool,
+    #[serde(with = "socket_addr_serde")]
+    pub bind: SocketAddr,
+}
+
+impl Default for ActiveMetricsSnapshot {
+    fn default() -> Self {
+        Self::from(&MetricsConfig::default())
+    }
+}
+
+impl From<&MetricsConfig> for ActiveMetricsSnapshot {
+    fn from(metrics: &MetricsConfig) -> Self {
+        Self {
+            enabled: metrics.enabled,
+            bind: metrics.bind,
+        }
+    }
+}
+
+impl From<&ActiveMetricsSnapshot> for MetricsConfig {
+    fn from(metrics: &ActiveMetricsSnapshot) -> Self {
+        Self {
+            enabled: metrics.enabled,
+            bind: metrics.bind,
+        }
+    }
+}
+
+/// One `[[listeners]]` entry in an [`ActiveConfigSnapshot`]; the wire form
+/// of [`ListenerConfig`], which ignores unknown keys.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveListenerSnapshot {
+    pub name: String,
+    #[serde(with = "socket_addr_serde")]
+    pub bind: SocketAddr,
+    pub backend: BackendEndpoint,
+}
+
+impl From<&ListenerConfig> for ActiveListenerSnapshot {
+    fn from(listener: &ListenerConfig) -> Self {
+        Self {
+            name: listener.name.clone(),
+            bind: listener.bind,
+            backend: listener.backend.clone(),
+        }
+    }
+}
+
+impl From<&ActiveListenerSnapshot> for ListenerConfig {
+    fn from(listener: &ActiveListenerSnapshot) -> Self {
+        Self {
+            name: listener.name.clone(),
+            bind: listener.bind,
+            backend: listener.backend.clone(),
+        }
+    }
+}
+
+/// Service settings in an [`ActiveConfigSnapshot`].
+///
+/// The required fields are the 0.1.6 set, in the configuration file's order.
+/// Each later setting is `None` when the daemon does not report it: in the
+/// [`ControlResponse::ActiveConfig`] shape, or from a daemon that predates it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveServiceSnapshot {
+    pub control_socket: PathBuf,
+    pub log_level: LogLevel,
+    #[serde(with = "humantime_serde")]
+    pub idle_timeout: Duration,
+    pub max_datagram_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_queue_depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_queue_memory_bytes: Option<u64>,
+    pub max_sessions: usize,
+    pub max_sessions_per_ip: usize,
+    pub new_sessions_per_second: u32,
+    #[serde(with = "humantime_serde")]
+    pub dns_refresh_interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub shutdown_timeout: Duration,
+}
+
+impl ActiveConfigSnapshot {
+    /// Every setting of `config`, for [`ControlResponse::ActiveConfigExtended`].
+    #[must_use]
+    pub fn extended(config: &NormalizedConfig) -> Self {
+        let service = &config.service;
+        Self {
+            service: ActiveServiceSnapshot {
+                control_socket: service.control_socket.clone(),
+                log_level: service.log_level,
+                idle_timeout: service.idle_timeout,
+                max_datagram_size: service.max_datagram_size,
+                session_queue_depth: Some(service.session_queue_depth),
+                max_queue_memory_bytes: Some(service.max_queue_memory_bytes),
+                max_sessions: service.max_sessions,
+                max_sessions_per_ip: service.max_sessions_per_ip,
+                new_sessions_per_second: service.new_sessions_per_second,
+                dns_refresh_interval: service.dns_refresh_interval,
+                shutdown_timeout: service.shutdown_timeout,
+            },
+            metrics: config.metrics.as_ref().map(ActiveMetricsSnapshot::from),
+            listeners: config
+                .listeners
+                .iter()
+                .map(ActiveListenerSnapshot::from)
+                .collect(),
+        }
+    }
+
+    /// `config` in the 0.1.6 shape, for [`ControlResponse::ActiveConfig`]:
+    /// later service settings are left out.
+    #[must_use]
+    pub fn legacy(config: &NormalizedConfig) -> Self {
+        let mut snapshot = Self::extended(config);
+        snapshot.service.session_queue_depth = None;
+        snapshot.service.max_queue_memory_bytes = None;
+        snapshot
+    }
+
+    /// Configuration keys of service settings the daemon did not report.
+    #[must_use]
+    pub fn unreported_service_settings(&self) -> Vec<&'static str> {
+        let service = &self.service;
+        [
+            (
+                service.session_queue_depth.is_none(),
+                "service.session_queue_depth",
+            ),
+            (
+                service.max_queue_memory_bytes.is_none(),
+                "service.max_queue_memory_bytes",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(missing, key)| missing.then_some(key))
+        .collect()
+    }
+
+    /// Validates the reported settings against this release's
+    /// configuration-file rules, as if they were loaded from a file. A
+    /// setting the daemon did not report is checked at its default, which
+    /// every configuration valid for a daemon without that setting also
+    /// satisfies. [`Self::to_toml`] does not call this: a later daemon may
+    /// run with values this release would not load.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let service = &self.service;
+        let defaults = ServiceConfig::default();
+        NormalizedConfig {
+            service: ServiceConfig {
+                control_socket: service.control_socket.clone(),
+                log_level: service.log_level,
+                idle_timeout: service.idle_timeout,
+                max_datagram_size: service.max_datagram_size,
+                session_queue_depth: service
+                    .session_queue_depth
+                    .unwrap_or(defaults.session_queue_depth),
+                max_queue_memory_bytes: service
+                    .max_queue_memory_bytes
+                    .unwrap_or(defaults.max_queue_memory_bytes),
+                max_sessions: service.max_sessions,
+                max_sessions_per_ip: service.max_sessions_per_ip,
+                new_sessions_per_second: service.new_sessions_per_second,
+                dns_refresh_interval: service.dns_refresh_interval,
+                shutdown_timeout: service.shutdown_timeout,
+            },
+            metrics: self.metrics.as_ref().map(MetricsConfig::from),
+            listeners: self.listeners.iter().map(ListenerConfig::from).collect(),
+        }
+        .validate()
+    }
+
+    /// Serializes the reported configuration as normalized TOML; settings the
+    /// daemon did not report are omitted, not filled in with defaults.
+    ///
+    /// This shows what the daemon is running and does not re-check it
+    /// against this release's configuration-file limits ([`Self::validate`]):
+    /// a later daemon may accept values this CLI would reject when loading a
+    /// file, and its configuration must still be viewable. Loading the
+    /// output as a file is still validated as usual.
+    pub fn to_toml(&self) -> Result<String, ConfigError> {
+        toml::to_string_pretty(self).map_err(|source| ConfigError::Serialize { source })
+    }
 }
 
 /// Summary shown by `wire-relay show`.
@@ -301,6 +535,261 @@ where
 mod tests {
     use super::*;
     use crate::relay::ListenerId;
+
+    /// A 0.1.6 daemon's real `active_config` response.
+    const OLD_DAEMON_ACTIVE_CONFIG: &str = r#"{"protocol_version":2,"request_id":"00000000-0000-0000-0000-000000000001","response":{"kind":"active_config","data":{"service":{"control_socket":"/tmp/wr-interop/control.sock","log_level":"info","idle_timeout":"3m","max_datagram_size":4096,"max_sessions":10000,"max_sessions_per_ip":64,"new_sessions_per_second":100,"dns_refresh_interval":"1m","shutdown_timeout":"10s"},"metrics":{"enabled":true,"bind":"127.0.0.1:19090"},"listeners":[{"name":"t","bind":"127.0.0.1:47811","backend":"relay.example.com:47812"}]}}}"#;
+
+    /// The strict response types of a 0.1.6 CLI, which reject unknown keys.
+    mod old_cli {
+        // Only decoding matters; the values are never read.
+        #![allow(dead_code)]
+
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Envelope {
+            pub protocol_version: u16,
+            pub request_id: uuid::Uuid,
+            pub response: Option<Response>,
+            pub error: Option<serde_json::Value>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+        pub enum Response {
+            ActiveConfig(Config),
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Config {
+            pub service: Service,
+            #[serde(default)]
+            pub metrics: Option<Metrics>,
+            pub listeners: Vec<Listener>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        #[derive(Default)]
+        pub struct Metrics {
+            pub enabled: serde_json::Value,
+            pub bind: serde_json::Value,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Listener {
+            pub name: serde_json::Value,
+            pub bind: serde_json::Value,
+            pub backend: serde_json::Value,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        #[derive(Default)]
+        pub struct Service {
+            pub control_socket: serde_json::Value,
+            pub log_level: serde_json::Value,
+            pub idle_timeout: serde_json::Value,
+            pub max_datagram_size: serde_json::Value,
+            pub max_sessions: serde_json::Value,
+            pub max_sessions_per_ip: serde_json::Value,
+            pub new_sessions_per_second: serde_json::Value,
+            pub dns_refresh_interval: serde_json::Value,
+            pub shutdown_timeout: serde_json::Value,
+        }
+    }
+
+    fn sample_config() -> NormalizedConfig {
+        crate::config::Config::parse_str(
+            "[service]\nsession_queue_depth = 64\nmax_queue_memory_bytes = 33554432\n\n\
+             [metrics]\nenabled = true\nbind = \"127.0.0.1:19090\"\n\n\
+             [[listeners]]\nname = \"t\"\nbind = \"127.0.0.1:47811\"\n\
+             backend = \"relay.example.com:47812\"\n",
+        )
+        .unwrap()
+        .into_normalized()
+        .unwrap()
+    }
+
+    #[test]
+    fn an_old_cli_decodes_the_active_config_of_this_daemon() {
+        let response = ResponseEnvelope::success(
+            Uuid::nil(),
+            ControlResponse::ActiveConfig(ActiveConfigSnapshot::legacy(&sample_config())),
+        );
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: old_cli::Envelope = serde_json::from_str(&encoded)
+            .unwrap_or_else(|error| panic!("a 0.1.6 CLI cannot decode {encoded}: {error}"));
+        assert!(matches!(
+            decoded.response,
+            Some(old_cli::Response::ActiveConfig(_))
+        ));
+        assert!(!encoded.contains("session_queue_depth"));
+        assert!(!encoded.contains("max_queue_memory_bytes"));
+
+        // The extended form is what an old CLI could not decode; only a new
+        // CLI asks for it.
+        let extended =
+            serde_json::to_value(ActiveConfigSnapshot::extended(&sample_config())).unwrap();
+        assert_eq!(extended["service"]["session_queue_depth"], 64);
+        assert_eq!(extended["service"]["max_queue_memory_bytes"], 33_554_432);
+        assert!(serde_json::from_value::<old_cli::Config>(extended).is_err());
+    }
+
+    #[test]
+    fn an_old_daemon_active_config_does_not_invent_new_settings() {
+        let envelope: ResponseEnvelope = serde_json::from_str(OLD_DAEMON_ACTIVE_CONFIG).unwrap();
+        let ControlResponse::ActiveConfig(config) = envelope.into_result().unwrap() else {
+            panic!("wrong response variant");
+        };
+        assert_eq!(config.service.session_queue_depth, None);
+        assert_eq!(config.service.max_queue_memory_bytes, None);
+        assert_eq!(
+            config.unreported_service_settings(),
+            [
+                "service.session_queue_depth",
+                "service.max_queue_memory_bytes"
+            ]
+        );
+        assert_eq!(config.service.max_sessions, 10_000);
+        assert_eq!(config.service.idle_timeout, Duration::from_secs(180));
+        assert_eq!(config.listeners.len(), 1);
+        let toml = config.to_toml().unwrap();
+        assert!(toml.contains("max_datagram_size = 4096\n"));
+        assert!(!toml.contains("session_queue_depth"), "{toml}");
+        assert!(!toml.contains("max_queue_memory_bytes"), "{toml}");
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("session_queue_depth"), "{json}");
+    }
+
+    #[test]
+    fn the_extended_active_config_matches_the_configuration_file_form() {
+        let config = sample_config();
+        let snapshot = ActiveConfigSnapshot::extended(&config);
+        assert!(snapshot.unreported_service_settings().is_empty());
+        // Same keys, order, and formatting as the strict file type.
+        assert_eq!(snapshot.to_toml().unwrap(), config.to_toml().unwrap());
+        assert_eq!(
+            serde_json::to_value(&snapshot).unwrap(),
+            serde_json::to_value(&config).unwrap()
+        );
+        let response = ControlResponse::ActiveConfigExtended(snapshot.clone());
+        let decoded: ControlResponse =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        assert_eq!(decoded, response);
+
+        // A later daemon may report settings this CLI does not know.
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value["service"]["a_later_setting"] = 1.into();
+        assert_eq!(
+            serde_json::from_value::<ActiveConfigSnapshot>(value).unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn the_running_configuration_is_shown_even_beyond_this_releases_file_limits() {
+        use crate::config::{Config, MAX_CONFIGURED_SESSIONS};
+
+        let config = sample_config();
+        let over = MAX_CONFIGURED_SESSIONS + 1;
+        // A later daemon running with a value this release would not load.
+        let mut snapshot = ActiveConfigSnapshot::extended(&config);
+        snapshot.service.max_sessions = over;
+        let toml = snapshot.to_toml().unwrap();
+        assert!(toml.contains(&format!("max_sessions = {over}\n")), "{toml}");
+        assert!(snapshot.validate().is_err());
+
+        // Loading that output as a configuration file still enforces the
+        // limit, through parsing and through validation.
+        let error = Config::parse_str(&toml).unwrap_err();
+        assert!(error.to_string().contains("max_sessions"), "{error}");
+        let mut file = config;
+        file.service.max_sessions = over;
+        assert!(file.validate().is_err());
+        assert!(file.to_toml().is_err());
+    }
+
+    #[test]
+    fn the_configuration_file_still_rejects_unknown_keys() {
+        for (section, extra) in [
+            ("[service]\na_later_setting = 1\n", ""),
+            (
+                "[metrics]\nenabled = true\nbind = \"127.0.0.1:19090\"\na_later_setting = 1\n",
+                "",
+            ),
+            ("", "a_later_setting = 1\n"),
+        ] {
+            let error = crate::config::Config::parse_str(&format!(
+                "{section}\n[[listeners]]\nname = \"t\"\n\
+                 bind = \"127.0.0.1:47811\"\nbackend = \"127.0.0.1:47812\"\n{extra}"
+            ))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("a_later_setting"),
+                "{section}{extra}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_metrics_and_listener_settings_are_ignored_on_the_wire() {
+        let snapshot = ActiveConfigSnapshot::extended(&sample_config());
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value["metrics"]["a_later_setting"] = 1.into();
+        value["listeners"][0]["a_later_setting"] = 1.into();
+        assert_eq!(
+            serde_json::from_value::<ActiveConfigSnapshot>(value.clone()).unwrap(),
+            snapshot
+        );
+        // Through the response a CLI actually decodes, in both shapes.
+        for kind in ["active_config", "active_config_extended"] {
+            let envelope = serde_json::json!({
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "request_id": Uuid::nil(),
+                "response": {"kind": kind, "data": value.clone()},
+            });
+            let decoded: ResponseEnvelope = serde_json::from_value(envelope).unwrap();
+            assert!(decoded.into_result().is_ok(), "{kind}");
+        }
+    }
+
+    /// Each section of the extended snapshot carries every key of its file
+    /// type, so a setting added to the configuration cannot be left out of
+    /// `wire-relay config`. (The order is checked through the TOML form in
+    /// `the_extended_active_config_matches_the_configuration_file_form`.)
+    #[test]
+    fn the_extended_snapshot_reports_every_configuration_setting() {
+        fn keys(value: &serde_json::Value) -> Vec<String> {
+            value
+                .as_object()
+                .expect("a section is a table")
+                .keys()
+                .cloned()
+                .collect()
+        }
+        let config = sample_config();
+        let file = serde_json::to_value(&config).unwrap();
+        let snapshot = serde_json::to_value(ActiveConfigSnapshot::extended(&config)).unwrap();
+        for (section, file, snapshot) in [
+            ("service", &file["service"], &snapshot["service"]),
+            ("metrics", &file["metrics"], &snapshot["metrics"]),
+            (
+                "listeners",
+                &file["listeners"][0],
+                &snapshot["listeners"][0],
+            ),
+        ] {
+            assert_eq!(
+                keys(snapshot),
+                keys(file),
+                "[{section}]: add the new setting to the control snapshot types"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn request_round_trips_through_framing() {

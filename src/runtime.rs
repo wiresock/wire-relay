@@ -31,8 +31,8 @@ use crate::{
     control::{
         ControlError, ControlErrorCode, ControlRequest, ControlResponse,
         protocol::{
-            ReloadResult, SessionCursor, SessionPage, SessionQuery, SessionSort, StatusSnapshot,
-            VersionSnapshot,
+            ActiveConfigSnapshot, ReloadResult, SessionCursor, SessionPage, SessionQuery,
+            SessionSort, StatusSnapshot, VersionSnapshot,
         },
         server::{ControlHandler, ControlServerHandle},
     },
@@ -43,7 +43,7 @@ use crate::{
     metrics::{Metrics, MetricsServerHandle, PreparedMetricsServer},
     relay::{
         ListenerHandle, ListenerId, ListenerSnapshot, PreparedListener, SessionSnapshot,
-        SessionTable, listener::ListenerContext,
+        SessionTable, listener::ListenerContext, session::QueueBudget,
     },
 };
 
@@ -87,7 +87,8 @@ struct RuntimeCore {
     admission: Arc<AdmissionController>,
     metrics: Arc<Metrics>,
     idle_timeout: watch::Sender<Duration>,
-    max_datagram_size: Arc<AtomicUsize>,
+    session_queue_depth: Arc<AtomicUsize>,
+    queue_budget: Arc<QueueBudget>,
     dns_refresh_interval_ms: Arc<AtomicU64>,
     cancel: CancellationToken,
     tracker: TaskTracker,
@@ -239,7 +240,8 @@ impl Runtime {
             admission,
             metrics,
             idle_timeout,
-            max_datagram_size: Arc::new(AtomicUsize::new(config.service.max_datagram_size)),
+            session_queue_depth: Arc::new(AtomicUsize::new(config.service.session_queue_depth)),
+            queue_budget: QueueBudget::new(&config.service),
             dns_refresh_interval_ms: Arc::new(AtomicU64::new(duration_millis_nonzero(
                 config.service.dns_refresh_interval,
             ))),
@@ -329,7 +331,8 @@ impl RuntimeCore {
             admission: Arc::clone(&self.admission),
             metrics: Arc::clone(&self.metrics),
             idle_timeout: self.idle_timeout.clone(),
-            max_datagram_size: Arc::clone(&self.max_datagram_size),
+            session_queue_depth: Arc::clone(&self.session_queue_depth),
+            queue_budget: Arc::clone(&self.queue_budget),
             dns_refresh_interval_ms: Arc::clone(&self.dns_refresh_interval_ms),
             parent_cancel: self.cancel.clone(),
             tracker: self.tracker.clone(),
@@ -581,16 +584,26 @@ impl RuntimeCore {
         logging::reload_level(new_config.service.log_level)?;
         self.idle_timeout
             .send_replace(new_config.service.idle_timeout);
-        self.max_datagram_size
-            .store(new_config.service.max_datagram_size, Ordering::Relaxed);
-        self.dns_refresh_interval_ms.store(
-            duration_millis_nonzero(new_config.service.dns_refresh_interval),
-            Ordering::Relaxed,
-        );
+        self.session_queue_depth
+            .store(new_config.service.session_queue_depth, Ordering::Relaxed);
+        // Apply the new admission limits before the queue budget so no
+        // session is admitted under the old limits after the budget changes.
         self.admission.update(
             new_config.service.max_sessions,
             new_config.service.max_sessions_per_ip,
             new_config.service.new_sessions_per_second,
+        );
+        // The budget derives its limit from the live session count on every
+        // reservation, so sessions admitted under the previous limits keep
+        // their receive buffers reserved, and the limit recovers as they end.
+        // It is also the only runtime copy of `max_datagram_size`: one store
+        // publishes the size listeners and sessions size their buffers from
+        // together with the budget shape that charges for it.
+        self.queue_budget.configure(&new_config.service);
+        warn_if_live_sessions_starve_queue_budget(&self.queue_budget);
+        self.dns_refresh_interval_ms.store(
+            duration_millis_nonzero(new_config.service.dns_refresh_interval),
+            Ordering::Relaxed,
         );
 
         let refresh_interval = new_config.service.dns_refresh_interval;
@@ -912,9 +925,14 @@ impl ControlHandler for RuntimeCore {
         Box::pin(async move {
             match request {
                 ControlRequest::Status => Ok(ControlResponse::Status(self.status())),
-                ControlRequest::ActiveConfig => {
-                    Ok(ControlResponse::ActiveConfig(self.active_config()))
-                }
+                // Older CLIs reject unknown service keys, so this keeps the
+                // 0.1.6 shape; newer CLIs ask for the extended form.
+                ControlRequest::ActiveConfig => Ok(ControlResponse::ActiveConfig(
+                    ActiveConfigSnapshot::legacy(&self.active_config()),
+                )),
+                ControlRequest::ActiveConfigExtended => Ok(ControlResponse::ActiveConfigExtended(
+                    ActiveConfigSnapshot::extended(&self.active_config()),
+                )),
                 ControlRequest::Listeners => {
                     Ok(ControlResponse::Listeners(self.listener_snapshots()))
                 }
@@ -948,8 +966,17 @@ impl ControlHandler for RuntimeCore {
                             format!("session `{id}` was not found"),
                         )
                     })?;
-                    session.close();
-                    Ok(ControlResponse::SessionClosed { id })
+                    // A closed session stays listed by ID until its task
+                    // ends; closing it again is reported, not claimed as a
+                    // close by this request.
+                    if self.sessions.close(&session) {
+                        Ok(ControlResponse::SessionClosed { id })
+                    } else {
+                        Err(ControlError::new(
+                            ControlErrorCode::NotFound,
+                            format!("session `{id}` is already closed"),
+                        ))
+                    }
                 }
                 ControlRequest::Version => Ok(ControlResponse::Version(VersionSnapshot {
                     application: VERSION.to_owned(),
@@ -1099,9 +1126,203 @@ fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Warns when a reload leaves live sessions' receive buffers so large that
+/// less than one maximum-sized datagram fits in the queue budget. The reload
+/// still applies; queued datagrams drop as `budget_exhausted` until enough of
+/// those sessions end.
+fn warn_if_live_sessions_starve_queue_budget(budget: &QueueBudget) -> bool {
+    if !budget.starved_by_live_sessions() {
+        return false;
+    }
+    let (max_sessions, max_datagram_size) = budget.configured();
+    warn!(
+        live_sessions = budget.live_sessions(),
+        max_sessions,
+        max_datagram_size,
+        budget_limit_bytes = budget.limit(),
+        one_datagram_charge_bytes = QueueBudget::charge(max_datagram_size),
+        "receive buffers of the live sessions at the new max_datagram_size leave less than \
+         one maximum-sized datagram of queued-datagram memory; queued client datagrams will \
+         drop as budget_exhausted until enough of these sessions end"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_budget_test_config(
+        listener: std::net::SocketAddr,
+        backend: std::net::SocketAddr,
+        max_sessions: usize,
+        idle_timeout: &str,
+    ) -> String {
+        format!(
+            "[service]\nmax_datagram_size = 4096\nmax_sessions = {max_sessions}\n\
+             max_queue_memory_bytes = 4294967296\nmax_sessions_per_ip = {max_sessions}\nnew_sessions_per_second = 1000\n\
+             idle_timeout = \"{idle_timeout}\"\nshutdown_timeout = \"3s\"\n\n\
+             [[listeners]]\nname = \"budget\"\nbind = \"{listener}\"\n\
+             backend = \"{backend}\"\n"
+        )
+    }
+
+    /// Starts a runtime on a free listener port, retrying when another
+    /// process takes the probed port before the runtime binds it.
+    async fn start_budget_runtime(
+        path: &std::path::Path,
+        backend: std::net::SocketAddr,
+        max_sessions: usize,
+    ) -> (Runtime, std::net::SocketAddr) {
+        const ATTEMPTS: usize = 10;
+        let mut last_error = None;
+        for _ in 0..ATTEMPTS {
+            let listener_addr = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let text = queue_budget_test_config(listener_addr, backend, max_sessions, "5m");
+            std::fs::write(path, &text).unwrap();
+            let config = crate::config::Config::parse_str(&text)
+                .unwrap()
+                .into_normalized()
+                .unwrap();
+            match Runtime::start_with_options(
+                config,
+                path,
+                RuntimeOptions {
+                    control: false,
+                    metrics: false,
+                },
+            )
+            .await
+            {
+                Ok(runtime) => return (runtime, listener_addr),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        panic!("failed to start the runtime after {ATTEMPTS} port attempts: {last_error:?}");
+    }
+
+    #[tokio::test]
+    async fn reload_reserves_receive_buffers_for_sessions_beyond_a_lowered_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let backend = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let (runtime, listener_addr) = start_budget_runtime(&path, backend_addr, 4).await;
+
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.send_to(b"hello", listener_addr).await.unwrap();
+            clients.push(client);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.sessions().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("three sessions must start");
+
+        // Lower `max_sessions` below the live count. The idle timeout stays
+        // long so the sessions cannot expire before the assertions below.
+        let lowered = queue_budget_test_config(listener_addr, backend_addr, 1, "5m");
+        std::fs::write(&path, &lowered).unwrap();
+        let result = runtime.reload().await.unwrap();
+        assert!(result.applied, "{}", result.message);
+        assert_eq!(
+            runtime.sessions().len(),
+            3,
+            "reload must keep live sessions"
+        );
+
+        let new_service = crate::config::Config::parse_str(&lowered).unwrap().service;
+        let per_session = 2 * 4096 + 1;
+        let expected =
+            usize::try_from(crate::config::MAX_SESSION_DATAGRAM_MEMORY_BYTES - 3 * per_session)
+                .unwrap();
+        assert_eq!(runtime.core.queue_budget.live_sessions(), 3);
+        assert_eq!(runtime.core.queue_budget.limit(), expected);
+        assert!(
+            runtime.core.queue_budget.limit() < new_service.queued_datagram_budget(),
+            "live sessions above the new limit must keep their buffer reservation"
+        );
+
+        // Only now end the sessions: refresh their activity, then shorten
+        // the idle timeout with an otherwise identical reload. Once they
+        // end, the limit must return to the steady-state budget for the new
+        // configuration.
+        for client in &clients {
+            client.send_to(b"keepalive", listener_addr).await.unwrap();
+        }
+        let expiring = queue_budget_test_config(listener_addr, backend_addr, 1, "50ms");
+        std::fs::write(&path, &expiring).unwrap();
+        let result = runtime.reload().await.unwrap();
+        assert!(result.applied, "{}", result.message);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !runtime.sessions().is_empty() || runtime.core.queue_budget.live_sessions() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sessions must expire under the lowered idle timeout");
+        assert_eq!(
+            runtime.core.queue_budget.limit(),
+            new_service.queued_datagram_budget()
+        );
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn reload_detects_live_sessions_starving_the_queue_budget() {
+        let before = crate::config::ServiceConfig {
+            max_sessions: 50_000,
+            max_datagram_size: 4096,
+            ..crate::config::ServiceConfig::default()
+        };
+        let after = crate::config::ServiceConfig {
+            max_sessions: 1_000,
+            max_datagram_size: 65_507,
+            ..crate::config::ServiceConfig::default()
+        };
+        let budget = QueueBudget::new(&before);
+        let live: Vec<_> = (0..40_000).map(|_| budget.session_started()).collect();
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
+        budget.configure(&after);
+        assert!(warn_if_live_sessions_starve_queue_budget(&budget));
+        assert_eq!(budget.limit(), 0);
+        drop(live);
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
+        assert_eq!(budget.limit(), after.queued_datagram_budget());
+    }
+
+    #[test]
+    fn reload_warns_when_less_than_one_maximum_datagram_fits() {
+        let after = crate::config::ServiceConfig {
+            max_sessions: 1_000,
+            max_datagram_size: 65_507,
+            ..crate::config::ServiceConfig::default()
+        };
+        let charge = QueueBudget::charge(after.max_datagram_size);
+        let budget = QueueBudget::new(&crate::config::ServiceConfig::default());
+        // 32 781 live sessions at 2 * 65507 + 1 bytes leave 164 581 bytes:
+        // room for a full-sized datagram, so no warning.
+        let mut live: Vec<_> = (0..32_781).map(|_| budget.session_started()).collect();
+        budget.configure(&after);
+        assert!(budget.limit() >= charge);
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
+        // One more leaves 33 566 bytes: positive, but too little for one
+        // maximum-sized datagram, so the reload must still warn.
+        live.push(budget.session_started());
+        assert!(budget.limit() > 0);
+        assert!(budget.limit() < charge);
+        assert!(warn_if_live_sessions_starve_queue_budget(&budget));
+        drop(live);
+        assert!(!warn_if_live_sessions_starve_queue_budget(&budget));
+    }
 
     fn session_snapshot(label: &str, bytes: u64) -> SessionSnapshot {
         SessionSnapshot {
@@ -1231,6 +1452,54 @@ mod tests {
         assert_eq!(cache.entries.len(), MAX_SESSION_CURSOR_SNAPSHOTS);
         assert_eq!(cache.retained_rows, MAX_SESSION_CURSOR_SNAPSHOTS * 2);
         assert!(!cache.entries.contains_key(&first_cursor.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn closing_an_already_closed_session_is_reported_as_an_error() {
+        use crate::relay::{ListenerId, Session, SessionHandle, SessionId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let (runtime, _) = start_budget_runtime(&path, "127.0.0.1:9".parse().unwrap(), 4).await;
+        // A handle without a task stays listed after it is closed, like a
+        // closed session whose task has not ended yet.
+        let handle = SessionHandle::for_test(Session::new(
+            ListenerId::new(u64::MAX),
+            "test".to_owned(),
+            "192.0.2.10:40000".parse().unwrap(),
+            "127.0.0.1:40001".parse().unwrap(),
+            "192.0.2.20:51820".parse().unwrap(),
+        ));
+        let id = handle.session().id;
+        assert!(runtime.core.sessions.insert(handle).is_ok());
+
+        let close = || runtime.core.handle(ControlRequest::CloseSession { id });
+        assert_eq!(
+            close().await.unwrap(),
+            ControlResponse::SessionClosed { id }
+        );
+        assert!(runtime.core.sessions.get_by_id(&id).is_some());
+        assert_eq!(
+            close().await.unwrap_err(),
+            ControlError::new(
+                ControlErrorCode::NotFound,
+                format!("session `{id}` is already closed"),
+            )
+        );
+
+        let unknown = SessionId::new();
+        assert_eq!(
+            runtime
+                .core
+                .handle(ControlRequest::CloseSession { id: unknown })
+                .await
+                .unwrap_err(),
+            ControlError::new(
+                ControlErrorCode::NotFound,
+                format!("session `{unknown}` was not found"),
+            )
+        );
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]

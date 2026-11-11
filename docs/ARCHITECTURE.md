@@ -62,19 +62,153 @@ The Tokio multi-thread scheduler runs several kinds of long-lived task:
 
 There is no task per packet. A listener reads into a buffer sized to
 `max_datagram_size + 1`, so it can reliably distinguish an acceptable
-datagram from a truncated oversized one. Existing-session datagrams are
-offered to a bounded per-session MPSC queue with `try_send`. Queue pressure
-drops and counts the datagram rather than growing memory or blocking all
-clients on the listener.
+datagram from a truncated oversized one. For an existing session, the
+listener sends the datagram directly with a non-blocking `try_send` on that
+session's connected upstream socket. Only if the socket reports `WouldBlock`,
+or earlier datagrams are still queued, is the datagram copied into a bounded
+per-session MPSC queue (`service.session_queue_depth`, default 512). A
+per-session pending count makes the listener queue behind earlier datagrams,
+so client datagram order is preserved; the listener is the only producer for
+its sessions. Queue pressure drops and counts the datagram as `queue_full`
+rather than growing memory or blocking all clients on the listener.
+
+Queued datagrams also reserve their length plus a fixed 64-byte per-datagram
+overhead from a process-wide queue memory budget:
+`service.max_queue_memory_bytes` (default 256 MiB), or, if that is less, the
+defensive 4 GiB datagram budget minus the fixed receive buffers of
+`max(max_sessions, live sessions)`. The explicit limit keeps the default worst
+case near what the earlier fixed eight-datagram queues could hold, instead of
+handing the queues whatever the receive buffers leave of the 4 GiB.
+The limit is not stored: every reservation derives it from the current
+`max_queue_memory_bytes`, `max_sessions` and `max_datagram_size` (updated on
+reload, after the admission limits) and an atomic live-session count kept by
+each session task. The budget
+holds the only runtime copy of `max_datagram_size`: listeners and sessions
+size their receive buffers from it, so one store publishes the new size and
+the budget shape that charges for it, and buffer sizing and the limit cannot
+disagree. A reload
+that shrinks `max_sessions` below the live count therefore lowers the limit
+only while the surplus sessions exist, and it returns to the steady-state
+budget as they end, without a recomputation that a concurrent reload or
+session exit could leave stale. The reservation is released when the queued
+datagram is dropped, including when a session stops with datagrams still
+queued. A lowered limit applies immediately; new reservations fail until use
+drains below it. Live sessions resize their receive buffers to the reloaded
+`max_datagram_size`, so the limit charges live sessions at the new size: a
+reload that raises `max_datagram_size` under a large live population, or
+shrinks `max_sessions` far below the live count, can drive the limit below
+one maximum-sized datagram, or to zero, although the new configuration is
+valid. The reload still applies and logs a warning whenever the limit is below
+the charge of one `max_datagram_size` datagram; queued datagrams drop as
+`budget_exhausted` until enough sessions end. The limit formula, including
+the `max(live, max_sessions)` rule, lives in one function in `config.rs`,
+used by both the test-only configuration helpers and the runtime budget.
+
+The listener claims a queue slot before charging the budget or copying the
+datagram, so a full queue drops without either. A full per-session queue is
+counted as `queue_full`; a failed budget reservation as `budget_exhausted`,
+with separate warnings. The budget is shared, not partitioned: under a tight
+configuration (high `max_sessions` and large datagrams) the remainder can be
+small, and a few back-pressured sessions can exhaust it so that other
+sessions drop as `budget_exhausted`.
+
+Rate-limited warnings use one atomic timestamp per log site, indexed by a
+`LogSite` enum declared from a single macro list (which also derives the slot
+count), so the drop path neither locks nor searches to decide whether to log.
+
+Closing a session (idle expiry, closed idle-timeout channel, explicit close,
+listener removal or backend change, shutdown) removes its routing entry,
+releases its client's per-IP admission slot, and sets the closed flag in the
+handle's atomic state word, which the listener checks without locking, all in
+one step under the routing entry's shard lock; it then cancels the token the
+task waits on. A listener therefore either still reaches the open session or
+finds no route and the client's slot free, and an idle expiry, which takes
+the same lock, cannot claim a session that is being closed. The lease is
+stored in the handle before the handle is published, and a session that loses
+its key is never listed by ID, so a close that races the launch still finds
+it. The task closes its own session the moment it decides to stop. A stopping
+listener closes every one of its sessions before it cancels its token, while
+its route lock keeps new ones from being launched, so no datagram is sent or
+queued after `stop` while the session tasks are still waking up.
+
+The next datagram from the same client therefore finds no route and is
+admitted as a new session even with a per-IP limit of one (for example a
+WireGuard handshake retry after a backend change), while the old task is
+still stopping. The admission lease is released in two stages: the per-IP
+slot with the route, and the global slot with the session handle itself.
+The lease is the handle's last field, and the handle is the only owner of
+the upstream socket and of the receive-buffer reservation, so the global
+slot is released only after the last reference to the handle is gone and
+the socket and reservation went before it. The session task holds the
+handle until it ends; the listener holds it only while it forwards one
+datagram. Until then the closed session keeps its upstream socket,
+receive-buffer reservation, and global slot; its gauges and ID entry go
+with the cleanup guard when the task stops. A new session takes its global
+slot before it opens its upstream socket, so the number of sessions that
+hold an upstream socket or a receive-buffer reservation never exceeds
+`max_sessions`, counting old and new sessions together (a reload that lowers
+`max_sessions` keeps the sessions already live; new ones are refused until
+the count is below the new limit). At the global limit a returning client is
+rejected until closed sessions are gone. To keep that short, every wait in the session task (including the
+client-direction send and the receive-error back-off) is raced against the
+cancellation token, so a closed task exits at its next wake-up. Closing is
+reported once: a session that is already closed but still listed is not
+counted again by a later listener close or reload, and `session close` on
+it returns a `not_found` error saying it is already closed. Route removal is guarded
+by session ID, so a stale task never removes a newer session's route, and
+each stage of the lease is released once. A listener that fetched the old
+handle just before the close does not send on the exiting session's socket:
+the closed handle refuses the datagram without counting it, and the
+listener treats it as one from a client without a session, once. A datagram
+that passes that check but has to queue after the cleanup has closed the
+queue is refused the same way. It goes
+through admission and normally opens a new session; if the listener is
+stopping it is counted as `session_closed` instead, and if admission
+refuses it, as `rejected`. A datagram the session accepted before the close
+can still be sent once. The cleanup guard is created before the task is spawned and owns the
+queue, so it is the one place a session ends, however its task stops
+(returning, dropped in mid-run, or dropped before its first poll): it closes
+the session, discards the queue, counts an unsent first datagram, removes the
+entry, and ends the gauges. The task's references to the handle are dropped
+with it, and the last one releases the global admission slot. Queued
+datagrams account for themselves: each holds a reference to its session's
+accounting and, when it is dropped, releases its budget charge and, unless
+its send was settled, counts itself as `session_closed`. That covers one the
+task had taken but not sent, every one still queued, and one the listener
+was still enqueueing when the session closed (counted when the queue is
+freed), so the cleanup never waits for the listener. A forward is registered
+in the state word only across its non-blocking send or enqueue; its
+accounting and logging run afterwards. Datagrams already sent are not
+counted, and delivering a queued datagram refreshes client activity like a
+direct send, so a session is not expired on the recovery of an upstream
+socket that was stalled for longer than the idle timeout. On idle timer expiry the task re-reads the
+current timeout before deciding to close, and decides against the listener's
+direct-send path: the listener registers each forward in the handle's state
+word, and the task announces the expiry there, re-reads activity, and closes
+the session only if the word is unchanged. A forward that starts meanwhile
+withdraws the announcement and is sent, so a datagram is refused only by a
+session that really closed. If that datagram is then dropped (`queue_full`
+or `budget_exhausted`), activity is not refreshed and the deadline has
+already passed, so the task tries again after a 10 ms back-off rather than
+at once. A session with datagrams still queued is not expired either: a
+forward increments the queued count while it is registered in the state
+word, so the task sees it in one or the other. If the task was held up past
+the idle timeout, it retries after the same back-off, by which time it has
+drained the queue (which refreshes activity) instead of discarding those
+datagrams as `session_closed`. The expiry runs under the route's shard lock and
+removes the route and releases admission in the same step, so the client's
+next datagram opens a new session. A session closed for another reason at
+that moment is counted as closed, not expired.
 
 For a new session, the listener reserves global/per-IP/rate capacity before
 creating a socket. The listener's receive loop serializes creation for that
 listener, preventing duplicate creation for the same key. Socket setup is
 bounded local work; admission is released on every setup failure.
 
-The session task owns its connected upstream socket and selects among:
+The session task shares its connected upstream socket with the session handle
+and selects among:
 
-- a queued client datagram;
+- queued client datagrams, of which it drains up to 64 per wakeup;
 - one backend datagram;
 - its idle deadline;
 - session or process cancellation.
@@ -89,9 +223,10 @@ socket means no protocol parsing is required to identify the client.
 
 ## Shared state and locking
 
-Session metadata is immutable where possible and uses atomics for counters.
-Activity timestamps and small DNS/config snapshots use short synchronous
-locks. A watch channel wakes sessions when the configured idle timeout
+Session metadata is immutable where possible and uses atomics for counters
+and activity timestamps. The idle deadline is armed once and recomputed only
+when it fires or the timeout changes, not per packet. Small DNS/config
+snapshots use short synchronous locks. A watch channel wakes sessions when the configured idle timeout
 changes, so reload immediately recomputes existing deadlines. A lock guard is
 always dropped before socket, file, channel, or timer awaits. Session maps
 support concurrent lookup and return owned handles before any await.
@@ -105,8 +240,10 @@ kill sessions; it prevents new admission until use falls below the limit.
 
 A session receives a UUID identifier and immutable listener, client, selected
 backend, creation, and upstream-local information. Its counters are atomic.
-Client and backend activity both extend the idle deadline. There is no hard
-session lifetime.
+Client and backend activity both extend the idle deadline. Client activity
+counts datagrams the session sent, queued, or tried to send (a refused or
+partial backend send still counts); datagrams the relay drops itself as
+`queue_full`, `budget_exhausted`, or `session_closed` do not extend it. There is no hard session lifetime.
 
 Creation follows this order:
 
@@ -166,6 +303,29 @@ most four snapshots and 200,000 rows, while no more than two snapshot builds
 run concurrently. Capacity pressure evicts the least-recently-used snapshot,
 and stale or mismatched cursors receive structured errors.
 
+The configuration file and the control protocol use separate types. The
+file types reject unknown keys. The active configuration travels as wire
+types whose service settings added after 0.1.6 are optional, and which
+ignore keys they do not know in every section (`[service]`, `[metrics]`, and
+each `[[listeners]]` entry). A test fails if a file type gains a setting
+the extended wire form does not carry. A CLI from 0.1.6 or earlier rejects
+unknown keys, so the `active_config` operation keeps the 0.1.6 shape and
+leaves out `session_queue_depth` and `max_queue_memory_bytes`. Current CLIs
+ask for `active_config_extended`, which carries every setting. A daemon that
+predates that operation cannot decode the request and closes the connection
+without a response. The CLI counts a request as unanswered only when it
+wrote the whole request and the connection ended before the first byte of a
+response; a failure to connect or write, a timeout, or a response that
+breaks off is an error. An unanswered request is sent once more on a new
+connection, since a current daemon that is restarting, or at its limit of
+concurrent control connections, can also close one unanswered. Only if that
+is unanswered too does the CLI repeat the request as `active_config` and
+treat the missing settings as absent rather than filling in defaults. The
+CLI prints the reported values in `config` and `--toml` without
+re-validating them against its own configuration-file limits; only loading
+a file enforces those. The protocol version stays 2, so every pairing of
+these releases still talks.
+
 Unsupported versions and malformed input receive structured errors when
 safely possible. The socket parent and socket use restrictive Unix
 permissions. Startup refuses to replace a non-socket path or a live daemon's
@@ -222,15 +382,20 @@ Every spawned task is either owned by a supervisor handle or a Tokio
 ## Resource and abuse controls
 
 - Datagram buffers are capped at the legal UDP payload maximum.
-- Session count is capped globally and per source IP.
+- Session count is capped globally and per source IP. The global cap counts
+  every session that still owns an upstream socket, including closed sessions
+  whose tasks have not ended.
 - A global token bucket caps new sessions per second while allowing at most
   one second of burst capacity.
-- Per-session queues and control concurrency are fixed and bounded.
-- The session-count/datagram-size combination is rejected when its
-  conservative queued-buffer estimate exceeds 4 GiB.
+- Per-session queues are bounded by `session_queue_depth` and a shared,
+  runtime-enforced queue memory budget (`max_queue_memory_bytes`, 256 MiB by
+  default); control concurrency is fixed and bounded.
+- A session-count/datagram-size/queue-depth combination is rejected when every
+  session's fixed receive buffers plus one full queue of maximum-sized
+  datagrams, each with its per-datagram overhead, exceeds 4 GiB.
 - Fixed configured destinations prevent open-proxy behavior.
-- Drop, reject, DNS, and socket counters are exposed without client-IP metric
-  labels.
+- Drop (in total and per reason), reject, DNS, and socket counters are exposed
+  without client-IP metric labels.
 - Repetitive warning sites use time-based log suppression.
 - Network input is treated as untrusted and never reaches `unwrap`,
   `expect`, indexing assumptions, or payload logging.

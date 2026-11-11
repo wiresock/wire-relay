@@ -177,6 +177,8 @@ control_socket = "/run/wire-relay/control.sock"
 log_level = "info"
 idle_timeout = "180s"
 max_datagram_size = 4096
+session_queue_depth = 512
+max_queue_memory_bytes = 268435456
 max_sessions = 10000
 max_sessions_per_ip = 64
 new_sessions_per_second = 100
@@ -247,10 +249,92 @@ file-descriptor limit, and host memory together. Lowering a session limit on
 reload does not evict existing sessions; it blocks admission until usage falls
 below the new limit. The compiled ceiling is 100,000 active sessions and the
 packaged unit reserves 131,072 file descriptors; real memory and network
-capacity will usually require a lower value. Validation also caps the combined
-worst-case session datagram buffers and bounded queues at a defensive 4 GiB
-estimate, so the largest datagram and session-count ceilings cannot be selected
-simultaneously.
+capacity will usually require a lower value.
+
+`session_queue_depth` (default `512`, range `1..=65536`) is the number of
+client datagrams that may wait behind one session's upstream socket. The
+listener normally sends a client datagram straight to its session's connected
+upstream socket; a datagram is queued only when that socket cannot accept it
+immediately or earlier datagrams are still queued. When the queue is full the
+datagram is dropped and counted as `queue_full`. A reloaded depth applies to
+new sessions.
+
+`max_queue_memory_bytes` (default `268435456`, 256 MiB) bounds the memory of
+all session queues together. It is enforced at runtime: each queued datagram
+is charged its length plus a fixed 64-byte overhead for the queue slot and
+allocator slack, so even empty datagrams count, and a datagram that would
+exceed the limit is dropped as `budget_exhausted`. The limit must hold at
+least one full queue of maximum-sized datagrams, so a much deeper
+`session_queue_depth` or larger `max_datagram_size` can require raising it.
+The default keeps the worst case close to what the fixed eight-datagram
+queues of earlier releases could hold at the default limits (about 0.33 GiB);
+raise it on hosts with memory to spare, lower it on small ones. A reload
+applies a new limit to datagrams queued afterwards.
+
+Datagram memory as a whole is bounded by a defensive 4 GiB budget, which
+`max_queue_memory_bytes` cannot exceed. Validation reserves two
+`max_datagram_size` receive buffers for every possible session and requires
+one completely full queue of maximum-sized datagrams, with that overhead, to
+fit beside them, so the largest datagram and session-count ceilings cannot be
+selected simultaneously. If the receive buffers leave less than
+`max_queue_memory_bytes` of the 4 GiB, the queues get only that remainder.
+Receive buffers stay reserved for every live session, at
+the current `max_datagram_size`, even when that is more sessions than the
+configured `max_sessions`. After a reload that lowers `max_sessions`, that
+remainder therefore grows back to the new configuration's full size only as
+the surplus sessions end. A reload that raises `max_datagram_size`
+while many sessions are live (or lowers `max_sessions` far below the live
+count) can leave too little for even one maximum-sized queued datagram, or
+nothing at all: for example 40,000 live sessions after a reload to
+`max_datagram_size = 65507`. Such a configuration is still valid and the
+reload applies, but the daemon logs a warning whenever the remainder is
+smaller than one `max_datagram_size` datagram plus its 64-byte overhead, and
+datagrams that have to queue are dropped as `budget_exhausted` until enough of
+those sessions end. Datagrams the relay drops itself (`queue_full`,
+`budget_exhausted`, `session_closed`) do not count as client activity, so
+sessions whose clients only send into a full queue or exhausted budget still
+idle out, once nothing of theirs is left queued, and release their buffers. A send the OS refuses (`send_error`) does
+count, so a backend outage does not expire sessions whose clients keep
+sending. Delivering a queued datagram counts too, so a session whose upstream
+socket was stalled for longer than `idle_timeout` is not expired, with
+datagrams still queued, the moment the socket recovers. A session with
+datagrams still queued is never idle-expired, so if its task was held up past
+`idle_timeout` (a blocked send, or no CPU), those datagrams are delivered
+rather than discarded as `session_closed`.
+
+Closing a session (backend change, listener removal, `session close`, idle
+expiry) removes its route and frees its client's `max_sessions_per_ip` slot
+at once, so the client's next datagram opens a new session even with
+`max_sessions_per_ip = 1`. A closed session does no further forwarding: its
+task stops at its next wake-up, without waiting for a pending send, and
+discards what is still queued as `session_closed`. Until its task has ended
+it still counts toward the session gauges, `active sessions` in `wire-relay
+stats`, and `wire-relay sessions`, and until its upstream socket is closed
+as well it still counts toward `max_sessions` and the queue budget.
+`max_sessions` therefore bounds the upstream sockets that exist, not only
+the sessions that can carry traffic, and is never exceeded by old and new
+sessions overlapping. The cost is at a relay that is at its global limit:
+right after a mass close (for example a backend change) a returning client
+is rejected, and counted as `rejected`, for the moment it takes the closed
+sessions to end; below the limit it is admitted immediately. A datagram that
+arrives just as its session closes is not dropped as `session_closed`: it
+opens a new session like the client's next datagram would, unless the
+listener itself is stopping.
+
+Idle expiry is decided against the listener's forwarding path: a session is
+not expired under a datagram it has just accepted, and once it expires no
+further datagram is sent on its upstream socket.
+
+The queue memory is shared, and it can be small. A few sessions whose upstream
+sockets are backed up can use all of it, so other sessions' datagrams are
+then dropped as `budget_exhausted` even though their own queues are short.
+With a high `max_sessions` and a large `max_datagram_size`, the fixed receive
+buffers also take most of the 4 GiB and leave less than
+`max_queue_memory_bytes`. If `budget_exhausted` drops grow, raise
+`max_queue_memory_bytes`, or, where the 4 GiB is what limits it, lower
+`max_sessions` or `max_datagram_size`; the warning logged with the drop
+reports the limit in effect. `queue_full` instead means one session's queue
+reached `session_queue_depth`.
 
 ## Running and operating
 
@@ -306,6 +390,26 @@ invalid, pass `--control-socket /current/path.sock` explicitly.
 Human-readable output is intended for operators. Use `--json` for automation;
 major JSON response shapes are intended to remain stable and compatibility
 changes are documented. Commands return a nonzero status on failure.
+
+CLI and daemon versions can be mixed while an upgrade is in progress, for
+example a new CLI before the daemon has restarted. `wire-relay config`
+reports `session_queue_depth` and `max_queue_memory_bytes` only when the
+daemon has them. Connected to an older daemon, the CLI leaves both out of the
+TOML and JSON output instead of showing defaults that daemon does not use;
+the TOML output starts with a comment that says so. The CLI decides that the
+daemon is older only when two requests in a row are closed without any
+response; a connection error, a timeout, or a response that breaks off is
+reported as an error instead. Settings a newer daemon reports that this CLI
+does not know are ignored, in every section. A CLI from 0.1.6 or
+earlier connected to a newer daemon gets the configuration without those two
+settings. Such a CLI still validates the TOML form against its own, older
+limits, so for a configuration only a newer release accepts (for example
+`max_sessions = 100000` with `max_datagram_size = 5000`) it refuses
+`wire-relay config` and `--toml`; `--json` still works. A CLI from this release
+does not re-validate: connected to a later daemon, it prints the running
+values in `wire-relay config` and `--toml` even when they would not pass its
+own configuration-file validation. Loading that output as a configuration
+file with this CLI may still fail.
 
 ### Transactional reload
 
@@ -368,6 +472,27 @@ The example binds to loopback. Do not expose metrics publicly without an
 authenticated reverse proxy or equivalent network controls. Metrics avoid
 client IP and session ID labels.
 
+`wire_relay_datagrams_dropped_total` counts every discarded datagram. It is
+broken down, without labels, by reason:
+
+| Metric | Reason |
+| --- | --- |
+| `wire_relay_datagrams_dropped_oversize_total` | larger than `max_datagram_size` |
+| `wire_relay_datagrams_dropped_queue_full_total` | the session's queue reached `session_queue_depth` |
+| `wire_relay_datagrams_dropped_budget_exhausted_total` | the shared queued-datagram memory budget was exhausted |
+| `wire_relay_datagrams_dropped_session_closed_total` | session was closing, including datagrams still queued when it stopped |
+| `wire_relay_datagrams_dropped_rejected_total` | no session could be created (admission limits, unresolved backend, socket setup, route change) |
+| `wire_relay_datagrams_dropped_send_error_total` | the OS refused or truncated a send in either direction |
+
+`wire-relay stats` shows the same breakdown, and `wire-relay listeners` shows
+each listener's total, `queue_full`, and `budget_exhausted` (`BUDGET`) drops.
+Connected to an older daemon that reports no per-reason counters, `stats`
+omits the breakdown and `listeners` prints `-` for `QUEUE FULL` and `BUDGET`;
+a daemon that predates only the budget reason reports it as 0. A growing
+`queue_full` count means one session's upstream sends cannot keep up; a
+growing `budget_exhausted` count means the shared queue memory is used up.
+Each logs its own rate-limited warning.
+
 ## Security model
 
 Clients cannot choose an upstream destination: every listener forwards only
@@ -399,14 +524,19 @@ See [`SECURITY.md`](SECURITY.md) for vulnerability reporting.
 ## Performance notes
 
 The normal data path performs one receive and one send per direction while
-preserving datagram boundaries. A dedicated connected upstream socket per
-session is an intentional correctness cost: it avoids parsing a protocol to
-demultiplex replies. The implementation does not spawn a task per packet and
+preserving datagram boundaries. Client-to-backend datagrams are sent from the
+listener task directly on the session's connected upstream socket, so the
+upload path, like the download path, has no task hand-off or per-packet copy
+unless the upstream socket is momentarily busy. A dedicated connected upstream
+socket per session is an intentional correctness cost: it avoids parsing a
+protocol to demultiplex replies. The implementation does not spawn a task per packet and
 uses atomic counters plus short-lived shared-state access.
 
 Bounded queues prefer dropping a datagram under sustained pressure over
 unbounded memory growth or head-of-line blocking across all clients. Observe
-drop counters while tuning. DNS resolution and control-plane serialization are
+the per-reason drop counters while tuning, and the kernel's UDP
+`RcvbufErrors`/`SndbufErrors` in `/proc/net/snmp`, which are outside the
+relay's counters. Socket buffer sizes use the operating-system defaults. DNS resolution and control-plane serialization are
 kept out of the packet path. Large session listings are sorted once on a
 bounded blocking worker and paged from a bounded, expiring daemon-side
 snapshot, avoiding repeated full-table scans on Tokio's packet-processing

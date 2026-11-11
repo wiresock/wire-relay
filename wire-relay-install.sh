@@ -34,7 +34,11 @@ readonly MINIMUM_RUST_VERSION="1.85.0"
 readonly MAX_SESSION_LIMIT=100000
 readonly MAX_SESSION_RATE=100000
 readonly MAX_SESSION_DATAGRAM_MEMORY_BYTES=4294967296
-readonly SESSION_DATAGRAM_SLOTS=10
+readonly SESSION_FIXED_DATAGRAM_BUFFERS=2
+readonly DEFAULT_SESSION_QUEUE_DEPTH=512
+readonly DEFAULT_MAX_QUEUE_MEMORY_BYTES=268435456
+readonly MAX_SESSION_QUEUE_DEPTH=65536
+readonly QUEUED_DATAGRAM_OVERHEAD_BYTES=64
 readonly SEMANTIC_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 readonly DEFAULT_REPOSITORY_URL="https://github.com/wiresock/wire-relay.git"
 readonly REPOSITORY_URL="${WIRE_RELAY_REPOSITORY_URL:-$DEFAULT_REPOSITORY_URL}"
@@ -1080,18 +1084,36 @@ is_rate_limit() {
     is_uint_in_range "$1" 1 "$MAX_SESSION_RATE"
 }
 
+is_session_queue_depth() {
+    is_uint_in_range "$1" 1 "$MAX_SESSION_QUEUE_DEPTH"
+}
+
+# Usage: is_session_datagram_budget MAX_SESSIONS MAX_DATAGRAM_SIZE [QUEUE_DEPTH]
+# QUEUE_DEPTH defaults to the daemon's default session_queue_depth, which the
+# installer does not prompt for.
 is_session_datagram_budget() {
     local max_sessions="$1"
     local max_datagram_size="$2"
+    local queue_depth="${3:-$DEFAULT_SESSION_QUEUE_DEPTH}"
     local sessions_decimal
     local datagram_decimal
+    local depth_decimal
 
     is_positive_limit "$max_sessions" || return 1
     is_max_datagram_size "$max_datagram_size" || return 1
+    is_session_queue_depth "$queue_depth" || return 1
     sessions_decimal=$((10#$max_sessions))
     datagram_decimal=$((10#$max_datagram_size))
-    (( sessions_decimal * (datagram_decimal * SESSION_DATAGRAM_SLOTS + 1) <=
-        MAX_SESSION_DATAGRAM_MEMORY_BYTES ))
+    depth_decimal=$((10#$queue_depth))
+    # Mirrors the daemon's validation: every session's fixed receive buffers
+    # plus one full queue of maximum-sized datagrams, each charged with the
+    # per-datagram queue overhead. That queue must also fit in the daemon's
+    # default service.max_queue_memory_bytes, which the installer leaves unset.
+    (( sessions_decimal * (datagram_decimal * SESSION_FIXED_DATAGRAM_BUFFERS + 1) +
+        (datagram_decimal + QUEUED_DATAGRAM_OVERHEAD_BYTES) * depth_decimal <=
+        MAX_SESSION_DATAGRAM_MEMORY_BYTES )) &&
+        (( (datagram_decimal + QUEUED_DATAGRAM_OVERHEAD_BYTES) * depth_decimal <=
+            DEFAULT_MAX_QUEUE_MEMORY_BYTES ))
 }
 
 is_metrics_bind() {
@@ -1663,11 +1685,12 @@ configuration_wizard() {
             "Maximum UDP datagram size" "4096" \
             is_max_datagram_size \
             "Enter an integer from 1 through 65507."
-        if is_session_datagram_budget "$max_sessions" "$max_datagram_size"; then
+        if is_session_datagram_budget "$max_sessions" "$max_datagram_size" \
+            "$DEFAULT_SESSION_QUEUE_DEPTH"; then
             break
         fi
-        warn "That datagram size and session limit exceed the defensive 4 GiB buffering budget."
-        warn "Choose a smaller maximum datagram size, or restart the wizard with fewer sessions."
+        warn "That datagram size and session limit, with the default session queue depth of ${DEFAULT_SESSION_QUEUE_DEPTH}, exceed the defensive 4 GiB buffering budget (per-session receive buffers plus one full session queue)."
+        warn "Choose a smaller maximum datagram size, or restart the wizard with fewer sessions. A smaller service.session_queue_depth in the configuration file also reduces the budget needed."
     done
 
     if confirm "Enable Prometheus metrics?" "n"; then
