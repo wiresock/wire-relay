@@ -187,6 +187,18 @@ impl ListenerHandle {
         self.resolver.set_refresh_interval(refresh_interval);
     }
 
+    /// Whether [`Self::stop`] has run, or is running, for this listener.
+    ///
+    /// Read under the route lock, which `stop` holds from closing the
+    /// listener's sessions until after it has cancelled the token. A caller
+    /// that saw one of those sessions closed therefore gets `true` if the
+    /// close was this listener's stop, instead of reading the token in the
+    /// moment between the close and the cancellation.
+    fn is_stopping(&self) -> bool {
+        let _route_commit = lock_unpoisoned(&self.route_commit);
+        self.cancel.is_cancelled()
+    }
+
     /// Stops admission and all sessions belonging to this incarnation.
     pub fn stop(&self) -> usize {
         let _route_commit = lock_unpoisoned(&self.route_commit);
@@ -195,7 +207,10 @@ impl ListenerHandle {
         // route lock keeps new ones from being launched: the listener's
         // forwarding path refuses them at once, without waiting for their
         // tasks to wake up, and the count is not lowered by tasks that see
-        // the cancellation and close themselves.
+        // the cancellation and close themselves. The lock is held until
+        // after the cancellation, so a datagram refused by one of these
+        // sessions sees the listener as stopping (`is_stopping`) and is
+        // counted as `session_closed`, not sent to admission.
         let closed = self.sessions.close_listener(self.id);
         self.cancel.cancel();
         self.resolver.stop();
@@ -285,7 +300,7 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             // Not kept across admission: the old session's last reference
             // releases its global slot.
             drop(session);
-            if handle.cancel.is_cancelled() {
+            if handle.is_stopping() {
                 // The listener is stopping and opens no new session.
                 record_drop(
                     &context.metrics,
@@ -474,13 +489,17 @@ mod tests {
     }
 
     async fn start() -> Running {
+        start_with_rate(1_000).await
+    }
+
+    async fn start_with_rate(new_sessions_per_second: u32) -> Running {
         let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let metrics = Arc::new(Metrics::default());
         let service = ServiceConfig::default();
         let context = ListenerContext {
             sessions: SessionTable::new(),
             // One session per IP: a replacement needs the old slot freed.
-            admission: AdmissionController::new(16, 1, 1_000),
+            admission: AdmissionController::new(16, 1, new_sessions_per_second),
             metrics: Arc::clone(&metrics),
             idle_timeout: watch::channel(Duration::from_secs(30)).0,
             session_queue_depth: Arc::new(AtomicUsize::new(16)),
@@ -581,5 +600,71 @@ mod tests {
         assert_eq!(stats.drops().total(), 1);
         assert_eq!(stats.sessions_rejected_total, 0);
         running.stop().await;
+    }
+
+    /// The real `stop` runs on another thread while the listener is between
+    /// its lookup and its forward. However the two interleave, the refused
+    /// datagram is seen on a stopping listener: counted as `session_closed`,
+    /// never sent to admission. With one token per second the first session
+    /// leaves none, so admission would refuse it (`rejected`); with two it
+    /// would accept it and spend the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_datagram_refused_during_stop_is_counted_as_session_closed() {
+        for rate in [1, 2] {
+            let running = start_with_rate(rate).await;
+            running.client.send(b"one").await.unwrap();
+            running.backend_receives(b"one").await;
+
+            let stopping = Arc::clone(&running.listener);
+            let (stopper_tx, stopper_rx) = std::sync::mpsc::channel();
+            running
+                .context
+                .sessions
+                .after_next_lookup(move |_, session| {
+                    let stopper = std::thread::spawn(move || stopping.stop());
+                    // Continue as soon as `stop` has closed the session,
+                    // possibly before it has cancelled the token.
+                    while !session.is_closed() {
+                        std::hint::spin_loop();
+                    }
+                    stopper_tx.send(stopper).unwrap();
+                });
+            running.client.send(b"two").await.unwrap();
+            let stopper = tokio::task::spawn_blocking(move || stopper_rx.recv().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(stopper.join().unwrap(), 1, "rate {rate}");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while running.context.metrics.snapshot().drops().session_closed == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the refused datagram must be counted");
+            running.context.tracker.close();
+            tokio::time::timeout(Duration::from_secs(5), running.context.tracker.wait())
+                .await
+                .expect("listener and sessions must stop");
+
+            let stats = running.context.metrics.snapshot();
+            assert_eq!(stats.sessions_created_total, 1, "rate {rate}");
+            assert_eq!(stats.drops().session_closed, 1, "rate {rate}: {stats:?}");
+            assert_eq!(stats.drops().total(), 1, "rate {rate}: {stats:?}");
+            assert_eq!(stats.sessions_rejected_total, 0, "rate {rate}");
+            let listener = running.listener.snapshot().counters;
+            assert_eq!(listener.dropped, 1, "rate {rate}");
+            assert_eq!(listener.drops().session_closed, 1, "rate {rate}");
+            if rate == 2 {
+                // The stopping path spent no admission token.
+                drop(
+                    running
+                        .context
+                        .admission
+                        .try_acquire("192.0.2.1".parse().unwrap())
+                        .expect("the second token must be left"),
+                );
+            }
+            running.stop().await;
+        }
     }
 }
