@@ -26,7 +26,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
 jobs:
   prepare:
@@ -140,20 +139,21 @@ jobs:
     needs:
       - prepare
     # Building on the oldest maintained GitHub Ubuntu image reduces the glibc
-    # baseline of the dynamically linked GNU artifacts.
-    runs-on: ubuntu-22.04
+    # baseline of the dynamically linked GNU artifacts. AArch64 is built
+    # natively on ubuntu-22.04-arm so the job does not need the cross
+    # toolchain packages from Ubuntu apt mirrors.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
             apt_packages: ""
           - target: aarch64-unknown-linux-gnu
-            # The GCC meta-package only recommends the cross libc development
-            # sysroot, while the install step intentionally disables
-            # recommends. List it explicitly for Scrt1.o, crti.o, and headers.
-            apt_packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            runner: ubuntu-22.04-arm
+            apt_packages: ""
 
     steps:
       - name: Check out source
