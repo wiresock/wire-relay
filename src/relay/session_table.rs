@@ -97,6 +97,24 @@ pub struct SessionTable {
     by_key: DashMap<SessionKey, Arc<SessionHandle>>,
     by_id: DashMap<SessionId, Arc<SessionHandle>>,
     count: AtomicU64,
+    #[cfg(test)]
+    lookup_hook: LookupHook,
+}
+
+/// Runs once right after the next successful [`SessionTable::get_by_key`],
+/// so a test can act between a listener's lookup and its forward.
+#[cfg(test)]
+type LookupHookFn = Box<dyn FnOnce(&SessionTable, &Arc<SessionHandle>) + Send>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct LookupHook(std::sync::Mutex<Option<LookupHookFn>>);
+
+#[cfg(test)]
+impl fmt::Debug for LookupHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LookupHook")
+    }
 }
 
 impl SessionTable {
@@ -130,7 +148,34 @@ impl SessionTable {
 
     #[must_use]
     pub fn get_by_key(&self, key: &SessionKey) -> Option<Arc<SessionHandle>> {
-        self.by_key.get(key).map(|entry| Arc::clone(entry.value()))
+        let found = self.by_key.get(key).map(|entry| Arc::clone(entry.value()));
+        #[cfg(test)]
+        if let Some(session) = &found {
+            let hook = self
+                .lookup_hook
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook(self, session);
+            }
+        }
+        found
+    }
+
+    /// Runs `hook` once, right after the next lookup by key that finds a
+    /// session (with no table lock held).
+    #[cfg(test)]
+    pub(crate) fn after_next_lookup(
+        &self,
+        hook: impl FnOnce(&Self, &Arc<SessionHandle>) + Send + 'static,
+    ) {
+        *self
+            .lookup_hook
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     #[must_use]
@@ -147,9 +192,11 @@ impl SessionTable {
     /// therefore either still reaches the open session, or finds no route
     /// and the client's slot free (even with a per-IP limit of one); and an
     /// idle expiry, which takes the same lock, can never claim a session
-    /// that is being closed. The ID entry, gauges, queue-budget reservation,
-    /// and global admission slot stay until the session task's cleanup calls
-    /// [`Self::remove`], so the global limit bounds the sockets that exist.
+    /// that is being closed. The ID entry and gauges stay until the session
+    /// task's cleanup calls [`Self::remove`]; the queue-budget reservation and
+    /// the global admission slot stay until the handle itself is dropped,
+    /// after its upstream socket, so the global limit bounds the sockets that
+    /// exist.
     pub fn close(&self, session: &SessionHandle) -> bool {
         let id = session.session().id;
         let mut closed = None;

@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    ListenerId, Session, SessionKey, SessionTable,
+    Forward, ListenerId, Session, SessionKey, SessionTable,
     session::{
         ListenerCounterSnapshot, ListenerCounters, QueueBudget, SessionLaunch, launch_session,
         record_drop,
@@ -266,16 +266,34 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
         }
         let key = SessionKey::new(handle.id, client_addr);
 
+        // Whether the datagram already went to a session that turned out to
+        // be closed (idle expiry or a close that won the race with the
+        // lookup). It then gets one new session, as if the lookup had missed.
+        let mut stale_session = false;
         if let Some(session) = context.sessions.get_by_key(&key) {
             // Fast path: send on the session's connected upstream socket from
             // this task, queueing only when that socket is busy.
-            session.forward_from_client(
+            match session.forward_from_client(
                 &buffer[..size],
                 &context.metrics,
                 &handle.counters,
                 &context.log_limiter,
-            );
-            continue;
+            ) {
+                Forward::Taken => continue,
+                Forward::Closed => stale_session = true,
+            }
+            // Not kept across admission: the old session's last reference
+            // releases its global slot.
+            drop(session);
+            if handle.cancel.is_cancelled() {
+                // The listener is stopping and opens no new session.
+                record_drop(
+                    &context.metrics,
+                    &handle.counters,
+                    DropReason::SessionClosed,
+                );
+                break;
+            }
         }
 
         let admission = match context.admission.try_acquire(client_addr.ip()) {
@@ -313,6 +331,13 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
         let Some((backend_addr, route_epoch)) = backend_selection else {
             if handle.cancel.is_cancelled() {
                 drop(admission);
+                if stale_session {
+                    record_drop(
+                        &context.metrics,
+                        &handle.counters,
+                        DropReason::SessionClosed,
+                    );
+                }
                 break;
             }
             context.metrics.session_rejected(false);
@@ -434,4 +459,127 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServiceConfig;
+
+    struct Running {
+        listener: Arc<ListenerHandle>,
+        context: ListenerContext,
+        backend: UdpSocket,
+        client: UdpSocket,
+    }
+
+    async fn start() -> Running {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let service = ServiceConfig::default();
+        let context = ListenerContext {
+            sessions: SessionTable::new(),
+            // One session per IP: a replacement needs the old slot freed.
+            admission: AdmissionController::new(16, 1, 1_000),
+            metrics: Arc::clone(&metrics),
+            idle_timeout: watch::channel(Duration::from_secs(30)).0,
+            session_queue_depth: Arc::new(AtomicUsize::new(16)),
+            queue_budget: QueueBudget::new(&service),
+            dns_refresh_interval_ms: Arc::new(AtomicU64::new(60_000)),
+            parent_cancel: CancellationToken::new(),
+            tracker: TaskTracker::new(),
+            log_limiter: Arc::new(LogRateLimiter::new(Duration::from_secs(60))),
+        };
+        let config = ListenerConfig {
+            name: "test".to_owned(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            backend: backend.local_addr().unwrap().to_string().parse().unwrap(),
+        };
+        let prepared = PreparedListener::bind(ListenerId::new(1), config, &metrics)
+            .await
+            .unwrap();
+        let bind = prepared.socket.local_addr().unwrap();
+        let listener = prepared.activate(context.clone());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(bind).await.unwrap();
+        Running {
+            listener,
+            context,
+            backend,
+            client,
+        }
+    }
+
+    impl Running {
+        async fn backend_receives(&self, expected: &[u8]) -> SocketAddr {
+            let mut buffer = [0_u8; 64];
+            let (size, from) =
+                tokio::time::timeout(Duration::from_secs(5), self.backend.recv_from(&mut buffer))
+                    .await
+                    .expect("the datagram must reach the backend")
+                    .unwrap();
+            assert_eq!(&buffer[..size], expected);
+            from
+        }
+
+        async fn stop(self) {
+            self.listener.stop();
+            self.context.parent_cancel.cancel();
+            self.context.tracker.close();
+            tokio::time::timeout(Duration::from_secs(5), self.context.tracker.wait())
+                .await
+                .expect("listener and sessions must stop");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_datagram_refused_by_a_session_closed_after_the_lookup_opens_a_new_one() {
+        let running = start().await;
+        running.client.send(b"one").await.unwrap();
+        let first = running.backend_receives(b"one").await;
+
+        // The session is closed between the listener's lookup and its
+        // forward, as by an idle expiry or a backend replacement.
+        running
+            .context
+            .sessions
+            .after_next_lookup(|table, session| assert!(table.close(session)));
+        running.client.send(b"two").await.unwrap();
+        let second = running.backend_receives(b"two").await;
+        assert_ne!(first, second, "the datagram must go out on a new session");
+
+        let stats = running.context.metrics.snapshot();
+        assert_eq!(stats.sessions_created_total, 2);
+        assert_eq!(stats.drops().total(), 0, "{stats:?}");
+        assert_eq!(running.listener.snapshot().counters.dropped, 0);
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_stopping_listener_does_not_reopen_a_closed_session() {
+        let running = start().await;
+        running.client.send(b"one").await.unwrap();
+        running.backend_receives(b"one").await;
+
+        // The listener is stopped between its lookup and its forward.
+        let stopping = Arc::clone(&running.listener);
+        running.context.sessions.after_next_lookup(move |_, _| {
+            assert_eq!(stopping.stop(), 1);
+        });
+        running.client.send(b"two").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while running.context.metrics.snapshot().drops().session_closed == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the refused datagram must be counted");
+
+        let stats = running.context.metrics.snapshot();
+        assert_eq!(stats.sessions_created_total, 1);
+        assert_eq!(stats.drops().session_closed, 1);
+        assert_eq!(stats.drops().total(), 1);
+        assert_eq!(stats.sessions_rejected_total, 0);
+        running.stop().await;
+    }
 }

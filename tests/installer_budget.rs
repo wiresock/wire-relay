@@ -5,7 +5,7 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
 use wire_relay::config::{
-    Config, DEFAULT_MAX_QUEUE_MEMORY_BYTES, DEFAULT_SESSION_QUEUE_DEPTH, MAX_CONFIGURED_SESSIONS,
+    DEFAULT_MAX_QUEUE_MEMORY_BYTES, DEFAULT_SESSION_QUEUE_DEPTH, MAX_CONFIGURED_SESSIONS,
     MAX_SESSION_DATAGRAM_MEMORY_BYTES, MAX_SESSION_QUEUE_DEPTH, QUEUED_DATAGRAM_OVERHEAD_BYTES,
     SESSION_FIXED_DATAGRAM_BUFFERS,
 };
@@ -77,11 +77,14 @@ fn installer_budget_function_agrees_with_config_validation() {
         let end = body.find("\n}\n").expect("function must end") + 3;
         body[..end].to_owned()
     };
-    let mut script: String = source
+    let mut script = String::new();
+    for line in source
         .lines()
         .filter(|line| line.starts_with("readonly ") && !line.contains('$'))
-        .map(|line| format!("{line}\n"))
-        .collect();
+    {
+        script.push_str(line);
+        script.push('\n');
+    }
     for name in [
         "is_uint_in_range",
         "is_max_datagram_size",
@@ -114,7 +117,7 @@ fn installer_budget_function_agrees_with_config_validation() {
              [[listeners]]\nname = \"test\"\nbind = \"127.0.0.1:40001\"\n\
              backend = \"127.0.0.1:51820\"\n"
         );
-        let daemon = match Config::parse_str(&input) {
+        let daemon = match wire_relay::config::Config::parse_str(&input) {
             Ok(_) => true,
             Err(error) => {
                 let error = error.to_string();

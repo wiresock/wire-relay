@@ -2,7 +2,12 @@
 
 //! Versioned, bounded length-prefixed JSON control protocol.
 
-use std::{fmt, io, net::IpAddr, path::PathBuf, time::Duration};
+use std::{
+    fmt, io,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -11,7 +16,8 @@ use uuid::Uuid;
 use crate::{
     CONTROL_PROTOCOL_VERSION,
     config::{
-        ConfigError, ListenerConfig, LogLevel, MetricsConfig, NormalizedConfig, ServiceConfig,
+        BackendEndpoint, ConfigError, ListenerConfig, LogLevel, MetricsConfig, NormalizedConfig,
+        ServiceConfig, socket_addr_serde,
     },
     metrics::MetricsSnapshot,
     relay::{ListenerSnapshot, SessionId, SessionSnapshot},
@@ -198,16 +204,85 @@ pub enum ControlResponse {
 /// The active configuration as carried by the control protocol.
 ///
 /// This is the wire form of [`NormalizedConfig`], kept apart from the strict
-/// file format. The configuration file still rejects unknown keys; this type
-/// does not, so a CLI can read a newer daemon's extended configuration, and
-/// service settings added after 0.1.6 are optional, so a CLI can tell a
-/// daemon that does not have them from one that uses their defaults.
+/// file format. The configuration file still rejects unknown keys; none of
+/// the snapshot types do, at any level, so a CLI can read the configuration
+/// of a newer daemon that has settings this CLI does not know. Service
+/// settings added after 0.1.6 are optional, so a CLI can tell a daemon that
+/// does not have them from one that uses their defaults.
+///
+/// Every snapshot type carries each field of its file type with the same
+/// name and order; a test fails when a file type gains a field that the
+/// extended snapshot does not report.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ActiveConfigSnapshot {
     pub service: ActiveServiceSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<MetricsConfig>,
-    pub listeners: Vec<ListenerConfig>,
+    pub metrics: Option<ActiveMetricsSnapshot>,
+    pub listeners: Vec<ActiveListenerSnapshot>,
+}
+
+/// `[metrics]` in an [`ActiveConfigSnapshot`]; the wire form of
+/// [`MetricsConfig`], which ignores unknown keys.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ActiveMetricsSnapshot {
+    pub enabled: bool,
+    #[serde(with = "socket_addr_serde")]
+    pub bind: SocketAddr,
+}
+
+impl Default for ActiveMetricsSnapshot {
+    fn default() -> Self {
+        Self::from(&MetricsConfig::default())
+    }
+}
+
+impl From<&MetricsConfig> for ActiveMetricsSnapshot {
+    fn from(metrics: &MetricsConfig) -> Self {
+        Self {
+            enabled: metrics.enabled,
+            bind: metrics.bind,
+        }
+    }
+}
+
+impl From<&ActiveMetricsSnapshot> for MetricsConfig {
+    fn from(metrics: &ActiveMetricsSnapshot) -> Self {
+        Self {
+            enabled: metrics.enabled,
+            bind: metrics.bind,
+        }
+    }
+}
+
+/// One `[[listeners]]` entry in an [`ActiveConfigSnapshot`]; the wire form
+/// of [`ListenerConfig`], which ignores unknown keys.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveListenerSnapshot {
+    pub name: String,
+    #[serde(with = "socket_addr_serde")]
+    pub bind: SocketAddr,
+    pub backend: BackendEndpoint,
+}
+
+impl From<&ListenerConfig> for ActiveListenerSnapshot {
+    fn from(listener: &ListenerConfig) -> Self {
+        Self {
+            name: listener.name.clone(),
+            bind: listener.bind,
+            backend: listener.backend.clone(),
+        }
+    }
+}
+
+impl From<&ActiveListenerSnapshot> for ListenerConfig {
+    fn from(listener: &ActiveListenerSnapshot) -> Self {
+        Self {
+            name: listener.name.clone(),
+            bind: listener.bind,
+            backend: listener.backend.clone(),
+        }
+    }
 }
 
 /// Service settings in an [`ActiveConfigSnapshot`].
@@ -254,8 +329,12 @@ impl ActiveConfigSnapshot {
                 dns_refresh_interval: service.dns_refresh_interval,
                 shutdown_timeout: service.shutdown_timeout,
             },
-            metrics: config.metrics.clone(),
-            listeners: config.listeners.clone(),
+            metrics: config.metrics.as_ref().map(ActiveMetricsSnapshot::from),
+            listeners: config
+                .listeners
+                .iter()
+                .map(ActiveListenerSnapshot::from)
+                .collect(),
         }
     }
 
@@ -312,8 +391,8 @@ impl ActiveConfigSnapshot {
                 dns_refresh_interval: service.dns_refresh_interval,
                 shutdown_timeout: service.shutdown_timeout,
             },
-            metrics: self.metrics.clone(),
-            listeners: self.listeners.clone(),
+            metrics: self.metrics.as_ref().map(MetricsConfig::from),
+            listeners: self.listeners.iter().map(ListenerConfig::from).collect(),
         }
         .validate()
     }
@@ -479,8 +558,24 @@ mod tests {
         pub struct Config {
             pub service: Service,
             #[serde(default)]
-            pub metrics: Option<serde_json::Value>,
-            pub listeners: Vec<serde_json::Value>,
+            pub metrics: Option<Metrics>,
+            pub listeners: Vec<Listener>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        #[derive(Default)]
+        pub struct Metrics {
+            pub enabled: serde_json::Value,
+            pub bind: serde_json::Value,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Listener {
+            pub name: serde_json::Value,
+            pub bind: serde_json::Value,
+            pub backend: serde_json::Value,
         }
 
         #[derive(Deserialize)]
@@ -589,12 +684,80 @@ mod tests {
 
     #[test]
     fn the_configuration_file_still_rejects_unknown_keys() {
-        let error = crate::config::Config::parse_str(
-            "[service]\na_later_setting = 1\n\n[[listeners]]\nname = \"t\"\n\
-             bind = \"127.0.0.1:47811\"\nbackend = \"127.0.0.1:47812\"\n",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("a_later_setting"), "{error}");
+        for (section, extra) in [
+            ("[service]\na_later_setting = 1\n", ""),
+            (
+                "[metrics]\nenabled = true\nbind = \"127.0.0.1:19090\"\na_later_setting = 1\n",
+                "",
+            ),
+            ("", "a_later_setting = 1\n"),
+        ] {
+            let error = crate::config::Config::parse_str(&format!(
+                "{section}\n[[listeners]]\nname = \"t\"\n\
+                 bind = \"127.0.0.1:47811\"\nbackend = \"127.0.0.1:47812\"\n{extra}"
+            ))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("a_later_setting"),
+                "{section}{extra}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_metrics_and_listener_settings_are_ignored_on_the_wire() {
+        let snapshot = ActiveConfigSnapshot::extended(&sample_config());
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value["metrics"]["a_later_setting"] = 1.into();
+        value["listeners"][0]["a_later_setting"] = 1.into();
+        assert_eq!(
+            serde_json::from_value::<ActiveConfigSnapshot>(value.clone()).unwrap(),
+            snapshot
+        );
+        // Through the response a CLI actually decodes, in both shapes.
+        for kind in ["active_config", "active_config_extended"] {
+            let envelope = serde_json::json!({
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "request_id": Uuid::nil(),
+                "response": {"kind": kind, "data": value.clone()},
+            });
+            let decoded: ResponseEnvelope = serde_json::from_value(envelope).unwrap();
+            assert!(decoded.into_result().is_ok(), "{kind}");
+        }
+    }
+
+    /// Each section of the extended snapshot carries every key of its file
+    /// type, so a setting added to the configuration cannot be left out of
+    /// `wire-relay config`. (The order is checked through the TOML form in
+    /// `the_extended_active_config_matches_the_configuration_file_form`.)
+    #[test]
+    fn the_extended_snapshot_reports_every_configuration_setting() {
+        fn keys(value: &serde_json::Value) -> Vec<String> {
+            value
+                .as_object()
+                .expect("a section is a table")
+                .keys()
+                .cloned()
+                .collect()
+        }
+        let config = sample_config();
+        let file = serde_json::to_value(&config).unwrap();
+        let snapshot = serde_json::to_value(ActiveConfigSnapshot::extended(&config)).unwrap();
+        for (section, file, snapshot) in [
+            ("service", &file["service"], &snapshot["service"]),
+            ("metrics", &file["metrics"], &snapshot["metrics"]),
+            (
+                "listeners",
+                &file["listeners"][0],
+                &snapshot["listeners"][0],
+            ),
+        ] {
+            assert_eq!(
+                keys(snapshot),
+                keys(file),
+                "[{section}]: add the new setting to the control snapshot types"
+            );
+        }
     }
 
     #[tokio::test]

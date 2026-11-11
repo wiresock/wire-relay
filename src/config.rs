@@ -75,10 +75,11 @@ pub const SESSION_FIXED_DATAGRAM_BUFFERS: u128 = 2;
 
 /// Fixed budget charged for every queued datagram on top of its payload.
 ///
-/// It covers the 40-byte queue slot on 64-bit targets (the payload `Vec` plus
-/// the budget reservation; a compile-time assertion keeps the slot within
-/// this value) and leaves slack for allocator size-class rounding and the
-/// channel's per-block bookkeeping. Without it, empty or tiny datagrams could
+/// It covers the 48-byte queue slot on 64-bit targets (the payload `Vec`, the
+/// bytes charged, the session's accounting reference and the settled flag,
+/// with padding; a compile-time assertion keeps the slot within this value)
+/// and leaves the remaining 16 bytes as slack for allocator size-class
+/// rounding and the channel's per-block bookkeeping. Without it, empty or tiny datagrams could
 /// occupy far more real memory than the budget records.
 pub const QUEUED_DATAGRAM_OVERHEAD_BYTES: usize = 64;
 
@@ -1053,7 +1054,7 @@ fn parse_backend_host(host: &str) -> Result<BackendHost, BackendEndpointError> {
     Ok(BackendHost::Name(canonical))
 }
 
-mod socket_addr_serde {
+pub(crate) mod socket_addr_serde {
     use std::net::SocketAddr;
 
     use serde::{Deserialize, Deserializer, Serializer};
