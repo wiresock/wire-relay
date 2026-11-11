@@ -616,7 +616,7 @@ pub struct SessionHandle {
 
 impl SessionHandle {
     #[cfg(test)]
-    pub(super) fn for_test(session: Session) -> Arc<Self> {
+    pub(crate) fn for_test(session: Session) -> Arc<Self> {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind test socket");
         socket
             .set_nonblocking(true)

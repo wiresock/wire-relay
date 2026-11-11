@@ -966,8 +966,17 @@ impl ControlHandler for RuntimeCore {
                             format!("session `{id}` was not found"),
                         )
                     })?;
-                    self.sessions.close(&session);
-                    Ok(ControlResponse::SessionClosed { id })
+                    // A closed session stays listed by ID until its task
+                    // ends; closing it again is reported, not claimed as a
+                    // close by this request.
+                    if self.sessions.close(&session) {
+                        Ok(ControlResponse::SessionClosed { id })
+                    } else {
+                        Err(ControlError::new(
+                            ControlErrorCode::NotFound,
+                            format!("session `{id}` is already closed"),
+                        ))
+                    }
                 }
                 ControlRequest::Version => Ok(ControlResponse::Version(VersionSnapshot {
                     application: VERSION.to_owned(),
@@ -1443,6 +1452,54 @@ mod tests {
         assert_eq!(cache.entries.len(), MAX_SESSION_CURSOR_SNAPSHOTS);
         assert_eq!(cache.retained_rows, MAX_SESSION_CURSOR_SNAPSHOTS * 2);
         assert!(!cache.entries.contains_key(&first_cursor.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn closing_an_already_closed_session_is_reported_as_an_error() {
+        use crate::relay::{ListenerId, Session, SessionHandle, SessionId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let (runtime, _) = start_budget_runtime(&path, "127.0.0.1:9".parse().unwrap(), 4).await;
+        // A handle without a task stays listed after it is closed, like a
+        // closed session whose task has not ended yet.
+        let handle = SessionHandle::for_test(Session::new(
+            ListenerId::new(u64::MAX),
+            "test".to_owned(),
+            "192.0.2.10:40000".parse().unwrap(),
+            "127.0.0.1:40001".parse().unwrap(),
+            "192.0.2.20:51820".parse().unwrap(),
+        ));
+        let id = handle.session().id;
+        assert!(runtime.core.sessions.insert(handle).is_ok());
+
+        let close = || runtime.core.handle(ControlRequest::CloseSession { id });
+        assert_eq!(
+            close().await.unwrap(),
+            ControlResponse::SessionClosed { id }
+        );
+        assert!(runtime.core.sessions.get_by_id(&id).is_some());
+        assert_eq!(
+            close().await.unwrap_err(),
+            ControlError::new(
+                ControlErrorCode::NotFound,
+                format!("session `{id}` is already closed"),
+            )
+        );
+
+        let unknown = SessionId::new();
+        assert_eq!(
+            runtime
+                .core
+                .handle(ControlRequest::CloseSession { id: unknown })
+                .await
+                .unwrap_err(),
+            ControlError::new(
+                ControlErrorCode::NotFound,
+                format!("session `{unknown}` was not found"),
+            )
+        );
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]
