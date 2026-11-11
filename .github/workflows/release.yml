@@ -26,7 +26,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
 jobs:
   prepare:
@@ -70,7 +69,7 @@ jobs:
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
 
       - name: Check out release source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.source.outputs.source_ref }}
           fetch-depth: 0
@@ -140,32 +139,63 @@ jobs:
     needs:
       - prepare
     # Building on the oldest maintained GitHub Ubuntu image reduces the glibc
-    # baseline of the dynamically linked GNU artifacts.
-    runs-on: ubuntu-22.04
+    # baseline of the dynamically linked GNU artifacts. AArch64 is built
+    # natively on ubuntu-22.04-arm so the job does not need the cross
+    # toolchain packages from Ubuntu apt mirrors.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
             apt_packages: ""
           - target: aarch64-unknown-linux-gnu
-            # The GCC meta-package only recommends the cross libc development
-            # sysroot, while the install step intentionally disables
-            # recommends. List it explicitly for Scrt1.o, crti.o, and headers.
-            apt_packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            runner: ubuntu-22.04-arm
+            apt_packages: ""
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
 
       - name: Install cross linker
         if: matrix.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
         run: |
+          set -euo pipefail
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null
+
+          prefer_canonical_apt_mirrors() {
+            if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+              printf '%s\t%s\n' \
+                'http://archive.ubuntu.com/ubuntu/' 'priority:1' \
+                'http://security.ubuntu.com/ubuntu/' 'priority:2' |
+                sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            fi
+          }
+
+          # GitHub-hosted Ubuntu runners prefer azure.archive.ubuntu.com via
+          # /etc/apt/apt-mirrors.txt. When that host cannot be resolved, apt
+          # still rewrites archive.ubuntu.com and security.ubuntu.com through
+          # the same list and the install fails.
+          if [[ -f /etc/apt/apt-mirrors.txt ]] &&
+            ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            prefer_canonical_apt_mirrors
+          fi
+
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ${{ matrix.apt_packages }}
+          # Word splitting of APT_PACKAGES is intentional.
+          # shellcheck disable=SC2086
+          sudo apt-get install --yes --no-install-recommends $APT_PACKAGES \
+            || {
+              prefer_canonical_apt_mirrors
+              sudo apt-get update
+              sudo apt-get install --yes --no-install-recommends $APT_PACKAGES
+            }
 
       - name: Install stable Rust target
         uses: dtolnay/rust-toolchain@stable
@@ -200,7 +230,7 @@ jobs:
           tar -C stage -czf "dist/$package.tar.gz" "$package"
 
       - name: Upload target archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: archive-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -220,13 +250,13 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
           fetch-depth: 0
 
       - name: Download target archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: archive-*
           path: dist
@@ -269,7 +299,7 @@ jobs:
           }
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.release_ref }}
           generate_release_notes: true
