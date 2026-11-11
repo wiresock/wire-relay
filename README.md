@@ -178,6 +178,7 @@ log_level = "info"
 idle_timeout = "180s"
 max_datagram_size = 4096
 session_queue_depth = 512
+max_queue_memory_bytes = 268435456
 max_sessions = 10000
 max_sessions_per_ip = 64
 new_sessions_per_second = 100
@@ -258,19 +259,30 @@ immediately or earlier datagrams are still queued. When the queue is full the
 datagram is dropped and counted as `queue_full`. A reloaded depth applies to
 new sessions.
 
-Datagram memory is bounded by a defensive 4 GiB budget. Each queued datagram
+`max_queue_memory_bytes` (default `268435456`, 256 MiB) bounds the memory of
+all session queues together. It is enforced at runtime: each queued datagram
 is charged its length plus a fixed 64-byte overhead for the queue slot and
-allocator slack, so even empty datagrams consume budget. Validation reserves
-two `max_datagram_size` receive buffers for every possible session and requires
+allocator slack, so even empty datagrams count, and a datagram that would
+exceed the limit is dropped as `budget_exhausted`. The limit must hold at
+least one full queue of maximum-sized datagrams, so a much deeper
+`session_queue_depth` or larger `max_datagram_size` can require raising it.
+The default keeps the worst case close to what the fixed eight-datagram
+queues of earlier releases could hold at the default limits (about 0.33 GiB);
+raise it on hosts with memory to spare, lower it on small ones. A reload
+applies a new limit to datagrams queued afterwards.
+
+Datagram memory as a whole is bounded by a defensive 4 GiB budget, which
+`max_queue_memory_bytes` cannot exceed. Validation reserves two
+`max_datagram_size` receive buffers for every possible session and requires
 one completely full queue of maximum-sized datagrams, with that overhead, to
 fit beside them, so the largest datagram and session-count ceilings cannot be
-selected simultaneously. The rest of the budget is shared by all session queues
-and is enforced at runtime; a datagram that would exceed it is dropped as
-`budget_exhausted`. Receive buffers stay reserved for every live session, at
+selected simultaneously. If the receive buffers leave less than
+`max_queue_memory_bytes` of the 4 GiB, the queues get only that remainder.
+Receive buffers stay reserved for every live session, at
 the current `max_datagram_size`, even when that is more sessions than the
-configured `max_sessions`. After a reload that lowers `max_sessions`, the
-shared remainder therefore grows back to the new configuration's full size
-only as the surplus sessions end. A reload that raises `max_datagram_size`
+configured `max_sessions`. After a reload that lowers `max_sessions`, that
+remainder therefore grows back to the new configuration's full size only as
+the surplus sessions end. A reload that raises `max_datagram_size`
 while many sessions are live (or lowers `max_sessions` far below the live
 count) can leave too little for even one maximum-sized queued datagram, or
 nothing at all: for example 40,000 live sessions after a reload to
@@ -286,28 +298,34 @@ count, so a backend outage does not expire sessions whose clients keep
 sending.
 
 Closing a session (backend change, listener removal, `close-session`, idle
-expiry) releases its route and admission slot at once, so the client's next
-datagram opens a new session even with `max_sessions_per_ip = 1` or a full
-global limit. `max_sessions` and `max_sessions_per_ip` therefore bound the
-sessions that can carry traffic. A closed session does no further forwarding:
-its task stops at its next wake-up, without waiting for a pending send, and
-discards what is still queued as `session_closed`. Until then it still holds
-its upstream socket and counts as live in the queue budget, the session
-gauges, and `wire-relay sessions`, so right after a mass close and reopen
-(for example a backend change) the old and the new sessions briefly coexist.
-Only an operator action or idle expiry closes a session; a client cannot
-trigger this overlap.
+expiry) removes its route and frees its client's `max_sessions_per_ip` slot
+at once, so the client's next datagram opens a new session even with
+`max_sessions_per_ip = 1`. A closed session does no further forwarding: its
+task stops at its next wake-up, without waiting for a pending send, and
+discards what is still queued as `session_closed`. Until its task has ended
+it still owns its upstream socket, and it still counts toward `max_sessions`,
+the queue budget, the session gauges, `active sessions` in `wire-relay
+status`, and `wire-relay sessions`. `max_sessions` therefore bounds the
+upstream sockets and tasks that exist, not only the sessions that can carry
+traffic, and is never exceeded by old and new sessions overlapping. The cost
+is at a relay that is at its global limit: right after a mass close (for
+example a backend change) a returning client is rejected, and counted as
+`rejected`, for the moment it takes the closed sessions' tasks to end; below
+the limit it is admitted immediately.
 
 Idle expiry is decided against the listener's forwarding path: a session is
 not expired under a datagram it has just accepted, and once it expires no
 further datagram is sent on its upstream socket.
 
-The shared remainder can be small. With a high `max_sessions` and a large
-`max_datagram_size`, the fixed receive buffers take most of the 4 GiB, and a
-few sessions whose upstream sockets are backed up can use the rest, so other
-sessions' datagrams are then dropped as `budget_exhausted` even though their
-own queues are short. Lower `max_sessions` or `max_datagram_size` if
-`budget_exhausted` drops grow. `queue_full` instead means one session's queue
+The queue memory is shared, and it can be small. A few sessions whose upstream
+sockets are backed up can use all of it, so other sessions' datagrams are
+then dropped as `budget_exhausted` even though their own queues are short.
+With a high `max_sessions` and a large `max_datagram_size`, the fixed receive
+buffers also take most of the 4 GiB and leave less than
+`max_queue_memory_bytes`. If `budget_exhausted` drops grow, raise
+`max_queue_memory_bytes`, or, where the 4 GiB is what limits it, lower
+`max_sessions` or `max_datagram_size`; the warning logged with the drop
+reports the limit in effect. `queue_full` instead means one session's queue
 reached `session_queue_depth`.
 
 ## Running and operating

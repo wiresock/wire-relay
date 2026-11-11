@@ -142,32 +142,39 @@ impl SessionTable {
     /// Returns whether this call closed it, so an already closed session that
     /// is still listed is not counted twice.
     ///
-    /// The route and the admission lease go together, so the next datagram
-    /// from the same client can start a new session while this one stops;
-    /// the ID entry, gauges, and queue-budget reservation stay until the
-    /// session task's cleanup calls [`Self::remove`].
+    /// The route, the client's per-IP admission slot, and the forwarding
+    /// path go in one step under the route's shard lock. A listener
+    /// therefore either still reaches the open session, or finds no route
+    /// and the client's slot free (even with a per-IP limit of one); and an
+    /// idle expiry, which takes the same lock, can never claim a session
+    /// that is being closed. The ID entry, gauges, queue-budget reservation,
+    /// and global admission slot stay until the session task's cleanup calls
+    /// [`Self::remove`], so the global limit bounds the sockets that exist.
     pub fn close(&self, session: &SessionHandle) -> bool {
         let id = session.session().id;
-        // The lease is released under the route's shard lock: a listener
-        // that no longer finds the route also finds the admission slot free
-        // (even with a per-IP limit of one), never a gap between the two.
+        let mut closed = None;
         self.by_key
             .remove_if(&session.session().key(), |_, current| {
                 let published = current.session().id == id;
                 if published {
-                    session.release_admission();
+                    session.release_client_slot();
+                    closed = Some(session.mark_closed());
                 }
                 published
             });
-        // Covers a session whose route was already gone or never published.
-        session.release_admission();
-        session.close()
+        // A session whose route was already gone or never published.
+        let closed = closed.unwrap_or_else(|| {
+            session.release_client_slot();
+            session.mark_closed()
+        });
+        // Waking the task takes its own locks; keep that out of the route's.
+        session.cancel_task();
+        closed
     }
 
-    /// Expires an idle session: if it is still idle, its route, admission
-    /// lease, and forwarding path all go in one step under the route's shard
-    /// lock, so a listener either still reaches the open session or finds no
-    /// route and a free admission slot.
+    /// Expires an idle session: if it is still idle, its route, the client's
+    /// per-IP admission slot, and its forwarding path all go in one step
+    /// under the route's shard lock, as in [`Self::close`].
     pub(super) fn expire(&self, session: &SessionHandle, idle_timeout: Duration) -> Expiry {
         let id = session.session().id;
         let mut outcome = None;
@@ -179,12 +186,12 @@ impl SessionTable {
                 let expiry = session.try_expire(idle_timeout);
                 outcome = Some(expiry);
                 if expiry == Expiry::Expired {
-                    session.release_admission();
+                    session.release_client_slot();
                 }
                 expiry == Expiry::Expired
             });
-        // Without a route of its own the session was closed or never
-        // published; decide on the handle alone.
+        // A session without a route of its own was closed, which this then
+        // reports, or was never published; decide on the handle alone.
         outcome.unwrap_or_else(|| session.try_expire(idle_timeout))
     }
 
@@ -391,6 +398,31 @@ mod tests {
         assert!(table.get_by_id(&loser_id).is_none());
         assert_eq!(table.len(), 1);
         assert_eq!(table.close_all(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_cannot_expire_afterwards() {
+        let table = SessionTable::new();
+        let session = test_session_handle();
+        assert!(table.insert(Arc::clone(&session)).is_ok());
+
+        // The route and the closed state go together, so an idle expiry that
+        // finds no route reports the close instead of claiming the session.
+        assert!(table.close(&session));
+        assert_eq!(table.expire(&session, Duration::ZERO), Expiry::Closed);
+        assert!(!table.close(&session));
+
+        // And the other way round: an expired session is not closed again.
+        let idle = test_session_handle();
+        assert!(
+            table
+                .remove(&session.session().key(), session.session().id)
+                .is_some()
+        );
+        assert!(table.insert(Arc::clone(&idle)).is_ok());
+        assert_eq!(table.expire(&idle, Duration::ZERO), Expiry::Expired);
+        assert!(table.get_by_key(&idle.session().key()).is_none());
+        assert!(!table.close(&idle));
     }
 
     #[tokio::test]

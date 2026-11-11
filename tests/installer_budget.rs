@@ -5,7 +5,7 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
 use wire_relay::config::{
-    Config, DEFAULT_SESSION_QUEUE_DEPTH, MAX_CONFIGURED_SESSIONS,
+    Config, DEFAULT_MAX_QUEUE_MEMORY_BYTES, DEFAULT_SESSION_QUEUE_DEPTH, MAX_CONFIGURED_SESSIONS,
     MAX_SESSION_DATAGRAM_MEMORY_BYTES, MAX_SESSION_QUEUE_DEPTH, QUEUED_DATAGRAM_OVERHEAD_BYTES,
     SESSION_FIXED_DATAGRAM_BUFFERS,
 };
@@ -54,6 +54,10 @@ fn installer_budget_constants_match_the_daemon() {
         "QUEUED_DATAGRAM_OVERHEAD_BYTES",
         QUEUED_DATAGRAM_OVERHEAD_BYTES.to_string(),
     );
+    expect(
+        "DEFAULT_MAX_QUEUE_MEMORY_BYTES",
+        DEFAULT_MAX_QUEUE_MEMORY_BYTES.to_string(),
+    );
     expect("MAX_SESSION_LIMIT", MAX_CONFIGURED_SESSIONS.to_string());
 }
 
@@ -97,6 +101,11 @@ fn installer_budget_function_agrees_with_config_validation() {
         (1, 65_507, 65_536),
         (1, 65_507, 65_535),
         (1, 1, 65_536),
+        // One full queue against the default queue-memory limit, which the
+        // installer does not write: 4094 * 65571 bytes fit, 4095 do not.
+        (1, 65_507, 4_094),
+        (1, 65_507, 4_095),
+        (10_000, 4_096, 65_536),
     ];
     for &(sessions, datagram, depth) in cases {
         let input = format!(
@@ -108,8 +117,9 @@ fn installer_budget_function_agrees_with_config_validation() {
         let daemon = match Config::parse_str(&input) {
             Ok(_) => true,
             Err(error) => {
+                let error = error.to_string();
                 assert!(
-                    error.to_string().contains("datagram buffers"),
+                    error.contains("datagram buffers") || error.contains("max_queue_memory_bytes"),
                     "unexpected validation failure for {input}: {error}"
                 );
                 false

@@ -127,8 +127,9 @@ pub fn record_drop(metrics: &Metrics, listener_counters: &ListenerCounters, reas
 /// or discarded during session teardown.
 ///
 /// The limit is not stored; every reservation derives it from the current
-/// configuration and live session count: the defensive datagram budget minus
-/// fixed receive buffers for `max(live sessions, max_sessions)`. A reload that
+/// configuration and live session count: `service.max_queue_memory_bytes`, or
+/// the defensive datagram budget minus fixed receive buffers for
+/// `max(live sessions, max_sessions)` if that is less. A reload that
 /// lowers `max_sessions` therefore keeps buffers reserved for surplus live
 /// sessions, and the limit rises back to the steady-state budget as they end,
 /// without a separate recomputation that concurrent session ends or reloads
@@ -144,6 +145,8 @@ pub struct QueueBudget {
     /// kept off the cache lines of the counters below, which are written on
     /// session churn and on every queued datagram.
     shape: CacheAligned<AtomicU64>,
+    /// `service.max_queue_memory_bytes`; read only when a datagram queues.
+    max_queue_memory: AtomicU64,
     live_sessions: CacheAligned<AtomicUsize>,
     used: CacheAligned<AtomicUsize>,
 }
@@ -166,14 +169,21 @@ impl QueueBudget {
     pub fn new(service: &ServiceConfig) -> Arc<Self> {
         Self::with_memory(
             MAX_SESSION_DATAGRAM_MEMORY_BYTES,
+            service.max_queue_memory_bytes,
             service.max_sessions,
             service.max_datagram_size,
         )
     }
 
-    fn with_memory(memory_bytes: u128, max_sessions: usize, max_datagram_size: usize) -> Arc<Self> {
+    fn with_memory(
+        memory_bytes: u128,
+        max_queue_memory_bytes: u64,
+        max_sessions: usize,
+        max_datagram_size: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             memory_bytes,
+            max_queue_memory: AtomicU64::new(max_queue_memory_bytes),
             shape: CacheAligned(AtomicU64::new(Self::shape(max_sessions, max_datagram_size))),
             live_sessions: CacheAligned(AtomicUsize::new(0)),
             used: CacheAligned(AtomicUsize::new(0)),
@@ -194,7 +204,12 @@ impl QueueBudget {
         max_sessions: usize,
         max_datagram_size: usize,
     ) -> Arc<Self> {
-        Self::with_memory(memory_bytes as u128, max_sessions, max_datagram_size)
+        Self::with_memory(
+            memory_bytes as u128,
+            u64::MAX,
+            max_sessions,
+            max_datagram_size,
+        )
     }
 
     fn shape(max_sessions: usize, max_datagram_size: usize) -> u64 {
@@ -212,6 +227,10 @@ impl QueueBudget {
 
     /// Applies reloaded limits to subsequent reservations.
     pub fn configure(&self, service: &ServiceConfig) {
+        // Independent of the shape: until both stores are visible the limit
+        // is the smaller of two terms that are each valid on their own.
+        self.max_queue_memory
+            .store(service.max_queue_memory_bytes, Ordering::Release);
         self.shape.store(
             Self::shape(service.max_sessions, service.max_datagram_size),
             Ordering::Release,
@@ -234,6 +253,12 @@ impl QueueBudget {
         Self::unpack(self.shape.load(Ordering::Acquire))
     }
 
+    /// The configured `service.max_queue_memory_bytes`.
+    #[must_use]
+    pub fn max_queue_memory(&self) -> u64 {
+        self.max_queue_memory.load(Ordering::Acquire)
+    }
+
     /// Bytes currently charged to queued datagrams.
     #[must_use]
     pub fn used(&self) -> usize {
@@ -252,6 +277,7 @@ impl QueueBudget {
         let (max_sessions, max_datagram_size) = self.configured();
         queued_datagram_budget(
             self.memory_bytes,
+            self.max_queue_memory(),
             max_sessions,
             self.live_sessions(),
             max_datagram_size,
@@ -533,8 +559,10 @@ pub struct SessionHandle {
     /// lets idle expiry tell that a datagram is being forwarded right now, so
     /// a session is never expired under a datagram it has just accepted.
     state: AtomicUsize,
-    /// Released as soon as the route is unpublished, so the same client can
-    /// be admitted again while this session drains.
+    /// The per-IP slot is released as soon as the route is unpublished, so
+    /// the same client can be admitted again while this session stops. The
+    /// global slot is released when the task has ended, so `max_sessions`
+    /// bounds the upstream sockets that exist.
     admission: Mutex<Option<AdmissionLease>>,
     cancel: CancellationToken,
 }
@@ -587,16 +615,21 @@ impl SessionHandle {
         // release its admission slot and receive buffers. A send the backend
         // side refused still is, so a backend outage does not expire sessions
         // whose clients keep sending.
-        let Some(_forwarding) = self.begin_forward() else {
+        let Some(forwarding) = self.begin_forward() else {
             record_drop(metrics, listener_counters, DropReason::SessionClosed);
             return;
         };
 
+        // The forward is registered only across the non-blocking send or
+        // enqueue and the activity update. Accounting and logging follow
+        // after it ends, so a slow log sink never holds up the cleanup of a
+        // session that is closed meanwhile.
         if self.pending.load(Ordering::Acquire) == 0 {
             match self.upstream.try_send(datagram) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 result => {
                     self.session.touch_client();
+                    drop(forwarding);
                     record_backend_send(
                         &self.session,
                         datagram.len(),
@@ -610,12 +643,14 @@ impl SessionHandle {
             }
         }
 
-        match self.enqueue(datagram) {
-            Ok(()) => self.session.touch_client(),
-            Err(reason) => {
-                record_drop(metrics, listener_counters, reason);
-                self.log_enqueue_drop(reason, datagram.len(), log_limiter);
-            }
+        let queued = self.enqueue(datagram);
+        if queued.is_ok() {
+            self.session.touch_client();
+        }
+        drop(forwarding);
+        if let Err(reason) = queued {
+            record_drop(metrics, listener_counters, reason);
+            self.log_enqueue_drop(reason, datagram.len(), log_limiter);
         }
     }
 
@@ -638,11 +673,13 @@ impl SessionHandle {
                     datagram_bytes = size,
                     budget_used_bytes = self.queue_budget.used(),
                     budget_limit_bytes = self.queue_budget.limit(),
+                    max_queue_memory_bytes = self.queue_budget.max_queue_memory(),
                     live_sessions = self.queue_budget.live_sessions(),
                     max_sessions,
                     max_datagram_size,
                     "process-wide queued-datagram memory budget exhausted; dropping client \
-                     datagram (lower service.max_sessions or service.max_datagram_size to \
+                     datagram (raise service.max_queue_memory_bytes, or if the limit is \
+                     below it, lower service.max_sessions or service.max_datagram_size to \
                      leave more for queues)"
                 );
             }
@@ -726,10 +763,20 @@ impl SessionHandle {
     }
 
     /// Waits for a listener forward that began before the session was closed.
-    /// A forward never blocks, so this lasts at most a few instructions.
+    ///
+    /// A forward is registered only across a non-blocking send or enqueue,
+    /// never across logging or an await, so this normally finds none and
+    /// otherwise lasts a few instructions; yielding covers a listener thread
+    /// that the OS preempted in between.
     fn wait_for_forwards(&self) {
+        let mut spins = 0_u32;
         while self.state.load(Ordering::SeqCst) >= STATE_FORWARDING {
-            std::thread::yield_now();
+            if spins < 64 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -738,15 +785,40 @@ impl SessionHandle {
         self.state.load(Ordering::Acquire) & STATE_CLOSED != 0
     }
 
-    /// Stops the session; idempotent. Returns whether this call closed it.
-    pub fn close(&self) -> bool {
+    /// Closes the session for the forwarding path; idempotent. Returns
+    /// whether this call closed it.
+    ///
+    /// Only [`SessionTable::close`] ends a session: it also removes the
+    /// route, frees the client's admission slot, and wakes the task.
+    pub(super) fn mark_closed(&self) -> bool {
         let previous = self.state.fetch_or(STATE_CLOSED, Ordering::SeqCst);
-        self.cancel.cancel();
         previous & STATE_CLOSED == 0
     }
 
-    /// Releases the admission lease once; later calls do nothing.
-    pub(super) fn release_admission(&self) {
+    /// Wakes the session task so that it stops; idempotent.
+    pub(super) fn cancel_task(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Closes a handle that is in no table.
+    #[cfg(test)]
+    fn close(&self) -> bool {
+        let closed = self.mark_closed();
+        self.cancel_task();
+        closed
+    }
+
+    /// Frees the client's per-IP admission slot, with the route; idempotent.
+    /// The global slot stays held until [`Self::release_admission`].
+    pub(super) fn release_client_slot(&self) {
+        if let Some(lease) = lock_unpoisoned(&self.admission).as_mut() {
+            lease.release_client_slot();
+        }
+    }
+
+    /// Releases the whole admission lease once the session's task has ended;
+    /// later calls do nothing.
+    fn release_admission(&self) {
         let lease = lock_unpoisoned(&self.admission).take();
         drop(lease);
     }
@@ -990,8 +1062,8 @@ async fn forward_until_stopped(
                         handle.session.touch_backend();
                         let payload = &backend_buffer[..size];
                         // A closed session must not outlive a slow client-side
-                        // send: its admission slot is already free, so its
-                        // socket and buffers have to go promptly too.
+                        // send: it holds a global admission slot, its socket,
+                        // and its buffers until its task ends.
                         let sent = tokio::select! {
                             biased;
                             () = cancel.cancelled() => None,
@@ -1076,8 +1148,8 @@ async fn forward_until_stopped(
                 if Instant::now() >= deadline {
                     // The listener forwards on this session's socket from
                     // its own task, so the decision is made against it, and
-                    // the route and admission slot go in the same step: the
-                    // client's next datagram opens a new session.
+                    // the route and the client's admission slot go in the
+                    // same step: its next datagram opens a new session.
                     match cleanup.table.expire(handle, idle_timeout) {
                         Expiry::Expired => {
                             cleanup.reason = SessionCloseReason::Idle;
@@ -1196,6 +1268,10 @@ impl Drop for SessionCleanup {
         self.listener_counters.session_ended();
         self.metrics
             .session_ended(self.reason == SessionCloseReason::Idle);
+        // Last: the global admission slot is held until the session is gone,
+        // so a replacement is never admitted on top of a session that still
+        // owns its upstream socket.
+        self.handle.release_admission();
     }
 }
 
@@ -1216,6 +1292,7 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     struct Harness {
         handle: Arc<SessionHandle>,
@@ -1507,9 +1584,10 @@ mod tests {
             backend.local_addr().unwrap(),
         ));
         let table = SessionTable::new();
-        // One session per IP and globally, so a replacement can only be
-        // admitted once the old session's lease is released.
-        let admission_controller = crate::limits::AdmissionController::new(1, 1, 100);
+        // One session per IP, so a replacement for the same client can only
+        // be admitted once the old session's per-IP slot is released, and
+        // two globally, so the old session's global slot shows up as well.
+        let admission_controller = crate::limits::AdmissionController::new(2, 1, 100);
         let admission = admission_controller.try_acquire(client_addr.ip()).unwrap();
         let (idle, idle_receiver) = watch::channel(idle_timeout);
         let metrics = Arc::new(Metrics::default());
@@ -1735,8 +1813,39 @@ mod tests {
 
     #[test]
     fn the_budget_matches_the_configured_steady_state() {
-        let service = ServiceConfig::default();
+        // By default the queue-memory limit is what applies.
+        let capped = ServiceConfig::default();
+        let budget = QueueBudget::new(&capped);
+        assert_eq!(
+            budget.limit(),
+            usize::try_from(crate::config::DEFAULT_MAX_QUEUE_MEMORY_BYTES).unwrap()
+        );
+        // With enough live sessions the receive buffers leave less than it.
+        let live: Vec<_> = (0..500_000).map(|_| budget.session_started()).collect();
+        assert!(budget.limit() < usize::try_from(capped.max_queue_memory_bytes).unwrap());
+        assert_eq!(
+            budget.limit(),
+            capped.queued_datagram_budget_with_live_sessions(live.len())
+        );
+        drop(live);
+
+        // Without that limit, the budget is what the receive buffers leave.
+        let service = ServiceConfig {
+            max_queue_memory_bytes: u64::try_from(MAX_SESSION_DATAGRAM_MEMORY_BYTES).unwrap(),
+            ..ServiceConfig::default()
+        };
         let budget = QueueBudget::new(&service);
+        assert_eq!(
+            budget.limit(),
+            usize::try_from(
+                MAX_SESSION_DATAGRAM_MEMORY_BYTES
+                    - crate::config::fixed_datagram_memory(
+                        service.max_sessions,
+                        service.max_datagram_size
+                    )
+            )
+            .unwrap()
+        );
         assert_eq!(budget.limit(), service.queued_datagram_budget());
         let extra = service.max_sessions + 3;
         let live: Vec<_> = (0..extra).map(|_| budget.session_started()).collect();
@@ -1949,7 +2058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_expiry_frees_the_route_and_admission_in_one_step() {
+    async fn idle_expiry_frees_the_route_and_the_client_slot_in_one_step() {
         let running = launch_running(Duration::from_secs(30)).await;
         let key = running.handle.session().key();
         let client_ip = running.handle.session().client_addr.ip();
@@ -1965,7 +2074,7 @@ mod tests {
         assert!(running.admission.try_acquire(client_ip).is_err());
 
         // Idle: the session is closed for forwarding, unrouted, and its
-        // admission slot is free before its task has run again.
+        // client's admission slot is free before its task has run again.
         assert_eq!(
             running.table.expire(&running.handle, Duration::ZERO),
             Expiry::Expired
@@ -1976,7 +2085,7 @@ mod tests {
             running
                 .admission
                 .try_acquire(client_ip)
-                .expect("an expired session must free its admission"),
+                .expect("an expired session must free its client's slot"),
         );
         // It expired; a later close does not count it as closed again.
         assert!(!running.table.close(&running.handle));
@@ -1985,6 +2094,93 @@ mod tests {
             Expiry::Closed
         );
         running.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_or_closed_session_sends_nothing_further_under_concurrent_forwards() {
+        const FORWARDS: u64 = 500;
+        for round in 0..100 {
+            let harness = harness(16, 0, usize::MAX).await;
+            let table = SessionTable::new();
+            assert!(table.insert(Arc::clone(&harness.handle)).is_ok());
+            // Direct sends need the socket's write readiness, which the
+            // runtime reports only once it has polled the new socket.
+            harness.handle.upstream.writable().await.unwrap();
+            // Alternate between idle expiry and an operator close racing the
+            // listener's forwarding path.
+            let expire = round % 2 == 0;
+
+            // Set once the session is stopped and a forward that had
+            // already begun has finished.
+            let stopped = AtomicBool::new(false);
+            let forwarder_done = AtomicBool::new(false);
+            let sent_after_stop = std::thread::scope(|scope| {
+                let forwarder = scope.spawn(|| {
+                    let mut sent_after_stop = 0;
+                    for _ in 0..FORWARDS {
+                        let stopped_before = stopped.load(Ordering::SeqCst);
+                        // Only this thread forwards, so the difference is
+                        // this datagram's own outcome.
+                        let sent_before = harness.metrics.snapshot().packets_to_backend_total;
+                        harness.handle.forward_from_client(
+                            b"x",
+                            &harness.metrics,
+                            &harness.counters,
+                            &harness.log_limiter,
+                        );
+                        let sent = harness.metrics.snapshot().packets_to_backend_total;
+                        if stopped_before && sent != sent_before {
+                            sent_after_stop += 1;
+                        }
+                    }
+                    forwarder_done.store(true, Ordering::SeqCst);
+                    sent_after_stop
+                });
+                scope.spawn(|| {
+                    // Stop in mid-stream, after a varying number of sends.
+                    while harness.metrics.snapshot().packets_to_backend_total < round % 17
+                        && !forwarder_done.load(Ordering::SeqCst)
+                    {
+                        std::hint::spin_loop();
+                    }
+                    if expire {
+                        while table.expire(&harness.handle, Duration::ZERO) != Expiry::Expired {
+                            std::hint::spin_loop();
+                        }
+                    } else {
+                        assert!(table.close(&harness.handle));
+                    }
+                    harness.handle.wait_for_forwards();
+                    stopped.store(true, Ordering::SeqCst);
+                });
+                forwarder.join().unwrap()
+            });
+
+            // Nothing was sent on the upstream socket after the stop.
+            assert_eq!(sent_after_stop, 0);
+            let stats = harness.metrics.snapshot();
+            assert!(harness.handle.is_closed());
+            assert!(
+                table.get_by_key(&harness.handle.session().key()).is_none(),
+                "a stopped session must be unrouted"
+            );
+            // The two can never both claim the session.
+            assert_eq!(
+                table.expire(&harness.handle, Duration::ZERO),
+                Expiry::Closed
+            );
+            assert!(!table.close(&harness.handle));
+            // Every datagram is sent, queued, or counted as dropped.
+            let queued = u64::try_from(harness.handle.pending.load(Ordering::Acquire)).unwrap();
+            assert_eq!(
+                stats.packets_to_backend_total + stats.drops().total() + queued,
+                FORWARDS
+            );
+            assert_eq!(
+                harness.handle.state.load(Ordering::SeqCst) & !STATE_EXPIRING,
+                STATE_CLOSED
+            );
+        }
     }
 
     #[test]
@@ -2025,30 +2221,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_close_racing_the_launch_still_releases_admission() {
+    async fn a_close_racing_the_launch_still_frees_the_client_slot() {
         let running =
             launch_unstarted(Duration::from_secs(30), QueueBudget::with_limit(usize::MAX)).await;
         let client_ip = running.handle.session().client_addr.ip();
         // The lease is in the handle from the moment it is published, so a
-        // close before the task has run at all frees the slot.
+        // close before the task has run at all frees the client's slot.
         assert!(running.admission.try_acquire(client_ip).is_err());
         assert!(running.table.close(&running.handle));
         let replacement = running
             .admission
             .try_acquire(client_ip)
-            .expect("closing a just-launched session must free its admission");
+            .expect("closing a just-launched session must free its client's slot");
         drop(replacement);
+        let admission = Arc::clone(&running.admission);
         running.stop().await;
+        assert_eq!(admission.active(), 0);
     }
 
     #[tokio::test]
-    async fn closing_releases_admission_while_the_old_session_drains() {
+    async fn closing_frees_the_client_slot_at_once_and_the_global_slot_with_the_task() {
+        use crate::limits::AdmissionRejection;
+
         let running = launch_running(Duration::from_secs(30)).await;
         let client_ip = running.handle.session().client_addr.ip();
-        // Global and per-IP limits are both one, held by this session.
-        assert!(running.admission.try_acquire(client_ip).is_err());
+        let other_ip: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+        // One session per IP, held by this session.
+        assert_eq!(
+            running.admission.try_acquire(client_ip).unwrap_err(),
+            AdmissionRejection::PerIpLimit
+        );
 
-        // Keep the old task draining: it cannot run until this test yields.
+        // Keep the old task from ending: it cannot run until this test yields.
         running.handle.pending.fetch_add(1, Ordering::AcqRel);
         assert_eq!(running.forward(b"queued"), ForwardOutcome::Queued);
         running.table.close(&running.handle);
@@ -2059,17 +2263,34 @@ mod tests {
                 .is_some()
         );
 
-        // The replacement for the same client is admitted right away, while
-        // the old session still holds its receive-buffer reservation.
+        // The replacement for the same client is admitted right away.
         let replacement = running
             .admission
             .try_acquire(client_ip)
-            .expect("a closed session must free its admission");
-        assert_eq!(running.admission.active(), 1);
+            .expect("a closed session must free its client's slot");
+
+        // The old session still owns its upstream socket, so it still counts
+        // toward the global limit of two: nothing is admitted on top of it.
+        assert_eq!(running.admission.active(), 2);
+        assert_eq!(
+            running.admission.try_acquire(other_ip).unwrap_err(),
+            AdmissionRejection::GlobalLimit
+        );
 
         running.wait_until_removed().await;
-        // The old cleanup must not release the lease a second time.
+        // Its task has ended: the global slot is free, and neither slot was
+        // released twice.
         assert_eq!(running.admission.active(), 1);
+        drop(
+            running
+                .admission
+                .try_acquire(other_ip)
+                .expect("an ended session must free its global slot"),
+        );
+        assert_eq!(
+            running.admission.try_acquire(client_ip).unwrap_err(),
+            AdmissionRejection::PerIpLimit
+        );
         drop(replacement);
         assert_eq!(running.admission.active(), 0);
         running.assert_session_closed_drops(1);

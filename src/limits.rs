@@ -15,9 +15,11 @@ use std::{
 /// Why a new session was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionRejection {
-    /// The global active-session limit is full.
+    /// The global limit is full. It counts every session that still holds
+    /// an upstream socket, including closed ones whose tasks have not ended.
     GlobalLimit,
-    /// This source IP has reached its active-session limit.
+    /// This source IP has reached its limit of sessions that can carry
+    /// traffic.
     PerIpLimit,
     /// The global new-session token bucket is empty.
     RateLimited,
@@ -103,6 +105,7 @@ impl AdmissionController {
         Ok(AdmissionLease {
             controller: Arc::clone(self),
             source_ip,
+            client_slot_held: true,
             released: false,
         })
     }
@@ -113,10 +116,13 @@ impl AdmissionController {
         lock_unpoisoned(&self.state).active
     }
 
-    fn release(&self, source_ip: IpAddr) {
+    fn release_global(&self) {
         let mut state = lock_unpoisoned(&self.state);
         state.active = state.active.saturating_sub(1);
+    }
 
+    fn release_client(&self, source_ip: IpAddr) {
+        let mut state = lock_unpoisoned(&self.state);
         let should_remove = if let Some(count) = state.per_ip.get_mut(&source_ip) {
             *count = count.saturating_sub(1);
             *count == 0
@@ -137,10 +143,19 @@ fn refill(state: &mut AdmissionState, now: Instant) {
 }
 
 /// RAII reservation. Dropping it releases global and per-IP capacity.
+///
+/// The two are released separately for a session that is closed before its
+/// task has ended. The per-IP slot goes with the session's route
+/// ([`Self::release_client_slot`]), so the same client can open a new session
+/// at once. The global slot stays until the lease is dropped, when the
+/// session's upstream socket and buffers are gone, so `max_sessions` bounds
+/// the sockets and tasks that exist, not only the sessions that can carry
+/// traffic.
 #[derive(Debug)]
 pub struct AdmissionLease {
     controller: Arc<AdmissionController>,
     source_ip: IpAddr,
+    client_slot_held: bool,
     released: bool,
 }
 
@@ -151,9 +166,19 @@ impl AdmissionLease {
         self.release_inner();
     }
 
+    /// Releases only the per-IP slot; idempotent. The global slot is still
+    /// held until the lease is released or dropped.
+    pub fn release_client_slot(&mut self) {
+        if self.client_slot_held {
+            self.controller.release_client(self.source_ip);
+            self.client_slot_held = false;
+        }
+    }
+
     fn release_inner(&mut self) {
         if !self.released {
-            self.controller.release(self.source_ip);
+            self.release_client_slot();
+            self.controller.release_global();
             self.released = true;
         }
     }
@@ -173,14 +198,18 @@ macro_rules! log_sites {
         ///
         /// Each site indexes its own atomic timestamp directly, so
         /// `should_log` neither locks nor searches.
+        ///
+        /// The type is crate-private and the slot count is derived without
+        /// naming a variant as a value, so the compiler reports a site that
+        /// no code logs through as dead code.
         #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-        pub enum LogSite {
+        pub(crate) enum LogSite {
             $($site,)+
         }
 
         impl LogSite {
             /// Number of sites; the limiter keeps one slot per site.
-            pub const COUNT: usize = [$(Self::$site,)+].len();
+            const COUNT: usize = [$(stringify!($site),)+].len();
 
             /// Every site, in declaration (discriminant) order.
             #[cfg(test)]
@@ -239,7 +268,7 @@ impl LogRateLimiter {
     }
 
     /// Returns true when the caller should emit this log event.
-    pub fn should_log(&self, site: LogSite) -> bool {
+    pub(crate) fn should_log(&self, site: LogSite) -> bool {
         self.should_log_at(site, Instant::now())
     }
 
@@ -323,24 +352,49 @@ mod tests {
     }
 
     #[test]
-    fn every_log_site_is_used_and_indexes_its_own_slot() {
-        let sources = [
-            include_str!("relay/listener.rs"),
-            include_str!("relay/session.rs"),
-            include_str!("dns.rs"),
-        ]
-        .concat();
-        assert!(
-            !sources.contains("should_log(\""),
-            "string log sites remain"
-        );
+    fn every_log_site_indexes_its_own_slot() {
+        // That every site is logged through is checked by the compiler: an
+        // unused variant of the crate-private enum is dead code.
         for (index, site) in LogSite::ALL.into_iter().enumerate() {
             assert_eq!(site.index(), index, "{site:?} does not index its own slot");
-            assert!(
-                sources.contains(&format!("LogSite::{site:?}")),
-                "unused log site {site:?}"
-            );
         }
+        assert_eq!(LogSite::ALL.len(), LogSite::COUNT);
+    }
+
+    #[test]
+    fn a_closed_session_frees_its_client_slot_but_keeps_its_global_slot() {
+        let controller = AdmissionController::new(2, 1, 100);
+        let ip = IpAddr::from([192, 0, 2, 1]);
+        let mut closed = controller.try_acquire(ip).unwrap();
+        assert_eq!(
+            controller.try_acquire(ip).unwrap_err(),
+            AdmissionRejection::PerIpLimit
+        );
+
+        // The route is gone: the client may come back, and the old session
+        // still counts toward the global limit.
+        closed.release_client_slot();
+        closed.release_client_slot();
+        let replacement = controller.try_acquire(ip).unwrap();
+        assert_eq!(controller.active(), 2);
+        assert_eq!(
+            controller
+                .try_acquire(IpAddr::from([192, 0, 2, 2]))
+                .unwrap_err(),
+            AdmissionRejection::GlobalLimit
+        );
+
+        // Its task has ended: only now is the global slot free, and the
+        // replacement's per-IP slot is untouched.
+        drop(closed);
+        assert_eq!(controller.active(), 1);
+        assert_eq!(
+            controller.try_acquire(ip).unwrap_err(),
+            AdmissionRejection::PerIpLimit
+        );
+        drop(replacement);
+        assert_eq!(controller.active(), 0);
+        drop(controller.try_acquire(ip).unwrap());
     }
 
     #[test]

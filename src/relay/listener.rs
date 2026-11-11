@@ -277,7 +277,6 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
             );
             continue;
         }
-        let datagram = buffer[..size].to_vec();
 
         let admission = match context.admission.try_acquire(client_addr.ip()) {
             Ok(admission) => admission,
@@ -379,7 +378,9 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
         );
         let launch = SessionLaunch {
             session: Arc::new(session),
-            first_datagram: datagram,
+            // Copied only once the session is certain to be launched, so a
+            // rejected datagram costs no allocation.
+            first_datagram: buffer[..size].to_vec(),
             upstream,
             listener_socket: Arc::clone(&handle.socket),
             table: Arc::clone(&context.sessions),

@@ -28,7 +28,17 @@ max_datagram_size = 4096
 # as queue_full. Valid range: 1..=65536; a reload applies to new sessions.
 session_queue_depth = 512
 
+# Memory, in bytes, that client datagrams waiting in all session queues may
+# use together (each is charged its size plus 64 bytes). A datagram beyond it
+# is dropped and counted as budget_exhausted. It must hold one full queue of
+# maximum-sized datagrams and cannot exceed 4294967296 (4 GiB); a reload
+# applies to datagrams queued afterwards. Default: 268435456 (256 MiB).
+max_queue_memory_bytes = 268435456
+
 # Admission limits. Each active session owns a connected upstream UDP socket.
+# max_sessions counts every session that still owns one, including a closed
+# session whose task has not ended yet; max_sessions_per_ip counts a source's
+# sessions that can carry traffic.
 # The compiled maximum active-session limit is 100000.
 max_sessions = 10000
 max_sessions_per_ip = 64
