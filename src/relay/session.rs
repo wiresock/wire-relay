@@ -38,13 +38,14 @@ use super::{ListenerId, SessionId, SessionKey, SessionTable};
 /// event sources again.
 pub const QUEUE_DRAIN_BATCH: usize = 64;
 
-/// How long a session task waits before it tries idle expiry again after a
-/// listener forward withdrew the attempt without refreshing activity (the
-/// datagram was then dropped as `queue_full` or `budget_exhausted`). The
-/// deadline is still in the past then; re-arming the timer to it would fire
-/// at once and retry through the route shard lock in a loop while such
-/// datagrams keep arriving. Short against any idle timeout, so expiry is
-/// delayed only by this much.
+/// How long a session task waits before it tries idle expiry again after an
+/// attempt was refused without activity being refreshed: a listener forward
+/// withdrew it and its datagram was then dropped as `queue_full` or
+/// `budget_exhausted`, or datagrams were still queued. The deadline is still
+/// in the past then; re-arming the timer to it would fire at once and retry
+/// through the route shard lock in a loop (or keep winning the task's
+/// `select!` over the queue it should drain). Short against any idle
+/// timeout, so expiry is delayed only by this much.
 const IDLE_EXPIRY_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Cumulative counters owned by one listener incarnation.
@@ -806,12 +807,20 @@ impl SessionHandle {
     /// that finished before it has already recorded its activity, and one
     /// that starts afterwards withdraws the announcement, so the final
     /// exchange fails. The session task still has to cancel and clean up.
+    ///
+    /// A session with datagrams still queued is not idle, however long ago
+    /// its last activity was: its task was held up (a blocked send, or no
+    /// CPU) and has accepted datagrams to deliver, which expiry would
+    /// discard as `session_closed`. A forward that queues one increments
+    /// `pending` while it is registered in the state word, so it is seen
+    /// either there or here.
     pub(super) fn try_expire(&self, idle_timeout: Duration) -> Expiry {
         let previous = self.state.fetch_or(STATE_EXPIRING, Ordering::SeqCst);
         if previous & STATE_CLOSED != 0 {
             return Expiry::Closed;
         }
         if previous < STATE_FORWARDING
+            && self.pending.load(Ordering::SeqCst) == 0
             && Instant::now() >= self.session.last_activity() + idle_timeout
         {
             match self.state.compare_exchange(
@@ -1237,9 +1246,9 @@ async fn forward_until_stopped(
                             break;
                         }
                         Expiry::Closed => break,
-                        // A datagram was just accepted or is being forwarded
-                        // right now; let it record its activity before the
-                        // deadline is computed again.
+                        // A datagram was just accepted, is being forwarded
+                        // right now, or is still queued; let a forward record
+                        // its activity before the deadline is computed again.
                         Expiry::Active => {
                             tokio::task::yield_now().await;
                             withdrawn = true;
@@ -1249,9 +1258,10 @@ async fn forward_until_stopped(
                 let mut next = handle.session.last_activity() + idle_timeout;
                 let now = Instant::now();
                 if withdrawn && next <= now {
-                    // The forward that withdrew the attempt was dropped and
-                    // did not refresh activity; retry after a short back-off
-                    // instead of at a deadline that has already passed.
+                    // Nothing refreshed activity: the forward that withdrew
+                    // the attempt was dropped, or the queue still has to be
+                    // drained. Retry after a short back-off instead of at a
+                    // deadline that has already passed.
                     next = now + IDLE_EXPIRY_RETRY_BACKOFF;
                 }
                 idle_sleep
@@ -2407,6 +2417,49 @@ mod tests {
         assert_eq!(counters.snapshot().drops().session_closed, 3);
         assert_eq!(metrics.snapshot().active_sessions, 0);
         assert_eq!(admission.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_queued_datagrams_is_not_idle_expired() {
+        // Nothing queued and already due: the session expires.
+        let idle = harness(16, 0, usize::MAX).await;
+        assert_eq!(idle.handle.try_expire(Duration::ZERO), Expiry::Expired);
+        assert!(idle.handle.is_closed());
+
+        // A datagram queued behind one the task is still sending, as when
+        // the task was held up past the idle timeout.
+        let mut harness = harness(16, 1, usize::MAX).await;
+        let table = SessionTable::new();
+        assert!(table.insert(Arc::clone(&harness.handle)).is_ok());
+        assert_eq!(harness.forward(b"queued"), ForwardOutcome::Queued);
+        let key = harness.handle.session().key();
+        let used = harness.budget.used();
+        for _ in 0..2 {
+            assert_eq!(
+                table.expire(&harness.handle, Duration::ZERO),
+                Expiry::Active
+            );
+            assert!(!harness.handle.is_closed());
+            assert_eq!(harness.handle.state.load(Ordering::SeqCst), 0);
+            assert_eq!(harness.handle.pending.load(Ordering::Acquire), 2);
+            assert_eq!(harness.budget.used(), used);
+            assert!(table.get_by_key(&key).is_some());
+        }
+        assert_eq!(harness.metrics.snapshot().drops().total(), 0);
+
+        // Once the queue has been delivered, the session can expire again.
+        harness.handle.finish_pending();
+        harness.receiver.try_recv().unwrap().settle();
+        harness.handle.finish_pending();
+        assert_eq!(harness.handle.pending.load(Ordering::Acquire), 0);
+        assert_eq!(
+            table.expire(&harness.handle, Duration::ZERO),
+            Expiry::Expired
+        );
+        assert!(harness.handle.is_closed());
+        assert!(table.get_by_key(&key).is_none());
+        assert_eq!(harness.budget.used(), 0);
+        assert_eq!(harness.metrics.snapshot().drops().total(), 0);
     }
 
     #[tokio::test]
