@@ -153,13 +153,19 @@ of sending on the exiting session's
 socket. The cleanup guard is created before the task is spawned and owns the
 queue, so it is the one place a session ends, however its task stops
 (returning, dropped in mid-run, or dropped before its first poll): it closes
-the session, waits out a forward the listener had already begun, counts the
-datagram the task had taken but not sent and every datagram still queued as
-`session_closed`, removes the entry, ends the gauges, and releases the global
-admission slot. A forward is registered only across its non-blocking send or
-enqueue; its accounting and logging run afterwards, so that wait is a few
-instructions and never depends on a log sink. Datagrams already
-sent are not counted. On idle timer expiry the task re-reads the
+the session, discards the queue, counts an unsent first datagram, removes the
+entry, ends the gauges, and releases the global admission slot. Queued
+datagrams account for themselves: each holds a reference to its session's
+accounting and, when it is dropped, releases its budget charge and, unless
+its send was settled, counts itself as `session_closed`. That covers one the
+task had taken but not sent, every one still queued, and one the listener
+was still enqueueing when the session closed (counted when the queue is
+freed), so the cleanup never waits for the listener. A forward is registered
+in the state word only across its non-blocking send or enqueue; its
+accounting and logging run afterwards. Datagrams already sent are not
+counted, and delivering a queued datagram refreshes client activity like a
+direct send, so a session is not expired on the recovery of an upstream
+socket that was stalled for longer than the idle timeout. On idle timer expiry the task re-reads the
 current timeout before deciding to close, and decides against the listener's
 direct-send path: the listener registers each forward in the handle's state
 word, and the task announces the expiry there, re-reads activity, and closes

@@ -195,21 +195,18 @@ impl SessionTable {
         outcome.unwrap_or_else(|| session.try_expire(idle_timeout))
     }
 
-    /// Removes the routing entry only if it still maps to `id`, so a stale
-    /// session never deletes a newer mapping for the same key.
-    fn unpublish(&self, key: &SessionKey, id: SessionId) {
-        // `remove_if` holds the shard write lock across the identity check and
-        // deletion, so a replacement cannot slip between separate operations.
-        self.by_key
-            .remove_if(key, |_, session| session.session().id == id);
-    }
-
-    /// Removes only the exact session incarnation, protecting a newer mapping
-    /// from a stale task's cleanup.
-    pub fn remove(&self, key: &SessionKey, id: SessionId) -> Option<Arc<SessionHandle>> {
-        self.unpublish(key, id);
-        // IDs are unique per incarnation, so this never touches a newer one.
-        let (_, removed) = self.by_id.remove(&id)?;
+    /// Removes an ended session from the table, closing it first if it is
+    /// still open.
+    ///
+    /// A closed session has no route left (they go together), so the normal
+    /// end of a session, which closes before it removes, takes only the ID
+    /// index here and never the route lock a second time. IDs are unique per
+    /// incarnation, so a newer session for the same client is never touched.
+    pub fn remove(&self, session: &SessionHandle) -> Option<Arc<SessionHandle>> {
+        if !session.is_closed() {
+            self.close(session);
+        }
+        let (_, removed) = self.by_id.remove(&session.session().id)?;
         self.count.fetch_sub(1, Ordering::Relaxed);
         Some(removed)
     }
@@ -292,11 +289,13 @@ mod tests {
         let session = test_session_handle();
         let key = session.session().key();
         let id = session.session().id;
-        let wrong_id = SessionId::new();
-        assert_ne!(id, wrong_id);
+        // Another incarnation for the same client that is not in the table.
+        let stranger = test_session_handle();
+        assert_eq!(stranger.session().key(), key);
+        assert_ne!(stranger.session().id, id);
         assert!(table.insert(Arc::clone(&session)).is_ok());
 
-        assert!(table.remove(&key, wrong_id).is_none());
+        assert!(table.remove(&stranger).is_none());
         assert_eq!(table.len(), 1);
         assert!(Arc::ptr_eq(
             &table.get_by_key(&key).expect("mapping must remain by key"),
@@ -307,9 +306,11 @@ mod tests {
             &session
         ));
 
+        // Removing a session that is still open closes and unroutes it.
         let removed = table
-            .remove(&key, id)
+            .remove(&session)
             .expect("exact session must be removed");
+        assert!(session.is_closed());
         assert!(Arc::ptr_eq(&removed, &session));
         assert!(table.get_by_key(&key).is_none());
         assert!(table.get_by_id(&id).is_none());
@@ -321,7 +322,7 @@ mod tests {
         assert_ne!(replacement_id, id);
         assert!(table.insert(Arc::clone(&replacement)).is_ok());
 
-        assert!(table.remove(&key, id).is_none());
+        assert!(table.remove(&session).is_none());
         assert_eq!(table.len(), 1);
         assert!(table.get_by_id(&id).is_none());
         assert!(Arc::ptr_eq(
@@ -364,7 +365,7 @@ mod tests {
         assert_eq!(table.len(), 2);
 
         // The old task's cleanup must not delete the newer route.
-        assert!(table.remove(&key, old_id).is_some());
+        assert!(table.remove(&old).is_some());
         assert_eq!(table.len(), 1);
         assert!(Arc::ptr_eq(
             &table
@@ -414,11 +415,7 @@ mod tests {
 
         // And the other way round: an expired session is not closed again.
         let idle = test_session_handle();
-        assert!(
-            table
-                .remove(&session.session().key(), session.session().id)
-                .is_some()
-        );
+        assert!(table.remove(&session).is_some());
         assert!(table.insert(Arc::clone(&idle)).is_ok());
         assert_eq!(table.expire(&idle, Duration::ZERO), Expiry::Expired);
         assert!(table.get_by_key(&idle.session().key()).is_none());

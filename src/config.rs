@@ -82,6 +82,16 @@ pub const SESSION_FIXED_DATAGRAM_BUFFERS: u128 = 2;
 /// occupy far more real memory than the budget records.
 pub const QUEUED_DATAGRAM_OVERHEAD_BYTES: usize = 64;
 
+/// Queue budget charged for one queued datagram of `payload_len` bytes.
+///
+/// The single definition of the charge: validation sizes a full queue with
+/// it and the runtime budget charges every queued datagram with it, so a
+/// validated queue always fits.
+#[must_use]
+pub const fn queued_datagram_charge(payload_len: usize) -> usize {
+    payload_len.saturating_add(QUEUED_DATAGRAM_OVERHEAD_BYTES)
+}
+
 /// Fully typed configuration loaded from TOML.
 ///
 /// `Config::parse_str` and `Config::load` always validate before returning.
@@ -306,8 +316,7 @@ impl ServiceConfig {
 
     /// Budget charged by one completely full queue of maximum-sized datagrams.
     fn full_queue_datagram_memory(&self) -> u128 {
-        (self.max_datagram_size as u128)
-            .saturating_add(QUEUED_DATAGRAM_OVERHEAD_BYTES as u128)
+        (queued_datagram_charge(self.max_datagram_size) as u128)
             .saturating_mul(self.session_queue_depth as u128)
     }
 }

@@ -378,8 +378,9 @@ async fn receive_loop(handle: Arc<ListenerHandle>, context: ListenerContext) {
         );
         let launch = SessionLaunch {
             session: Arc::new(session),
-            // Copied only once the session is certain to be launched, so a
-            // rejected datagram costs no allocation.
+            // Copied only after admission and upstream socket setup, so a
+            // datagram rejected by the session limits or the rate limit (a
+            // new-session flood) costs no allocation.
             first_datagram: buffer[..size].to_vec(),
             upstream,
             listener_socket: Arc::clone(&handle.socket),
