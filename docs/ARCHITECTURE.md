@@ -73,11 +73,16 @@ its sessions. Queue pressure drops and counts the datagram as `queue_full`
 rather than growing memory or blocking all clients on the listener.
 
 Queued datagrams also reserve their length plus a fixed 64-byte per-datagram
-overhead from a process-wide queue memory budget: the defensive 4 GiB datagram
-budget minus the fixed receive buffers of `max(max_sessions, live sessions)`.
+overhead from a process-wide queue memory budget:
+`service.max_queue_memory_bytes` (default 256 MiB), or, if that is less, the
+defensive 4 GiB datagram budget minus the fixed receive buffers of
+`max(max_sessions, live sessions)`. The explicit limit keeps the default worst
+case near what the earlier fixed eight-datagram queues could hold, instead of
+handing the queues whatever the receive buffers leave of the 4 GiB.
 The limit is not stored: every reservation derives it from the current
-`max_sessions` and `max_datagram_size` (updated on reload, after the admission
-limits) and an atomic live-session count kept by each session task. The budget
+`max_queue_memory_bytes`, `max_sessions` and `max_datagram_size` (updated on
+reload, after the admission limits) and an atomic live-session count kept by
+each session task. The budget
 holds the only runtime copy of `max_datagram_size`: listeners and sessions
 size their receive buffers from it, so one store publishes the new size and
 the budget shape that charges for it, and buffer sizing and the limit cannot
@@ -112,39 +117,48 @@ Rate-limited warnings use one atomic timestamp per log site, indexed by a
 count), so the drop path neither locks nor searches to decide whether to log.
 
 Closing a session (idle expiry, closed idle-timeout channel, explicit close,
-listener removal or backend change, shutdown) first unpublishes its routing
-entry and releases its admission lease, then sets the closed flag in the
-handle's atomic state word, which the listener checks without locking, and
-cancels the token the task waits on. The lease is released under the routing
-entry's shard lock, so a listener that no longer finds the route also finds
-the admission slot free. The lease is stored in the handle before the handle
-is published, so a close that races the launch still releases it. The task
-closes its own session the moment it decides to stop. A stopping listener
-closes every one of its sessions before it cancels its token, while its route
-lock keeps new ones from being launched, so no datagram is sent or queued
-after `stop` while the session tasks are still waking up.
+listener removal or backend change, shutdown) removes its routing entry,
+releases its client's per-IP admission slot, and sets the closed flag in the
+handle's atomic state word, which the listener checks without locking, all in
+one step under the routing entry's shard lock; it then cancels the token the
+task waits on. A listener therefore either still reaches the open session or
+finds no route and the client's slot free, and an idle expiry, which takes
+the same lock, cannot claim a session that is being closed. The lease is
+stored in the handle before the handle is published, and a session that loses
+its key is never listed by ID, so a close that races the launch still finds
+it. The task closes its own session the moment it decides to stop. A stopping
+listener closes every one of its sessions before it cancels its token, while
+its route lock keeps new ones from being launched, so no datagram is sent or
+queued after `stop` while the session tasks are still waking up.
 
 The next datagram from the same client therefore finds no route and is
 admitted as a new session even with a per-IP limit of one (for example a
-WireGuard handshake retry after a backend change), while the old task still
-drains. The draining session keeps its upstream socket, receive-buffer
-reservation, gauges, and ID entry until its task ends, so the queue budget
-stays conservative and can briefly count both incarnations. Admission limits
-bound routable sessions; to keep the overlap short, every wait in the session
-task (including the client-direction send and the receive-error back-off) is
-raced against the cancellation token, so a closed task exits at its next
-wake-up. Closing is reported once: a session that is already closed but still
-listed is not counted again by a later listener close or reload. Route removal
-is guarded by session ID, so a
-stale task never removes a newer session's route, and the lease is released
-once. A listener that fetched the old handle just before the close drops the
-datagram as `session_closed` instead of sending on the exiting session's
+WireGuard handshake retry after a backend change), while the old task is
+still stopping. The admission lease is released in two stages: the per-IP
+slot with the route, and the global slot by the cleanup guard when the task
+has ended. Until then the closed session keeps its upstream socket,
+receive-buffer reservation, gauges, and ID entry, and it still counts toward
+`max_sessions`, so the global limit is a hard bound on the sockets, tasks,
+and receive buffers that exist; old and new sessions never add up to more.
+At the global limit a returning client is rejected until closed tasks have
+ended. To keep that short, every wait in the session task (including the
+client-direction send and the receive-error back-off) is raced against the
+cancellation token, so a closed task exits at its next wake-up. Closing is
+reported once: a session that is already closed but still listed is not
+counted again by a later listener close or reload. Route removal is guarded
+by session ID, so a stale task never removes a newer session's route, and
+each stage of the lease is released once. A listener that fetched the old
+handle just before the close drops the datagram as `session_closed` instead
+of sending on the exiting session's
 socket. The cleanup guard is created before the task is spawned and owns the
 queue, so it is the one place a session ends, however its task stops
 (returning, dropped in mid-run, or dropped before its first poll): it closes
 the session, waits out a forward the listener had already begun, counts the
 datagram the task had taken but not sent and every datagram still queued as
-`session_closed`, removes the entry, and ends the gauges. Datagrams already
+`session_closed`, removes the entry, ends the gauges, and releases the global
+admission slot. A forward is registered only across its non-blocking send or
+enqueue; its accounting and logging run afterwards, so that wait is a few
+instructions and never depends on a log sink. Datagrams already
 sent are not counted. On idle timer expiry the task re-reads the
 current timeout before deciding to close, and decides against the listener's
 direct-send path: the listener registers each forward in the handle's state
@@ -315,12 +329,14 @@ Every spawned task is either owned by a supervisor handle or a Tokio
 ## Resource and abuse controls
 
 - Datagram buffers are capped at the legal UDP payload maximum.
-- Session count is capped globally and per source IP.
+- Session count is capped globally and per source IP. The global cap counts
+  every session that still owns an upstream socket, including closed sessions
+  whose tasks have not ended.
 - A global token bucket caps new sessions per second while allowing at most
   one second of burst capacity.
 - Per-session queues are bounded by `session_queue_depth` and a shared,
-  runtime-enforced queue memory budget; control concurrency is fixed and
-  bounded.
+  runtime-enforced queue memory budget (`max_queue_memory_bytes`, 256 MiB by
+  default); control concurrency is fixed and bounded.
 - A session-count/datagram-size/queue-depth combination is rejected when every
   session's fixed receive buffers plus one full queue of maximum-sized
   datagrams, each with its per-datagram overhead, exceeds 4 GiB.

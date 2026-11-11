@@ -36,6 +36,7 @@ readonly MAX_SESSION_RATE=100000
 readonly MAX_SESSION_DATAGRAM_MEMORY_BYTES=4294967296
 readonly SESSION_FIXED_DATAGRAM_BUFFERS=2
 readonly DEFAULT_SESSION_QUEUE_DEPTH=512
+readonly DEFAULT_MAX_QUEUE_MEMORY_BYTES=268435456
 readonly MAX_SESSION_QUEUE_DEPTH=65536
 readonly QUEUED_DATAGRAM_OVERHEAD_BYTES=64
 readonly SEMANTIC_VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
@@ -1106,10 +1107,13 @@ is_session_datagram_budget() {
     depth_decimal=$((10#$queue_depth))
     # Mirrors the daemon's validation: every session's fixed receive buffers
     # plus one full queue of maximum-sized datagrams, each charged with the
-    # per-datagram queue overhead.
+    # per-datagram queue overhead. That queue must also fit in the daemon's
+    # default service.max_queue_memory_bytes, which the installer leaves unset.
     (( sessions_decimal * (datagram_decimal * SESSION_FIXED_DATAGRAM_BUFFERS + 1) +
         (datagram_decimal + QUEUED_DATAGRAM_OVERHEAD_BYTES) * depth_decimal <=
-        MAX_SESSION_DATAGRAM_MEMORY_BYTES ))
+        MAX_SESSION_DATAGRAM_MEMORY_BYTES )) &&
+        (( (datagram_decimal + QUEUED_DATAGRAM_OVERHEAD_BYTES) * depth_decimal <=
+            DEFAULT_MAX_QUEUE_MEMORY_BYTES ))
 }
 
 is_metrics_bind() {

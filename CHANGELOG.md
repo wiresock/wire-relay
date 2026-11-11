@@ -13,15 +13,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   eight-datagram per-session queue. The listener now sends directly on the
   session's connected upstream socket and only queues when that socket is
   busy.
-- A closed session no longer keeps its route or admission slot while it
-  drains, so the next datagram from the same client opens a new session
-  instead of being dropped as `session_closed` or `rejected`, even with
-  `max_sessions_per_ip = 1`. The closed session still counts toward the
-  queue budget and session gauges until its task ends, which no longer waits
-  for a pending client-direction send. A reload or listener stop no longer
-  counts sessions that were already closed. A session task dropped
-  before it first runs still removes its table entry and gauges and counts its
-  unsent first datagram as `session_closed`.
+- A closed session no longer keeps its route or its client's
+  `max_sessions_per_ip` slot while it stops, so the next datagram from the
+  same client opens a new session instead of being dropped as
+  `session_closed` or `rejected`, even with `max_sessions_per_ip = 1`. The
+  closed session still counts toward `max_sessions`, the queue budget and the
+  session gauges until its task ends, so `max_sessions` bounds the upstream
+  sockets that exist; its task no longer waits for a pending client-direction
+  send. A reload or listener stop no longer counts sessions that were already
+  closed, and a close that coincides with idle expiry is counted as a close.
+  A session task dropped before it first runs or in mid-run still removes its
+  table entry and gauges and counts the datagrams it never sent as
+  `session_closed`.
 - Datagrams the relay drops itself (`queue_full`, `budget_exhausted`,
   `session_closed`) no longer refresh a session's idle timer, so a client
   sending only into a full queue or exhausted budget still idles out. Backend
@@ -34,11 +37,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `service.session_queue_depth` (default 512) with a shared, runtime-enforced
-  queue memory budget charged with each datagram's size plus a fixed 64-byte
-  overhead. Under a tight configuration (high `max_sessions` and large
-  datagrams) the shared remainder can be small, and a few back-pressured
-  sessions can exhaust it so that others drop as `budget_exhausted`. After a
+- `service.session_queue_depth` (default 512) and
+  `service.max_queue_memory_bytes` (default 256 MiB): a shared,
+  runtime-enforced queue memory limit charged with each datagram's size plus
+  a fixed 64-byte overhead. The limit must hold one full queue of
+  maximum-sized datagrams and is further reduced to what the per-session
+  receive buffers leave of the defensive 4 GiB. A few back-pressured sessions
+  can exhaust it so that others drop as `budget_exhausted`. After a
   reload lowers `max_sessions` below the live session count, the budget
   recovers to its full size as the surplus sessions end. A reload that leaves
   less than one maximum-sized datagram of budget beside the live sessions'

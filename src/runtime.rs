@@ -1146,7 +1146,7 @@ mod tests {
     ) -> String {
         format!(
             "[service]\nmax_datagram_size = 4096\nmax_sessions = {max_sessions}\n\
-             max_sessions_per_ip = {max_sessions}\nnew_sessions_per_second = 1000\n\
+             max_queue_memory_bytes = 4294967296\nmax_sessions_per_ip = {max_sessions}\nnew_sessions_per_second = 1000\n\
              idle_timeout = \"{idle_timeout}\"\nshutdown_timeout = \"3s\"\n\n\
              [[listeners]]\nname = \"budget\"\nbind = \"{listener}\"\n\
              backend = \"{backend}\"\n"
