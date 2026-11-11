@@ -60,7 +60,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   version stays 2. Configuration files still reject unknown keys. A 0.1.6
   CLI validates the TOML form against its own limits, so it refuses
   `config`/`--toml` for a configuration only this release accepts;
-  `--json` still works.
+  `--json` still works. This CLI prints the running values in
+  `config`/`--toml` even when they would not pass its own file validation,
+  for example from a later daemon with higher limits; loading that output as
+  a configuration file with this CLI may still fail.
 
 ### Added
 

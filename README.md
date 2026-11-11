@@ -402,7 +402,11 @@ earlier connected to a newer daemon gets the configuration without those two
 settings. Such a CLI still validates the TOML form against its own, older
 limits, so for a configuration only a newer release accepts (for example
 `max_sessions = 100000` with `max_datagram_size = 5000`) it refuses
-`wire-relay config` and `--toml`; `--json` still works.
+`wire-relay config` and `--toml`; `--json` still works. A CLI from this release
+does not re-validate: connected to a later daemon, it prints the running
+values in `wire-relay config` and `--toml` even when they would not pass its
+own configuration-file validation. Loading that output as a configuration
+file with this CLI may still fail.
 
 ### Transactional reload
 

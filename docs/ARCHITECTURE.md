@@ -158,7 +158,9 @@ by session ID, so a stale task never removes a newer session's route, and
 each stage of the lease is released once. A listener that fetched the old
 handle just before the close does not send on the exiting session's socket:
 the closed handle refuses the datagram without counting it, and the
-listener treats it as one from a client without a session, once. It goes
+listener treats it as one from a client without a session, once. A datagram
+that passes that check but has to queue after the cleanup has closed the
+queue is refused the same way. It goes
 through admission and normally opens a new session; if the listener is
 stopping it is counted as `session_closed` instead, and if admission
 refuses it, as `rejected`. A datagram the session accepted before the close
@@ -184,7 +186,10 @@ direct-send path: the listener registers each forward in the handle's state
 word, and the task announces the expiry there, re-reads activity, and closes
 the session only if the word is unchanged. A forward that starts meanwhile
 withdraws the announcement and is sent, so a datagram is refused only by a
-session that really closed. The expiry runs under the route's shard lock and
+session that really closed. If that datagram is then dropped (`queue_full`
+or `budget_exhausted`), activity is not refreshed and the deadline has
+already passed, so the task tries again after a 10 ms back-off rather than
+at once. The expiry runs under the route's shard lock and
 removes the route and releases admission in the same step, so the client's
 next datagram opens a new session. A session closed for another reason at
 that moment is counted as closed, not expired.
@@ -310,7 +315,10 @@ connection, since a current daemon that is restarting, or at its limit of
 concurrent control connections, can also close one unanswered. Only if that
 is unanswered too does the CLI repeat the request as `active_config` and
 treat the missing settings as absent rather than filling in defaults. The
-protocol version stays 2, so every pairing of these releases still talks.
+CLI prints the reported values in `config` and `--toml` without
+re-validating them against its own configuration-file limits; only loading
+a file enforces those. The protocol version stays 2, so every pairing of
+these releases still talks.
 
 Unsupported versions and malformed input receive structured errors when
 safely possible. The socket parent and socket use restrictive Unix
