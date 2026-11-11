@@ -385,6 +385,18 @@ Human-readable output is intended for operators. Use `--json` for automation;
 major JSON response shapes are intended to remain stable and compatibility
 changes are documented. Commands return a nonzero status on failure.
 
+CLI and daemon versions can be mixed while an upgrade is in progress, for
+example a new CLI before the daemon has restarted. `wire-relay config`
+reports `session_queue_depth` and `max_queue_memory_bytes` only when the
+daemon has them. Connected to an older daemon, the CLI leaves both out of the
+TOML and JSON output instead of showing defaults that daemon does not use;
+the TOML output starts with a comment that says so. A CLI from 0.1.6 or
+earlier connected to a newer daemon gets the configuration without those two
+settings. Such a CLI still validates the TOML form against its own, older
+limits, so for a configuration only a newer release accepts (for example
+`max_sessions = 100000` with `max_datagram_size = 5000`) it refuses
+`wire-relay config` and `--toml`; `--json` still works.
+
 ### Transactional reload
 
 `wire-relay reload` asks the running daemon to read its configured file. The

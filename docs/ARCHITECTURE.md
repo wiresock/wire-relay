@@ -279,6 +279,18 @@ most four snapshots and 200,000 rows, while no more than two snapshot builds
 run concurrently. Capacity pressure evicts the least-recently-used snapshot,
 and stale or mismatched cursors receive structured errors.
 
+The configuration file and the control protocol use separate types. The
+file types reject unknown keys. The active configuration travels as a wire
+type whose service settings added after 0.1.6 are optional, and which
+ignores keys it does not know. A CLI from 0.1.6 or earlier rejects unknown
+keys, so the `active_config` operation keeps the 0.1.6 shape and leaves out
+`session_queue_depth` and `max_queue_memory_bytes`. Current CLIs ask for
+`active_config_extended`, which carries every setting. A daemon that predates
+that operation cannot decode the request and closes the connection without a
+response; the CLI then repeats the request as `active_config` and treats the
+missing settings as absent rather than filling in defaults. The protocol
+version stays 2, so every pairing of these releases still talks.
+
 Unsupported versions and malformed input receive structured errors when
 safely possible. The socket parent and socket use restrictive Unix
 permissions. Startup refuses to replace a non-socket path or a live daemon's

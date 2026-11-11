@@ -39,6 +39,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Idle expiry no longer races the direct upload path: a session is not
   expired under a datagram it has just accepted, and an expired session
   sends nothing further on its upstream socket.
+- `wire-relay config` works between this release and older CLIs and daemons.
+  The `active_config` control response keeps the 0.1.6 shape, without
+  `session_queue_depth` and `max_queue_memory_bytes`, so a 0.1.6 CLI can
+  still decode it. A current CLI asks for the new `active_config_extended`
+  operation. If the daemon predates that operation, the CLI falls back to
+  `active_config` and leaves the two settings out (with a TOML comment saying
+  so) instead of showing this release's defaults. The control protocol
+  version stays 2. Configuration files still reject unknown keys. A 0.1.6
+  CLI validates the TOML form against its own limits, so it refuses
+  `config`/`--toml` for a configuration only this release accepts;
+  `--json` still works.
 
 ### Added
 
