@@ -1,14 +1,10 @@
 name: Version and Release
 
 on:
-  # This mutating job must receive the trusted base repository token even when
-  # the merged PR came from a fork or Dependabot. It checks out only `main` and
-  # the already-merged commit; no untrusted PR branch code is executed.
-  pull_request_target:
+  # Use the trusted main update even when the merged PR came from a fork.
+  push:
     branches:
       - main
-    types:
-      - closed
 
 permissions:
   contents: read
@@ -20,24 +16,45 @@ concurrency:
 jobs:
   version:
     name: Version merged pull request
-    if: github.event.pull_request.merged == true
+    # GITHUB_TOKEN pushes do not trigger workflows; also exclude our own bot.
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      !github.event.created &&
+      !github.event.deleted &&
+      !github.event.forced
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
+      pull-requests: read
     outputs:
       release_ref: ${{ steps.version.outputs.release_ref }}
       release_sha: ${{ steps.version.outputs.release_sha }}
       version: ${{ steps.version.outputs.version }}
 
     steps:
-      - name: Check out main
+      - name: Check out pushed main commit
         uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
+      - name: Resolve the merged pull request
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr_number="$(python3 scripts/versioning/merged_pr.py "$GITHUB_REPOSITORY" "$GITHUB_SHA")"
+          if [[ -z "$pr_number" ]]; then
+            echo "No exact merged pull request for this push; skipping release."
+            exit 0
+          fi
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
       - name: Configure Git author
+        if: steps.pr.outputs.number != ''
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -45,23 +62,27 @@ jobs:
 
       - name: Detect a version changed by the pull request
         id: compare
+        if: steps.pr.outputs.number != ''
         shell: bash
         env:
-          BASE_REF: ${{ github.event.pull_request.base.sha }}
-          MERGE_REF: ${{ github.event.pull_request.merge_commit_sha }}
+          BASE_REF: ${{ github.event.before }}
+          MERGE_REF: ${{ github.sha }}
         run: |
           set -euo pipefail
+          git merge-base --is-ancestor "$BASE_REF" "$MERGE_REF"
+          git merge-base --is-ancestor "$MERGE_REF" origin/main
           python3 scripts/versioning/version.py compare-refs \
             --base-ref "$BASE_REF" \
             --head-ref "$MERGE_REF"
 
       - name: Bump or recover the merged pull request version
         id: version
+        if: steps.pr.outputs.number != ''
         shell: bash
         env:
           MANUAL_BUMP: ${{ steps.compare.outputs.changed }}
-          MERGE_REF: ${{ github.event.pull_request.merge_commit_sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_REF: ${{ github.sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
 
@@ -90,6 +111,7 @@ jobs:
             pushed=false
             for attempt in 1 2 3 4 5 6 7 8; do
               git fetch --prune --tags origin
+              git merge-base --is-ancestor "$MERGE_REF" origin/main
 
               existing_commit=""
               while read -r candidate_commit; do

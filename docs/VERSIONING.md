@@ -12,7 +12,12 @@ must increment the protocol version explicitly.
 
 ## Automatic patch versions
 
-Every pull request merged into `main` is assigned a release version:
+A pull request merged into `main` through GitHub is assigned a release
+version. The workflow runs on the trusted push to `main` and verifies that
+its exact tip commit is GitHub's recorded merge SHA for a merged pull request
+targeting this repository's `main`. This supports merge commits, squash merges,
+and GitHub rebase merges. The versions immediately before and after that push
+determine whether the pull request intentionally changed the version.
 
 1. If the pull request did not change the package version, the
    `Version and Release` workflow increments the current patch version on
@@ -22,16 +27,24 @@ Every pull request merged into `main` is assigned a release version:
 3. The workflow creates an annotated `vMAJOR.MINOR.PATCH` tag on the exact
    versioned commit and runs the release workflow for that tag.
 
+Direct pushes without an exact merged pull request, branch creation and
+deletion, force pushes, and Actions bot pushes do not publish a release.
+One push is evaluated for its tip only; do not batch multiple PR merges into
+a single ref update. The workflow retries briefly to allow GitHub's merge
+association to become visible. If a real merge is skipped because indexing
+was delayed, rerun the workflow for that push.
+
 GitHub's generated release notes are the patch-by-patch history. `CHANGELOG.md`
 is curated for initial, minor, major, security, and compatibility milestones;
 the automatic patch commit therefore does not rewrite it on every merge.
 
 The post-merge version commit records the pull request number. This makes a
 rerun idempotent and lets an interrupted run repair a missing tag or release
-without advancing the version again.
+without advancing the version again. The workflow pushes version commits and
+tags with `GITHUB_TOKEN`, so those pushes do not schedule a second run.
 
-The workflow uses GitHub Actions' expanded concurrency queue so merge events
-wait instead of replacing an already-pending version run. Optimistic push
+The workflow uses GitHub Actions' expanded concurrency queue so pushes wait
+instead of replacing an already-pending version run. Optimistic push
 retries remain as a second guard: if `main` advances unexpectedly, the run
 fetches it, computes the next patch version, and retries.
 
